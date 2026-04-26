@@ -202,3 +202,115 @@ def test_bootstrap_admin_preserves_tg_profile(db_module):
     assert full[5] == "admin"
     assert full[6] == "boss"
     assert full[7] == "Boss"
+
+
+# --- Promocodes ---
+
+def test_promocode_full_lifecycle(db_module):
+    asyncio.run(db_module.init_db())
+    # Создание
+    ok = asyncio.run(db_module.create_promocode(
+        "TEST10", bonus_days=30, max_uses=2, created_by=1
+    ))
+    assert ok is True
+    # Дубль
+    again = asyncio.run(db_module.create_promocode(
+        "test10", bonus_days=10, max_uses=1, created_by=1
+    ))
+    assert again is False  # case-insensitive PK
+
+    # Первый редем
+    status, days = asyncio.run(db_module.redeem_promocode("TEST10", 100))
+    assert status == db_module.PROMO_OK
+    assert days == 30
+
+    # Тот же юзер — повторно — отказ
+    status, _ = asyncio.run(db_module.redeem_promocode("TEST10", 100))
+    assert status == db_module.PROMO_ALREADY_USED
+
+    # Другой юзер — ок
+    status, _ = asyncio.run(db_module.redeem_promocode("test10", 200))
+    assert status == db_module.PROMO_OK  # case-insensitive lookup
+
+    # Лимит исчерпан
+    status, _ = asyncio.run(db_module.redeem_promocode("TEST10", 300))
+    assert status == db_module.PROMO_EXHAUSTED
+
+
+def test_promocode_revoked(db_module):
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.create_promocode("REV", bonus_days=7, max_uses=None, created_by=1))
+    assert asyncio.run(db_module.revoke_promocode("REV")) is True
+    status, _ = asyncio.run(db_module.redeem_promocode("REV", 100))
+    assert status == db_module.PROMO_REVOKED
+
+
+def test_promocode_unlimited(db_module):
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.create_promocode("UNLIM", bonus_days=1, max_uses=None, created_by=1))
+    for tg in range(5):
+        status, _ = asyncio.run(db_module.redeem_promocode("UNLIM", tg))
+        assert status == db_module.PROMO_OK
+
+
+def test_promocode_not_found(db_module):
+    asyncio.run(db_module.init_db())
+    status, _ = asyncio.run(db_module.redeem_promocode("NOPE", 1))
+    assert status == db_module.PROMO_NOT_FOUND
+
+
+# --- Settings ---
+
+def test_setting_get_set_clear(db_module):
+    asyncio.run(db_module.init_db())
+    assert asyncio.run(db_module.get_setting("foo")) is None
+    asyncio.run(db_module.set_setting("foo", "bar"))
+    assert asyncio.run(db_module.get_setting("foo")) == "bar"
+    asyncio.run(db_module.set_setting("foo", "baz"))
+    assert asyncio.run(db_module.get_setting("foo")) == "baz"
+    asyncio.run(db_module.set_setting("foo", None))
+    assert asyncio.run(db_module.get_setting("foo")) is None
+
+
+# --- delete_user ---
+
+def test_delete_user_wipes_promo_uses(db_module):
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.add_user(
+        tg_id=42, uuid="u", short_uuid="s", username="tg_42", expire_date=0,
+    ))
+    asyncio.run(db_module.create_promocode("CODE", bonus_days=5, max_uses=10, created_by=1))
+    status, _ = asyncio.run(db_module.redeem_promocode("CODE", 42))
+    assert status == db_module.PROMO_OK
+
+    asyncio.run(db_module.delete_user(42))
+    assert asyncio.run(db_module.get_user(42)) is None
+    # тот же юзер может снова активировать тот же код после реактивации
+    status, _ = asyncio.run(db_module.redeem_promocode("CODE", 42))
+    assert status == db_module.PROMO_OK
+
+
+# --- build_panel_username ---
+
+def test_build_panel_username_variants(monkeypatch, tmp_path):
+    """Чистый юнит-тест на санитайзер username — без БД."""
+    # Импортируем функцию из bot.py — он требует env-переменные. Мокируем только нужное.
+    monkeypatch.setenv("BOT_TOKEN", "123456:AAA-BBB_ccc-fakefakefakefakefakefakefa")
+    monkeypatch.setenv("REMNAWAVE_URL", "https://x")
+    monkeypatch.setenv("REMNAWAVE_TOKEN", "x")
+    monkeypatch.setenv("SUB_DOMAIN", "https://y")
+    monkeypatch.setenv("ADMIN_TG_IDS", "1")
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "x.db"))
+    if "bot" in sys.modules:
+        importlib.reload(sys.modules["bot"])
+    import bot
+
+    assert bot.build_panel_username(123, "wizard", "Andrew") == "tg_123_wizard"
+    assert bot.build_panel_username(123, None, "Андрей") == "tg_123"  # кириллица отсеивается
+    assert bot.build_panel_username(123, None, "Andrew Ivanov") == "tg_123_AndrewIvanov"
+    assert bot.build_panel_username(123, None, None) == "tg_123"
+    # длинный никнейм должен обрезаться
+    long = "x" * 50
+    out = bot.build_panel_username(1, long, None)
+    assert len(out) == 32
+    assert out.startswith("tg_1_")

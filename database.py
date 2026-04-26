@@ -72,6 +72,39 @@ async def init_db():
             )
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code TEXT PRIMARY KEY COLLATE NOCASE,
+                bonus_days INTEGER NOT NULL,
+                max_uses INTEGER,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER,
+                created_at INTEGER NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promocode_uses (
+                code TEXT NOT NULL COLLATE NOCASE,
+                tg_id INTEGER NOT NULL,
+                used_at INTEGER NOT NULL,
+                PRIMARY KEY (code, tg_id)
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
         await db.commit()
 
 
@@ -345,3 +378,168 @@ async def find_token_by_hash_prefix(prefix: str) -> Optional[str]:
     if len(rows) == 1:
         return rows[0][0]
     return None
+
+
+# --- Promocodes ---
+
+PROMO_OK = "ok"
+PROMO_NOT_FOUND = "not_found"
+PROMO_REVOKED = "revoked"
+PROMO_EXHAUSTED = "exhausted"
+PROMO_ALREADY_USED = "already_used"
+
+
+async def create_promocode(
+    code: str,
+    *,
+    bonus_days: int,
+    max_uses: Optional[int],
+    created_by: int,
+) -> bool:
+    """Создаёт промокод. Возвращает True если создан, False если уже существует."""
+    code = code.strip()
+    if not code:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """
+                INSERT INTO promocodes (code, bonus_days, max_uses, used_count, created_by, created_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (code, int(bonus_days), max_uses, int(created_by), int(time.time())),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def revoke_promocode(code: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE promocodes SET revoked = 1 WHERE code = ? COLLATE NOCASE",
+            (code.strip(),),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_promocode(code: str):
+    """Returns row (code, bonus_days, max_uses, used_count, created_by, created_at, revoked) or None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT code, bonus_days, max_uses, used_count, created_by, created_at, revoked
+            FROM promocodes WHERE code = ? COLLATE NOCASE
+            """,
+            (code.strip(),),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def list_promocodes(limit: int = 50) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT code, bonus_days, max_uses, used_count, revoked, created_at
+            FROM promocodes
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+
+async def redeem_promocode(code: str, tg_id: int) -> tuple[str, Optional[int]]:
+    """Атомарно «погашает» один use промокода для tg_id.
+
+    Возвращает (status, bonus_days). status — одна из PROMO_* констант.
+    bonus_days возвращается только при PROMO_OK.
+    """
+    code = code.strip()
+    if not code:
+        return PROMO_NOT_FOUND, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем запись промо
+        async with db.execute(
+            """
+            SELECT code, bonus_days, max_uses, used_count, revoked
+            FROM promocodes WHERE code = ? COLLATE NOCASE
+            """,
+            (code,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return PROMO_NOT_FOUND, None
+        actual_code, bonus_days, max_uses, _used_count, revoked = row
+        if revoked:
+            return PROMO_REVOKED, None
+
+        # Этот юзер уже активировал данный промо?
+        async with db.execute(
+            "SELECT 1 FROM promocode_uses WHERE code = ? COLLATE NOCASE AND tg_id = ?",
+            (actual_code, int(tg_id)),
+        ) as cursor:
+            if await cursor.fetchone():
+                return PROMO_ALREADY_USED, None
+
+        # Атомарный инкремент used_count с проверкой лимита и revoked.
+        cursor = await db.execute(
+            """
+            UPDATE promocodes
+            SET used_count = used_count + 1
+            WHERE code = ? COLLATE NOCASE
+              AND revoked = 0
+              AND (max_uses IS NULL OR used_count < max_uses)
+            """,
+            (actual_code,),
+        )
+        if cursor.rowcount == 0:
+            return PROMO_EXHAUSTED, None
+
+        await db.execute(
+            "INSERT INTO promocode_uses (code, tg_id, used_at) VALUES (?, ?, ?)",
+            (actual_code, int(tg_id), int(time.time())),
+        )
+        await db.commit()
+        return PROMO_OK, int(bonus_days)
+
+
+# --- Settings (key/value) ---
+
+async def get_setting(key: str) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def set_setting(key: str, value: Optional[str]) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if value is None:
+            await db.execute("DELETE FROM settings WHERE key = ?", (key,))
+        else:
+            await db.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+        await db.commit()
+
+
+# --- User deletion ---
+
+async def delete_user(tg_id: int) -> None:
+    """Удаляет запись о юзере + все его use-записи промокодов.
+    Не удаляет аккаунт в Remnawave — это делает api.delete_user из бота.
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM promocode_uses WHERE tg_id = ?", (int(tg_id),))
+        await conn.execute("DELETE FROM users WHERE tg_id = ?", (int(tg_id),))
+        await conn.commit()

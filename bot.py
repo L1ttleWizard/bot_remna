@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import logging
 import re
 import sys
@@ -7,13 +8,18 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+import qrcode
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -146,7 +152,9 @@ def main_keyboard_user() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⚙️ Мои настройки", callback_data="my_settings")],
             [InlineKeyboardButton(text="📅 Моя подписка", callback_data="my_subscription")],
             [InlineKeyboardButton(text="📱 Мои устройства", callback_data="my_devices")],
-            [InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions")],
+            [InlineKeyboardButton(text="📥 Подключить", callback_data="connect")],
+            [InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_input")],
+            [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
         ]
     )
 
@@ -156,12 +164,14 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users:0")],
         [InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token")],
         [InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens")],
+        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos")],
+        [InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support")],
     ]
     if has_account:
         rows.append(
             [InlineKeyboardButton(text="⚙️ Мой аккаунт", callback_data=f"admu:{tg_id}:open")]
         )
-    rows.append([InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions")])
+    rows.append([InlineKeyboardButton(text="📥 Подключить", callback_data="connect")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -238,8 +248,15 @@ def subscription_user_keyboard() -> InlineKeyboardMarkup:
 # --- Bot wiring ---
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 api = RemnawaveAPI(base_url=REMNAWAVE_URL, api_token=REMNAWAVE_TOKEN)
+
+
+class PromoStates(StatesGroup):
+    waiting_for_code = State()
+
+
+SUPPORT_KEY = "support_text"
 
 
 class TgProfileMiddleware(BaseMiddleware):
@@ -334,15 +351,58 @@ async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     await db.update_user_expire(tg_id, int(dt.timestamp()))
 
 
+_USERNAME_SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
+_REMNAWAVE_USERNAME_MAX_LEN = 32
+
+
+def build_panel_username(
+    tg_id: int,
+    tg_username: Optional[str],
+    tg_first_name: Optional[str],
+) -> str:
+    """Собирает username для Remnawave из TG-профиля.
+
+    Шаблоны (по приоритету):
+      `tg_<id>_<sanitized(@username)>` → если есть @username;
+      `tg_<id>_<sanitized(first_name)>` → если есть first_name;
+      `tg_<id>` → fallback.
+    Sanitize: оставляем только [A-Za-z0-9_], обрезаем до общего лимита 32 символа.
+    """
+    base = f"tg_{tg_id}"
+    raw = tg_username or tg_first_name or ""
+    if not raw:
+        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
+    suffix = _USERNAME_SAFE_CHARS_RE.sub("", raw).strip("_")
+    if not suffix:
+        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
+    full = f"{base}_{suffix}"
+    if len(full) <= _REMNAWAVE_USERNAME_MAX_LEN:
+        return full
+    # обрезаем суффикс, чтобы влезть
+    avail = _REMNAWAVE_USERNAME_MAX_LEN - len(base) - 1
+    if avail <= 0:
+        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
+    return f"{base}_{suffix[:avail]}"
+
+
 async def create_account_for_user(
     tg_id: int,
     *,
     expire_days: int,
     hwid_device_limit: int,
     created_by: Optional[int] = None,
+    tg_username: Optional[str] = None,
+    tg_first_name: Optional[str] = None,
 ) -> Optional[str]:
     """Создаёт аккаунт в Remnawave, кладёт запись в БД. Возвращает subscriptionUrl."""
-    username = f"tg_{tg_id}"
+    # Если профиль не передан — попробуем взять из локальной БД
+    # (`TgProfileMiddleware` уже сохранил его при /start или /redeem).
+    if tg_username is None and tg_first_name is None:
+        existing_profile = await db.get_user_full(tg_id)
+        if existing_profile:
+            tg_username = existing_profile[6]
+            tg_first_name = existing_profile[7]
+    username = build_panel_username(tg_id, tg_username, tg_first_name)
     response = await api.create_user(
         username=username,
         expire_days=expire_days,
@@ -447,6 +507,8 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
         tg_id,
         expire_days=token.expire_days,
         hwid_device_limit=token.hwid_device_limit,
+        tg_username=message.from_user.username,
+        tg_first_name=message.from_user.first_name,
     )
     if not sub_url:
         await message.answer(
@@ -570,7 +632,7 @@ def _parse_expire_to_ts(value: Optional[str]) -> int:
         return 0
 
 
-_TG_USERNAME_RE = re.compile(r"^tg_(\d+)$")
+_TG_USERNAME_RE = re.compile(r"^tg_(\d+)(?:_[A-Za-z0-9_]*)?$")
 
 
 @dp.message(Command("import_users"))
@@ -966,20 +1028,267 @@ async def cb_my_devices(callback: CallbackQuery):
     await callback.answer("Обновлено" if callback.data == "my_devices_refresh" else None)
 
 
-@dp.callback_query(F.data == "instructions")
-async def cb_instructions(callback: CallbackQuery):
-    text = (
-        "**Как настроить прокси:**\n\n"
-        "**Для iOS (iPhone):**\n"
-        "1. Скачайте приложение Shadowrocket или V2Box.\n"
-        "2. Скопируйте вашу ссылку подписки.\n"
-        "3. В приложении нажмите '+' и выберите 'Subscribe'. Вставьте ссылку.\n\n"
-        "**Для Android:**\n"
-        "1. Скачайте v2rayNG.\n"
-        "2. Откройте меню (три полоски) -> 'Подписка'. Нажмите '+' и вставьте ссылку.\n"
-        "3. Нажмите 'Обновить подписку'."
+# --- Connect / VPN client instructions ---
+
+# Каталог рекомендуемых клиентов по платформам.
+# `deeplink_template` — шаблон импорта подписки в клиент. `{sub}` — URL подписки целиком.
+# Для клиентов без подтверждённого deep-link оставляем None — будет только инструкция и QR.
+CLIENT_CATALOG: dict[str, list[dict]] = {
+    "ios": [
+        {
+            "name": "Happ",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
+            ],
+            "deeplink_template": "happ://add/{sub}",
+        },
+        {
+            "name": "V2Box",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690"),
+            ],
+            "deeplink_template": "v2box://install-sub?url={sub}",
+        },
+        {
+            "name": "Streisand",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/streisand/id6450534064"),
+            ],
+            "deeplink_template": "streisand://import/{sub}",
+        },
+        {
+            "name": "Shadowrocket",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/shadowrocket/id932747118"),
+            ],
+            "deeplink_template": "shadowrocket://add/sub://{sub}",
+        },
+    ],
+    "android": [
+        {
+            "name": "Happ",
+            "stores": [
+                ("Google Play", "https://play.google.com/store/apps/details?id=com.happproxy"),
+                ("Сайт", "https://happ.su/"),
+            ],
+            "deeplink_template": "happ://add/{sub}",
+        },
+        {
+            "name": "v2rayNG",
+            "stores": [
+                ("Google Play", "https://play.google.com/store/apps/details?id=com.v2ray.ang"),
+                ("GitHub", "https://github.com/2dust/v2rayNG/releases"),
+            ],
+            "deeplink_template": None,
+        },
+        {
+            "name": "Hiddify",
+            "stores": [
+                ("Google Play", "https://play.google.com/store/apps/details?id=app.hiddify.com"),
+                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
+            ],
+            "deeplink_template": "hiddify://install-config?url={sub}",
+        },
+        {
+            "name": "NekoBox",
+            "stores": [
+                ("GitHub", "https://github.com/MatsuriDayo/NekoBoxForAndroid/releases"),
+            ],
+            "deeplink_template": None,
+        },
+    ],
+    "windows": [
+        {
+            "name": "Hiddify",
+            "stores": [
+                ("Сайт", "https://hiddify.com/"),
+                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
+            ],
+            "deeplink_template": "hiddify://install-config?url={sub}",
+        },
+        {
+            "name": "v2rayN",
+            "stores": [
+                ("GitHub", "https://github.com/2dust/v2rayN/releases"),
+            ],
+            "deeplink_template": None,
+        },
+        {
+            "name": "NekoRay",
+            "stores": [
+                ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
+            ],
+            "deeplink_template": None,
+        },
+    ],
+    "macos": [
+        {
+            "name": "Happ",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
+            ],
+            "deeplink_template": "happ://add/{sub}",
+        },
+        {
+            "name": "V2Box",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690"),
+            ],
+            "deeplink_template": "v2box://install-sub?url={sub}",
+        },
+        {
+            "name": "Hiddify",
+            "stores": [
+                ("Сайт", "https://hiddify.com/"),
+                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
+            ],
+            "deeplink_template": "hiddify://install-config?url={sub}",
+        },
+        {
+            "name": "FoXray",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/foxray/id6448898396"),
+            ],
+            "deeplink_template": None,
+        },
+    ],
+    "linux": [
+        {
+            "name": "Hiddify",
+            "stores": [
+                ("Сайт", "https://hiddify.com/"),
+                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
+            ],
+            "deeplink_template": "hiddify://install-config?url={sub}",
+        },
+        {
+            "name": "NekoRay",
+            "stores": [
+                ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
+            ],
+            "deeplink_template": None,
+        },
+    ],
+}
+
+PLATFORM_TITLES = {
+    "ios": "📱 iOS (iPhone/iPad)",
+    "android": "🤖 Android",
+    "windows": "🪟 Windows",
+    "macos": "🍎 macOS",
+    "linux": "🐧 Linux",
+}
+
+
+def connect_platform_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data="connect_p:ios")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["android"], callback_data="connect_p:android")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data="connect_p:windows")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data="connect_p:macos")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["linux"], callback_data="connect_p:linux")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
+        ]
     )
-    await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_only_keyboard())
+
+
+async def _resolve_user_sub_url(tg_id: int) -> Optional[str]:
+    user = await db.get_user(tg_id)
+    if not user or not user[2]:
+        return None
+    short_uuid = user[2]
+    return f"{SUB_DOMAIN}/{short_uuid}"
+
+
+@dp.callback_query(F.data == "connect")
+async def cb_connect(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    text = (
+        "📥 <b>Подключение</b>\n\n"
+        "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
+        "deep-link для импорта одной кнопкой и QR-код подписки."
+    )
+    await safe_edit(
+        callback, text, parse_mode="HTML",
+        reply_markup=connect_platform_keyboard(), prefer_edit=True,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("connect_p:"))
+async def cb_connect_platform(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    platform = callback.data.split(":", 1)[1]
+    if platform not in CLIENT_CATALOG:
+        await callback.answer("Неизвестная платформа.", show_alert=True)
+        return
+
+    sub_url = await _resolve_user_sub_url(callback.from_user.id)
+    if not sub_url:
+        # Админ без своего аккаунта — даём общую инструкцию без ссылки/QR
+        sub_url = ""
+
+    title = PLATFORM_TITLES[platform]
+    clients = CLIENT_CATALOG[platform]
+    lines = [f"<b>{title}</b>", ""]
+
+    if sub_url:
+        lines.append("Ваша ссылка-подписка:")
+        lines.append(f"<code>{html.escape(sub_url)}</code>")
+        lines.append("")
+    else:
+        lines.append(
+            "<i>У вас пока нет аккаунта в панели — ссылка появится после активации токена.</i>\n"
+        )
+
+    for c in clients:
+        lines.append(f"<b>• {html.escape(c['name'])}</b>")
+        for label, url in c["stores"]:
+            lines.append(f"  · <a href=\"{html.escape(url)}\">{html.escape(label)}</a>")
+        if sub_url and c.get("deeplink_template"):
+            deep = c["deeplink_template"].replace("{sub}", sub_url)
+            lines.append(
+                f"  · <a href=\"{html.escape(deep)}\">Импорт в один клик</a>"
+            )
+        lines.append("")
+
+    lines.append(
+        "📌 <b>Если deep-link не сработал</b>: скопируйте ссылку выше и в клиенте "
+        "выберите «Импорт подписки» / «Add subscription» / «+».\n"
+        "📷 QR-код подписки — следующим сообщением (если есть аккаунт)."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К выбору платформы", callback_data="connect")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+        ]
+    )
+    await callback.message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+    if sub_url:
+        try:
+            img = qrcode.make(sub_url)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            await callback.message.answer_photo(
+                photo=BufferedInputFile(buf.read(), filename="subscription.png"),
+                caption="QR-код подписки. Отсканируйте в выбранном клиенте.",
+            )
+        except Exception as exc:
+            logger.warning("QR generation failed: %s", exc)
+
     await callback.answer()
 
 
@@ -1080,6 +1389,8 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
     if has_account:
         rows.append([InlineKeyboardButton(text="📅 Подписка", callback_data=f"admu:{target_tg}:sub")])
         rows.append([InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:dev")])
+    rows.append([InlineKeyboardButton(text="✉️ Написать", callback_data=f"admu:{target_tg}:dm")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admu:{target_tg}:del")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
     rows.append([InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")])
     await safe_edit(
@@ -1124,7 +1435,7 @@ async def _send_admin_devices(callback: CallbackQuery, target_tg: int, *, prefer
 
 
 @dp.callback_query(F.data.startswith("admu:"))
-async def cb_admu(callback: CallbackQuery):
+async def cb_admu(callback: CallbackQuery, state: FSMContext):
     if not await auth.is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
@@ -1249,7 +1560,375 @@ async def cb_admu(callback: CallbackQuery):
         await callback.answer("Устройство удалено")
         return
 
+    if action == "dm":
+        # переводим админа в FSM ожидания текста сообщения этому юзеру
+        await state.set_state(AdminDmStates.waiting_for_text)
+        await state.update_data(target_tg=target_tg)
+        await callback.message.answer(
+            f"✉️ Введите текст сообщения для пользователя <code>{target_tg}</code>. "
+            "Отправлю от вашего имени. /cancel — отменить.",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if action == "del":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="❌ Подтвердить удаление",
+                        callback_data=f"admu:{target_tg}:del_confirm",
+                    )
+                ],
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admu:{target_tg}:open")],
+            ]
+        )
+        full = await db.get_user_full(target_tg)
+        if not full:
+            await callback.answer("Пользователь не найден.", show_alert=True)
+            return
+        warning = (
+            f"⚠️ <b>Удалить пользователя</b> <code>{target_tg}</code>?\n\n"
+            f"Будет удалён аккаунт <code>{html.escape(full[3] or '—')}</code> "
+            "из Remnawave-панели и стёрта запись в локальной БД (вместе с его use-записями промокодов).\n\n"
+            "Действие необратимо."
+        )
+        await safe_edit(
+            callback, warning, parse_mode="HTML", reply_markup=kb, prefer_edit=True,
+        )
+        await callback.answer()
+        return
+
+    if action == "del_confirm":
+        full = await db.get_user_full(target_tg)
+        if not full:
+            await callback.answer("Уже удалён.", show_alert=True)
+            return
+        full_uuid = full[1]
+        panel_ok = True
+        if full_uuid:
+            panel_ok, _err = await api.delete_user(full_uuid)
+        await db.delete_user(target_tg)
+        msg = (
+            f"✅ Пользователь <code>{target_tg}</code> удалён."
+            if panel_ok
+            else f"⚠️ Локально удалён, но в Remnawave удалить не вышло (uuid <code>{full_uuid}</code>)."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")]]
+        )
+        await safe_edit(callback, msg, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+        await callback.answer()
+        return
+
     await callback.answer("Неизвестное действие.", show_alert=True)
+
+
+# --- Admin: DM message to a specific user ---
+
+class AdminDmStates(StatesGroup):
+    waiting_for_text = State()
+
+
+@dp.message(Command("dm"))
+async def cmd_dm(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer(
+            "Использование: <code>/dm &lt;tg_id|@username&gt; текст</code>",
+            parse_mode="HTML",
+        )
+        return
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Нужно указать получателя и текст.")
+        return
+    target_raw, text = parts
+    target_tg: Optional[int] = None
+    if target_raw.isdigit():
+        target_tg = int(target_raw)
+    else:
+        uname = target_raw[1:] if target_raw.startswith("@") else target_raw
+        row = await db.find_user_by_tg_username(uname)
+        if row:
+            target_tg = int(row[0])
+    if target_tg is None:
+        await message.answer("Получатель не найден в БД. Попроси его сначала запустить бота.")
+        return
+    sender_name = format_tg_name(
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name,
+    )
+    body = (
+        f"📩 <b>Сообщение от администратора</b> ({html.escape(sender_name)}):\n\n"
+        f"{html.escape(text)}"
+    )
+    try:
+        await bot.send_message(target_tg, body, parse_mode="HTML")
+        await message.answer(f"✅ Доставлено пользователю <code>{target_tg}</code>.", parse_mode="HTML")
+    except Exception as exc:
+        await message.answer(f"❌ Не удалось доставить: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+
+
+@dp.message(AdminDmStates.waiting_for_text)
+async def admin_dm_capture(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    if not text:
+        await message.answer("Текст не может быть пустым. /cancel чтобы выйти.")
+        return
+    data = await state.get_data()
+    target_tg = data.get("target_tg")
+    await state.clear()
+    if not target_tg:
+        await message.answer("Состояние потеряно — повторите из карточки пользователя.")
+        return
+    sender_name = format_tg_name(
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name,
+    )
+    body = (
+        f"📩 <b>Сообщение от администратора</b> ({html.escape(sender_name)}):\n\n"
+        f"{html.escape(text)}"
+    )
+    try:
+        await bot.send_message(int(target_tg), body, parse_mode="HTML")
+        await message.answer(f"✅ Доставлено пользователю <code>{target_tg}</code>.", parse_mode="HTML")
+    except Exception as exc:
+        await message.answer(
+            f"❌ Не удалось доставить: <code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+        )
+
+
+# --- Admin: promocodes ---
+
+@dp.callback_query(F.data == "admin_promos")
+async def cb_admin_promos(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    rows = await db.list_promocodes(limit=20)
+    if not rows:
+        text = "🎁 <b>Промокоды</b>\n\nПока ни одного. Создайте первый: <code>/issue_promo CODE 30 [max_uses]</code>"
+    else:
+        lines = ["🎁 <b>Промокоды</b> (последние 20)\n"]
+        for code, bonus, max_uses, used, revoked, _created in rows:
+            mu = "∞" if max_uses is None else str(max_uses)
+            status = "🚫" if revoked else "✅"
+            lines.append(
+                f"{status} <code>{html.escape(code)}</code> — +{bonus} дн., {used}/{mu}"
+            )
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")],
+        ]
+    )
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.message(Command("issue_promo"))
+async def cmd_issue_promo(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip().split()
+    if len(args) < 2:
+        await message.answer(
+            "Использование: <code>/issue_promo CODE bonus_days [max_uses]</code>\n"
+            "Например: <code>/issue_promo SUMMER25 30 100</code>",
+            parse_mode="HTML",
+        )
+        return
+    code = args[0]
+    try:
+        bonus_days = int(args[1])
+    except ValueError:
+        await message.answer("bonus_days должен быть целым числом.")
+        return
+    if bonus_days <= 0 or bonus_days > 3650:
+        await message.answer("bonus_days должен быть в диапазоне 1..3650.")
+        return
+    max_uses: Optional[int] = None
+    if len(args) >= 3:
+        try:
+            max_uses = int(args[2])
+        except ValueError:
+            await message.answer("max_uses должен быть целым числом или опущен.")
+            return
+        if max_uses <= 0:
+            await message.answer("max_uses должен быть положительным.")
+            return
+    ok = await db.create_promocode(
+        code, bonus_days=bonus_days, max_uses=max_uses, created_by=message.from_user.id
+    )
+    if not ok:
+        await message.answer(f"⚠️ Промокод <code>{html.escape(code)}</code> уже существует.", parse_mode="HTML")
+        return
+    mu = "∞" if max_uses is None else str(max_uses)
+    await message.answer(
+        f"✅ Промокод <code>{html.escape(code)}</code> создан.\n"
+        f"Бонус: <b>+{bonus_days}</b> дн., лимит использований: <b>{mu}</b>.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("revoke_promo"))
+async def cmd_revoke_promo(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    code = (command.args or "").strip()
+    if not code:
+        await message.answer("Использование: <code>/revoke_promo CODE</code>", parse_mode="HTML")
+        return
+    ok = await db.revoke_promocode(code)
+    if ok:
+        await message.answer(f"🚫 Промокод <code>{html.escape(code)}</code> отозван.", parse_mode="HTML")
+    else:
+        await message.answer(f"Промокод <code>{html.escape(code)}</code> не найден.", parse_mode="HTML")
+
+
+@dp.message(Command("list_promos"))
+async def cmd_list_promos(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    rows = await db.list_promocodes(limit=50)
+    if not rows:
+        await message.answer("Промокодов пока нет.")
+        return
+    lines = ["🎁 <b>Промокоды</b>\n"]
+    for code, bonus, max_uses, used, revoked, _created in rows:
+        mu = "∞" if max_uses is None else str(max_uses)
+        status = "🚫" if revoked else "✅"
+        lines.append(
+            f"{status} <code>{html.escape(code)}</code> — +{bonus} дн., {used}/{mu}"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- User: promocode redemption ---
+
+@dp.callback_query(F.data == "promo_input")
+async def cb_promo_input(callback: CallbackQuery, state: FSMContext):
+    if not (await auth.is_authorized(callback.from_user.id) or await auth.is_admin(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    await state.set_state(PromoStates.waiting_for_code)
+    await callback.message.answer(
+        "🎁 Введите промокод одной строкой. /cancel — отменить.",
+    )
+    await callback.answer()
+
+
+@dp.message(PromoStates.waiting_for_code)
+async def promo_capture(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    if not text:
+        await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.")
+        return
+    await state.clear()
+    tg_id = message.from_user.id
+    status, bonus_days = await db.redeem_promocode(text, tg_id)
+    if status == db.PROMO_NOT_FOUND:
+        await message.answer("❌ Такого промокода не существует.")
+        return
+    if status == db.PROMO_REVOKED:
+        await message.answer("❌ Промокод отозван.")
+        return
+    if status == db.PROMO_EXHAUSTED:
+        await message.answer("❌ Лимит использований промокода исчерпан.")
+        return
+    if status == db.PROMO_ALREADY_USED:
+        await message.answer("❌ Вы уже активировали этот промокод.")
+        return
+    # PROMO_OK
+    user = await db.get_user(tg_id)
+    if not user or not user[1]:
+        await message.answer(
+            "✅ Промокод принят, но у вас ещё нет аккаунта в панели — обратитесь к администратору."
+        )
+        return
+    full_uuid = user[1]
+    ok, _ = await api.extend_user_subscription_days(full_uuid, int(bonus_days or 0))
+    if not ok:
+        await message.answer(
+            "⚠️ Промокод принят, но не удалось продлить подписку в панели. "
+            "Сообщите администратору."
+        )
+        return
+    await sync_local_expire_from_panel(tg_id, full_uuid)
+    await message.answer(
+        f"🎉 Подписка продлена на <b>{bonus_days}</b> дн.!", parse_mode="HTML"
+    )
+
+
+# --- Support contacts ---
+
+@dp.callback_query(F.data == "support")
+async def cb_support(callback: CallbackQuery):
+    if not (await auth.is_authorized(callback.from_user.id) or await auth.is_admin(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    text = await db.get_setting(SUPPORT_KEY)
+    body = (
+        f"❓ <b>Поддержка</b>\n\n{text}"
+        if text
+        else "❓ <b>Поддержка</b>\n\nКонтакты поддержки пока не настроены."
+    )
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=back_only_keyboard(), prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_support")
+async def cb_admin_support(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    cur = await db.get_setting(SUPPORT_KEY)
+    body = (
+        "❓ <b>Контакты поддержки</b>\n\n"
+        f"Текущий текст:\n{cur if cur else '<i>не задан</i>'}\n\n"
+        "Изменить: <code>/set_support &lt;HTML-текст&gt;</code>\n"
+        "Очистить: <code>/set_support</code> без аргументов."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")],
+        ]
+    )
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.message(Command("set_support"))
+async def cmd_set_support(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await db.set_setting(SUPPORT_KEY, None)
+        await message.answer("Контакты поддержки очищены.")
+        return
+    await db.set_setting(SUPPORT_KEY, text)
+    await message.answer(
+        "✅ Контакты поддержки сохранены. Пользователи увидят кнопку «❓ Поддержка» в меню."
+    )
 
 
 # --- Main ---
@@ -1266,6 +1945,11 @@ ADMIN_COMMANDS = [
     BotCommand(command="issue_token", description="🔑 Выдать новый токен доступа"),
     BotCommand(command="revoke_token", description="🚫 Отозвать токен по префиксу"),
     BotCommand(command="import_users", description="📥 Импорт юзеров tg_<id> из Remnawave"),
+    BotCommand(command="issue_promo", description="🎁 Создать промокод"),
+    BotCommand(command="revoke_promo", description="🚫 Отозвать промокод"),
+    BotCommand(command="list_promos", description="📋 Список промокодов"),
+    BotCommand(command="set_support", description="❓ Задать контакты поддержки"),
+    BotCommand(command="dm", description="✉️ Написать пользователю"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
 

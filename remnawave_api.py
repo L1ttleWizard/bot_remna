@@ -170,6 +170,26 @@ class RemnawaveAPI:
         """Обновляет лимит устройств по HWID (PATCH /api/users). None = снять лимит (null в JSON)."""
         return await self.patch_user({"uuid": user_uuid, "hwidDeviceLimit": new_limit})
 
+    async def delete_user(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
+        """DELETE /api/users/{uuid} — удалить пользователя из панели.
+        Возвращает (ok, error_code). 404/A025 трактуется как «уже удалён» — ok=True.
+        """
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/users/{user_uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status == 200 or resp.status == 204:
+                        return True, None
+                    if resp.status == 404:
+                        # уже удалён
+                        return True, None
+                    err = await resp.text()
+                    logger.error(f"delete_user: статус {resp.status}, ответ: {err}")
+                    return False, f"http_{resp.status}"
+            except Exception as e:
+                logger.error(f"delete_user: {e}")
+                return False, "exception"
+
     async def list_users(self, size: int = 100, start: int = 0) -> Optional[dict]:
         """GET /api/users?size=&start= — постраничный список юзеров.
         Возвращает dict вида {'response': {'total': int, 'users': [...]}} или None при ошибке.
