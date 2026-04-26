@@ -146,12 +146,10 @@ def back_only_keyboard() -> InlineKeyboardMarkup:
 
 
 def main_keyboard_user() -> InlineKeyboardMarkup:
-    """Меню обычного пользователя — без управления подпиской/устройствами."""
+    """Меню обычного пользователя — read-only, с поддержкой нескольких подписок."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⚙️ Мои настройки", callback_data="my_settings")],
-            [InlineKeyboardButton(text="📅 Моя подписка", callback_data="my_subscription")],
-            [InlineKeyboardButton(text="📱 Мои устройства", callback_data="my_devices")],
+            [InlineKeyboardButton(text="📅 Мои подписки", callback_data="my_subs")],
             [InlineKeyboardButton(text="📥 Подключить", callback_data="connect")],
             [InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_input")],
             [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
@@ -254,6 +252,7 @@ api = RemnawaveAPI(base_url=REMNAWAVE_URL, api_token=REMNAWAVE_TOKEN)
 
 class PromoStates(StatesGroup):
     waiting_for_code = State()
+    waiting_for_sub_pick = State()
 
 
 SUPPORT_KEY = "support_text"
@@ -338,6 +337,7 @@ async def safe_edit(callback: CallbackQuery, text: str, *, parse_mode: str, repl
 
 
 async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
+    """Синкает expire_date конкретной подписки (по uuid) с тем, что отдаёт панель."""
     info = await api.get_user_info(full_uuid)
     if not info or "response" not in info:
         return
@@ -348,7 +348,7 @@ async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    await db.update_user_expire(tg_id, int(dt.timestamp()))
+    await db.update_subscription_expire_by_uuid(full_uuid, int(dt.timestamp()))
 
 
 _USERNAME_SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
@@ -394,20 +394,43 @@ async def create_account_for_user(
     tg_username: Optional[str] = None,
     tg_first_name: Optional[str] = None,
 ) -> Optional[str]:
-    """Создаёт аккаунт в Remnawave, кладёт запись в БД. Возвращает subscriptionUrl."""
-    # Если профиль не передан — попробуем взять из локальной БД
-    # (`TgProfileMiddleware` уже сохранил его при /start или /redeem).
+    """Создаёт **новую** подписку в Remnawave для tg_id и кладёт запись в БД.
+
+    Имя в панели: для первой подписки — `tg_<id>_<name>`, для второй+ — добавляется
+    суффикс `_<n>`. При коллизии в панели инкрементим n до успеха.
+    """
     if tg_username is None and tg_first_name is None:
         existing_profile = await db.get_user_full(tg_id)
         if existing_profile:
             tg_username = existing_profile[6]
             tg_first_name = existing_profile[7]
-    username = build_panel_username(tg_id, tg_username, tg_first_name)
-    response = await api.create_user(
-        username=username,
-        expire_days=expire_days,
-        hwid_device_limit=hwid_device_limit,
-    )
+    base_username = build_panel_username(tg_id, tg_username, tg_first_name)
+    existing_count = await db.count_subscriptions(tg_id)
+
+    response = None
+    username = base_username
+    # Пытаемся создать с прогрессивно увеличивающимся суффиксом, пока не получится.
+    for attempt in range(existing_count, existing_count + 20):
+        candidate = (
+            base_username
+            if attempt == 0
+            else f"{base_username}_{attempt + 1}"
+        )
+        # Если получился слишком длинный — обрежем (Remnawave ограничивает 32 символа).
+        candidate = candidate[:_REMNAWAVE_USERNAME_MAX_LEN]
+        response = await api.create_user(
+            username=candidate,
+            expire_days=expire_days,
+            hwid_device_limit=hwid_device_limit,
+        )
+        if response and "response" in response:
+            username = candidate
+            break
+        # 409 / username taken → пробуем следующий суффикс
+        logger.warning("create_user('%s') не удалось, пробуем следующий суффикс", candidate)
+    else:
+        logger.error("Не удалось создать аккаунт для tg_id=%s после нескольких попыток", tg_id)
+        return None
     if not response or "response" not in response:
         logger.error("Не удалось создать аккаунт для tg_id=%s: %s", tg_id, response)
         return None
@@ -488,13 +511,6 @@ async def cmd_redeem(message: Message, command: CommandObject):
 async def _try_redeem_token(message: Message, raw_token: str) -> None:
     tg_id = message.from_user.id
 
-    # Если уже авторизован — не даём активировать второй раз.
-    if await auth.is_authorized(tg_id):
-        await message.answer(
-            "У вас уже есть активный доступ. Откройте меню командой /start.",
-        )
-        return
-
     token = await auth.find_redeemable_token(raw_token.split()[0])
     if token is None:
         await message.answer(
@@ -521,10 +537,16 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
         # Кто-то опередил — крайне маловероятно, но логируем.
         logger.warning("Token race for tg_id=%s, hash=%s", tg_id, token.token_hash[:12])
 
+    sub_count = await db.count_subscriptions(tg_id)
+    head = (
+        "✅ Доступ активирован!"
+        if sub_count <= 1
+        else f"✅ Добавлена ещё одна подписка (всего: {sub_count})."
+    )
     await message.answer(
-        "✅ Доступ активирован!\n\n"
+        f"{head}\n\n"
         f"🔗 Ваша ссылка на подписку:\n<code>{html.escape(sub_url)}</code>\n\n"
-        "Скопируйте ссылку и вставьте в приложение.",
+        "Скопируйте ссылку и вставьте в приложение или нажмите «📥 Подключить» для пошаговой инструкции.",
         parse_mode="HTML",
         reply_markup=main_keyboard_user(),
     )
@@ -947,6 +969,169 @@ async def _ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
     return user_data
 
 
+def _format_sub_caption(sub: tuple) -> str:
+    """Делает читаемое название из (id, uuid, short_uuid, username, expire_date, label, created_at)."""
+    sid, _uuid, _short, username, expire_date, label, _created = sub
+    if label:
+        head = label
+    elif username:
+        head = username
+    else:
+        head = f"#{sid}"
+    if expire_date:
+        ts = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
+        return f"#{sid} · {head} · до {ts}"
+    return f"#{sid} · {head}"
+
+
+async def _ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> Optional[tuple]:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return None
+    return sub
+
+
+def _user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статус и трафик", callback_data=f"sub:info:{sub_id}")],
+            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}")],
+            [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
+            [InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")],
+        ]
+    )
+
+
+@dp.callback_query(F.data == "my_subs")
+async def cb_my_subs(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    subs = await db.list_subscriptions(callback.from_user.id)
+    if not subs:
+        await safe_edit(
+            callback,
+            "У вас пока нет активных подписок. Активируйте токен через /redeem.",
+            parse_mode="HTML",
+            reply_markup=back_only_keyboard(),
+            prefer_edit=True,
+        )
+        await callback.answer()
+        return
+    if len(subs) == 1:
+        await _render_sub_open(callback, subs[0], prefer_edit=True)
+        return
+    rows = []
+    for sub in subs:
+        cap = _format_sub_caption(sub)[:60]
+        rows.append([InlineKeyboardButton(text=cap, callback_data=f"sub:open:{sub[0]}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
+    await safe_edit(
+        callback,
+        f"📅 <b>Ваши подписки</b> ({len(subs)})",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=True,
+    )
+    await callback.answer()
+
+
+async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: bool) -> None:
+    sid, uuid, short_uuid, username, expire_date, label, _created = sub
+    expire_str = (
+        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
+        if expire_date else "—"
+    )
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    text = (
+        f"📅 <b>Подписка #{sid}</b>"
+        f"{(' · ' + html.escape(label)) if label else ''}\n\n"
+        f"<b>Имя в панели:</b> <code>{html.escape(username or '—')}</code>\n"
+        f"<b>Действует до:</b> {html.escape(expire_str)}\n"
+        f"<b>Ссылка:</b> <code>{html.escape(sub_url)}</code>"
+    )
+    await safe_edit(
+        callback, text, parse_mode="HTML",
+        reply_markup=_user_sub_menu_keyboard(sid), prefer_edit=prefer_edit,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sub:open:"))
+async def cb_sub_open(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    # adapt 9-tuple to 7-tuple for _render_sub_open
+    adapted = (sub[0], sub[2], sub[3], sub[4], sub[5], sub[6], sub[8])
+    await _render_sub_open(callback, adapted, prefer_edit=True)
+
+
+@dp.callback_query(F.data.startswith("sub:info:"))
+async def cb_sub_info(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    full_uuid = sub[2]
+    short_uuid = sub[3]
+    expire_timestamp = sub[5]
+    expire_date_str = (
+        datetime.fromtimestamp(expire_timestamp).strftime("%d.%m.%Y %H:%M")
+        if expire_timestamp else "—"
+    )
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    info = await api.get_user_info(full_uuid)
+    status_text = "Активна ✅"
+    limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
+    traffic_lines = ""
+    if info and "response" in info:
+        api_data = info["response"]
+        panel_status = api_data.get("status", "ACTIVE")
+        if panel_status != "ACTIVE":
+            status_text = "Неактивна ❌"
+        limit_text = hwid_limit_caption(api_data)
+        traffic_lines = "\n\n" + traffic_summary_markdown(api_data)
+    text = (
+        f"📊 **Подписка #{sub_id}**\n\n"
+        f"**Статус:** {status_text}\n"
+        f"**Лимит устройств (HWID):** {limit_text}\n"
+        f"**Действует до:** `{expire_date_str}`\n"
+        f"{traffic_lines}\n\n"
+        f"🔗 **Ссылка:** `{sub_url}`"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sub:info:{sub_id}")],
+            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"sub:open:{sub_id}")],
+        ]
+    )
+    await safe_edit(callback, text, parse_mode="Markdown", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sub:dev:"))
+async def cb_sub_devices(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    full_uuid = sub[2]
+    text, _devices, _show = await load_devices_text(full_uuid)
+    text = f"📱 <b>Устройства подписки #{sub_id}</b>\n\n" + text
+    text += "\n\nℹ️ Управление лимитами доступно только администратору."
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sub:dev:{sub_id}")],
+            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"sub:open:{sub_id}")],
+        ]
+    )
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "my_settings")
 async def cb_my_settings(callback: CallbackQuery):
     user_data = await _ensure_authorized_user(callback)
@@ -1180,25 +1365,30 @@ PLATFORM_TITLES = {
 }
 
 
-def connect_platform_keyboard() -> InlineKeyboardMarkup:
+def connect_platform_keyboard(sub_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data="connect_p:ios")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["android"], callback_data="connect_p:android")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data="connect_p:windows")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data="connect_p:macos")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["linux"], callback_data="connect_p:linux")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data=f"connect_p:{sub_id}:ios")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["android"], callback_data=f"connect_p:{sub_id}:android")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data=f"connect_p:{sub_id}:windows")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data=f"connect_p:{sub_id}:macos")],
+            [InlineKeyboardButton(text=PLATFORM_TITLES["linux"], callback_data=f"connect_p:{sub_id}:linux")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="connect")],
         ]
     )
 
 
-async def _resolve_user_sub_url(tg_id: int) -> Optional[str]:
-    user = await db.get_user(tg_id)
-    if not user or not user[2]:
-        return None
-    short_uuid = user[2]
-    return f"{SUB_DOMAIN}/{short_uuid}"
+async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> None:
+    text = (
+        f"📥 <b>Подключение подписки #{sub_id}</b>\n\n"
+        "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
+        "deep-link для импорта одной кнопкой и QR-код."
+    )
+    await safe_edit(
+        callback, text, parse_mode="HTML",
+        reply_markup=connect_platform_keyboard(sub_id), prefer_edit=True,
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "connect")
@@ -1206,16 +1396,51 @@ async def cb_connect(callback: CallbackQuery):
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
-    text = (
-        "📥 <b>Подключение</b>\n\n"
-        "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
-        "deep-link для импорта одной кнопкой и QR-код подписки."
-    )
+    subs = await db.list_subscriptions(callback.from_user.id)
+    if not subs:
+        await safe_edit(
+            callback,
+            "📥 У вас пока нет активных подписок. Активируйте токен через /redeem.",
+            parse_mode="HTML",
+            reply_markup=back_only_keyboard(),
+            prefer_edit=True,
+        )
+        await callback.answer()
+        return
+    if len(subs) == 1:
+        await _show_connect_platform_menu(callback, subs[0][0])
+        return
+    rows = []
+    for sub in subs:
+        cap = _format_sub_caption(sub)[:60]
+        rows.append([InlineKeyboardButton(text=cap, callback_data=f"connect_s:{sub[0]}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     await safe_edit(
-        callback, text, parse_mode="HTML",
-        reply_markup=connect_platform_keyboard(), prefer_edit=True,
+        callback,
+        "📥 <b>Подключение</b>\n\nВыберите подписку:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=True,
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("connect_s:"))
+async def cb_connect_pick_sub(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 1)[1])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    await _show_connect_platform_menu(callback, sub_id)
+
+
+@dp.callback_query(F.data.startswith("sub:conn:"))
+async def cb_sub_connect(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    await _show_connect_platform_menu(callback, sub_id)
 
 
 @dp.callback_query(F.data.startswith("connect_p:"))
@@ -1223,15 +1448,25 @@ async def cb_connect_platform(callback: CallbackQuery):
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
-    platform = callback.data.split(":", 1)[1]
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    try:
+        sub_id = int(parts[1])
+    except ValueError:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    platform = parts[2]
     if platform not in CLIENT_CATALOG:
         await callback.answer("Неизвестная платформа.", show_alert=True)
         return
 
-    sub_url = await _resolve_user_sub_url(callback.from_user.id)
-    if not sub_url:
-        # Админ без своего аккаунта — даём общую инструкцию без ссылки/QR
-        sub_url = ""
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    short_uuid = sub[3]
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else ""
 
     title = PLATFORM_TITLES[platform]
     clients = CLIENT_CATALOG[platform]
@@ -1265,7 +1500,7 @@ async def cb_connect_platform(callback: CallbackQuery):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ К выбору платформы", callback_data="connect")],
+            [InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
         ]
     )
@@ -1317,8 +1552,13 @@ async def cb_back_main(callback: CallbackQuery):
 
 # --- Admin actions on a specific target user (admu:<tg>:...) ---
 
-def _parse_admu(data: str) -> Optional[tuple[int, str, Optional[str]]]:
-    """admu:<tg>:<action>[:<arg>] -> (tg, action, arg)."""
+def _parse_admu(data: str) -> Optional[tuple[int, Optional[int], str, Optional[str]]]:
+    """Парсит admu callback. Возвращает (tg, sub_id, action, arg).
+
+    Форматы:
+      admu:<tg>:<action>[:<arg>]            — действие по «текущей» подписке (legacy)
+      admu:<tg>:s:<sub_id>:<action>[:<arg>] — действие по конкретной подписке
+    """
     parts = data.split(":")
     if len(parts) < 3 or parts[0] != "admu":
         return None
@@ -1326,9 +1566,19 @@ def _parse_admu(data: str) -> Optional[tuple[int, str, Optional[str]]]:
         tg = int(parts[1])
     except ValueError:
         return None
+    if parts[2] == "s":
+        if len(parts) < 5:
+            return None
+        try:
+            sub_id = int(parts[3])
+        except ValueError:
+            return None
+        action = parts[4]
+        arg = parts[5] if len(parts) >= 6 else None
+        return tg, sub_id, action, arg
     action = parts[2]
     arg = parts[3] if len(parts) >= 4 else None
-    return tg, action, arg
+    return tg, None, action, arg
 
 
 async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tuple]:
@@ -1385,12 +1635,18 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
     )
     if not has_account:
         text += "\n⚠️ У пользователя нет аккаунта в Remnawave (токен не активирован)."
+    subs = await db.list_subscriptions(target_tg)
+    if subs:
+        text += f"\n\n<b>Подписок:</b> {len(subs)}"
     rows = []
-    if has_account:
-        rows.append([InlineKeyboardButton(text="📅 Подписка", callback_data=f"admu:{target_tg}:sub")])
-        rows.append([InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:dev")])
+    for sub in subs:
+        cap = _format_sub_caption(sub)[:55]
+        rows.append([InlineKeyboardButton(
+            text=f"📅 {cap}",
+            callback_data=f"admu:{target_tg}:s:{sub[0]}:open",
+        )])
     rows.append([InlineKeyboardButton(text="✉️ Написать", callback_data=f"admu:{target_tg}:dm")])
-    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admu:{target_tg}:del")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admu:{target_tg}:del")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
     rows.append([InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")])
     await safe_edit(
@@ -1434,6 +1690,212 @@ async def _send_admin_devices(callback: CallbackQuery, target_tg: int, *, prefer
     )
 
 
+def _admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+7 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:7"),
+                InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:30"),
+            ],
+            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
+            [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
+            [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
+        ]
+    )
+
+
+def _admin_sub_devices_keyboard(target_tg: int, sub_id: int, devices_count: int, show_limits: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(devices_count):
+        rows.append([InlineKeyboardButton(
+            text=f"🗑 Удалить #{i + 1}",
+            callback_data=f"admu:{target_tg}:s:{sub_id}:hw_rm:{i}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")])
+    if show_limits:
+        rows.append([
+            InlineKeyboardButton(text="➕ +1", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:1"),
+            InlineKeyboardButton(text="➕ +3", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:3"),
+        ])
+        rows.append([InlineKeyboardButton(text="♾ Без лимита", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:inf")])
+    rows.append([InlineKeyboardButton(text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool) -> None:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != target_tg:
+        await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
+        return
+    full_uuid = sub[2]
+    text = await load_subscription_text(full_uuid)
+    expire_str = (
+        datetime.fromtimestamp(int(sub[5])).strftime("%d.%m.%Y %H:%M")
+        if sub[5] else "—"
+    )
+    text = (
+        f"📅 <b>Подписка #{sub_id}</b> пользователя <code>{target_tg}</code>\n"
+        f"<b>panel username:</b> {html.escape(sub[4] or '—')}\n"
+        f"<b>uuid:</b> <code>{html.escape(sub[2])}</code>\n"
+        f"<b>действует до:</b> {html.escape(expire_str)}\n\n"
+    ) + text
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_admin_sub_keyboard(target_tg, sub_id),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_sub_devices(callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool) -> None:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != target_tg:
+        await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
+        return
+    full_uuid = sub[2]
+    text, devices, show_limits = await load_devices_text(full_uuid)
+    text = f"📱 <b>Устройства подписки #{sub_id}</b> · tg=<code>{target_tg}</code>\n\n" + text
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_admin_sub_devices_keyboard(target_tg, sub_id, len(devices), show_limits),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int, action: str, arg: Optional[str]) -> None:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != target_tg:
+        await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
+        return
+    full_uuid = sub[2]
+
+    if action == "open":
+        await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "ext":
+        try:
+            days = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректные данные.", show_alert=True)
+            return
+        ok, _ = await api.extend_user_subscription_days(full_uuid, days)
+        if ok:
+            await sync_local_expire_from_panel(target_tg, full_uuid)
+            await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
+            await callback.answer(f"Подписка продлена на {days} дн.")
+        else:
+            await callback.answer("Не удалось продлить подписку.", show_alert=True)
+        return
+
+    if action == "dev":
+        await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "hw_lim":
+        info = await api.get_user_info(full_uuid)
+        if not info or "response" not in info:
+            await callback.answer("Не удалось получить данные с панели.", show_alert=True)
+            return
+        ad = info["response"]
+        if arg == "inf":
+            if is_hwid_unlimited(ad):
+                await callback.answer("Уже без лимита.", show_alert=True)
+                return
+            if await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_SENTINEL):
+                await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
+                await callback.answer("Лимит снят")
+            else:
+                await callback.answer("Не удалось обновить лимит.", show_alert=True)
+            return
+        if is_hwid_unlimited(ad):
+            await callback.answer("Уже без лимита.", show_alert=True)
+            return
+        try:
+            delta = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректное действие.", show_alert=True)
+            return
+        cur = effective_hwid_limit(ad)
+        new_val = min(cur + delta, MAX_HWID_INCREMENT_CAP)
+        if new_val == cur and cur >= MAX_HWID_INCREMENT_CAP:
+            await callback.answer(f"Достигнут верхний порог ({MAX_HWID_INCREMENT_CAP}).", show_alert=True)
+            return
+        if await api.update_hwid_device_limit(full_uuid, new_val):
+            await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
+            await callback.answer(f"Лимит: {cur} → {new_val}")
+        else:
+            await callback.answer("Не удалось обновить лимит.", show_alert=True)
+        return
+
+    if action == "hw_rm":
+        try:
+            idx = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректные данные.", show_alert=True)
+            return
+        hw_raw = await api.get_user_hwid_devices(full_uuid)
+        devices: list = []
+        if hw_raw and "response" in hw_raw:
+            devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+        if idx < 0 or idx >= len(devices):
+            await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
+            return
+        hwid = devices[idx].get("hwid")
+        if not hwid or not await api.delete_user_hwid_device(full_uuid, hwid):
+            await callback.answer("Не удалось удалить устройство.", show_alert=True)
+            return
+        await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
+        await callback.answer("Устройство удалено")
+        return
+
+    if action == "del":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❌ Подтвердить удаление",
+                    callback_data=f"admu:{target_tg}:s:{sub_id}:del_confirm",
+                )],
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
+            ]
+        )
+        warning = (
+            f"⚠️ <b>Удалить подписку #{sub_id}</b> у <code>{target_tg}</code>?\n\n"
+            f"Аккаунт <code>{html.escape(sub[4] or '—')}</code> будет удалён из Remnawave-панели.\n"
+            "Действие необратимо."
+        )
+        await safe_edit(callback, warning, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "del_confirm":
+        panel_ok, _err = await api.delete_user(full_uuid)
+        await db.delete_subscription(sub_id)
+        msg = (
+            f"✅ Подписка #{sub_id} удалена."
+            if panel_ok
+            else f"⚠️ Запись удалена локально, в Remnawave удалить не вышло (uuid <code>{full_uuid}</code>)."
+        )
+        await safe_edit(
+            callback, msg,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")]
+            ]),
+            prefer_edit=True,
+        )
+        await callback.answer()
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
+
+
 @dp.callback_query(F.data.startswith("admu:"))
 async def cb_admu(callback: CallbackQuery, state: FSMContext):
     if not await auth.is_admin(callback.from_user.id):
@@ -1443,7 +1905,11 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
     if not parsed:
         await callback.answer("Некорректные данные.", show_alert=True)
         return
-    target_tg, action, arg = parsed
+    target_tg, sub_id, action, arg = parsed
+
+    if sub_id is not None:
+        await _handle_admu_sub(callback, target_tg, sub_id, action, arg)
+        return
 
     if action == "open":
         await _send_admin_user_card(callback, target_tg, prefer_edit=True)
@@ -1601,19 +2067,19 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
         return
 
     if action == "del_confirm":
-        full = await db.get_user_full(target_tg)
-        if not full:
-            await callback.answer("Уже удалён.", show_alert=True)
-            return
-        full_uuid = full[1]
-        panel_ok = True
-        if full_uuid:
-            panel_ok, _err = await api.delete_user(full_uuid)
+        subs = await db.list_subscriptions(target_tg)
+        deleted = 0
+        failed = 0
+        for sub in subs:
+            ok, _ = await api.delete_user(sub[1])
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
         await db.delete_user(target_tg)
         msg = (
-            f"✅ Пользователь <code>{target_tg}</code> удалён."
-            if panel_ok
-            else f"⚠️ Локально удалён, но в Remnawave удалить не вышло (uuid <code>{full_uuid}</code>)."
+            f"✅ Пользователь <code>{target_tg}</code> удалён.\n"
+            f"Подписок удалено в панели: {deleted}, ошибок: {failed}."
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")]]
@@ -1832,6 +2298,49 @@ async def cb_promo_input(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _peek_promocode(code: str, tg_id: int) -> tuple[str, Optional[int]]:
+    """Проверяет валидность кода БЕЗ потребления. Возвращает (status, bonus_days|None)."""
+    row = await db.get_promocode(code)
+    if not row:
+        return db.PROMO_NOT_FOUND, None
+    _code, bonus_days, max_uses, used_count, _created_by, _created_at, revoked = row
+    if revoked:
+        return db.PROMO_REVOKED, None
+    if max_uses is not None and used_count >= max_uses:
+        return db.PROMO_EXHAUSTED, None
+    if await db.has_promocode_use(code, tg_id):
+        return db.PROMO_ALREADY_USED, None
+    return db.PROMO_OK, int(bonus_days)
+
+
+async def _apply_promo_to_subscription(
+    message: Message, code: str, sub_id: int, bonus_days: int
+) -> None:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != message.from_user.id:
+        await message.answer("❌ Подписка не найдена.")
+        return
+    full_uuid = sub[2]
+    # Атомарно потребляем код
+    status, _ = await db.redeem_promocode(code, message.from_user.id)
+    if status != db.PROMO_OK:
+        # Кто-то опередил между peek и redeem
+        await message.answer("❌ Не удалось активировать промокод (возможно, кто-то опередил). Попробуйте ещё раз.")
+        return
+    ok, _ = await api.extend_user_subscription_days(full_uuid, int(bonus_days))
+    if not ok:
+        await message.answer(
+            "⚠️ Промокод принят, но не удалось продлить подписку в панели. "
+            "Сообщите администратору."
+        )
+        return
+    await sync_local_expire_from_panel(message.from_user.id, full_uuid)
+    await message.answer(
+        f"🎉 Подписка #{sub_id} продлена на <b>{bonus_days}</b> дн.!",
+        parse_mode="HTML",
+    )
+
+
 @dp.message(PromoStates.waiting_for_code)
 async def promo_capture(message: Message, state: FSMContext):
     text = (message.text or "").strip()
@@ -1842,40 +2351,73 @@ async def promo_capture(message: Message, state: FSMContext):
     if not text:
         await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.")
         return
-    await state.clear()
     tg_id = message.from_user.id
-    status, bonus_days = await db.redeem_promocode(text, tg_id)
+    status, bonus_days = await _peek_promocode(text, tg_id)
     if status == db.PROMO_NOT_FOUND:
+        await state.clear()
         await message.answer("❌ Такого промокода не существует.")
         return
     if status == db.PROMO_REVOKED:
+        await state.clear()
         await message.answer("❌ Промокод отозван.")
         return
     if status == db.PROMO_EXHAUSTED:
+        await state.clear()
         await message.answer("❌ Лимит использований промокода исчерпан.")
         return
     if status == db.PROMO_ALREADY_USED:
+        await state.clear()
         await message.answer("❌ Вы уже активировали этот промокод.")
         return
-    # PROMO_OK
-    user = await db.get_user(tg_id)
-    if not user or not user[1]:
+
+    subs = await db.list_subscriptions(tg_id)
+    if not subs:
+        await state.clear()
         await message.answer(
-            "✅ Промокод принят, но у вас ещё нет аккаунта в панели — обратитесь к администратору."
+            "✅ Промокод корректный, но у вас ещё нет аккаунта в панели — обратитесь к администратору."
         )
         return
-    full_uuid = user[1]
-    ok, _ = await api.extend_user_subscription_days(full_uuid, int(bonus_days or 0))
-    if not ok:
-        await message.answer(
-            "⚠️ Промокод принят, но не удалось продлить подписку в панели. "
-            "Сообщите администратору."
-        )
+    if len(subs) == 1:
+        await state.clear()
+        await _apply_promo_to_subscription(message, text, subs[0][0], int(bonus_days or 0))
         return
-    await sync_local_expire_from_panel(tg_id, full_uuid)
+    # multi-sub: ask which one to extend
+    await state.set_state(PromoStates.waiting_for_sub_pick)
+    await state.update_data(code=text, bonus_days=int(bonus_days or 0))
+    rows = []
+    for sub in subs:
+        cap = _format_sub_caption(sub)[:60]
+        rows.append([InlineKeyboardButton(text=cap, callback_data=f"promo_pick:{sub[0]}")])
+    rows.append([InlineKeyboardButton(text="Отменить", callback_data="promo_cancel")])
     await message.answer(
-        f"🎉 Подписка продлена на <b>{bonus_days}</b> дн.!", parse_mode="HTML"
+        f"🎁 Промокод даст +{bonus_days} дн. Выберите подписку для продления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
+
+
+@dp.callback_query(F.data.startswith("promo_pick:"), PromoStates.waiting_for_sub_pick)
+async def cb_promo_pick(callback: CallbackQuery, state: FSMContext):
+    sub_id = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    await state.clear()
+    code = data.get("code")
+    bonus_days = int(data.get("bonus_days") or 0)
+    if not code:
+        await callback.answer("Состояние истекло. Введите промокод заново.", show_alert=True)
+        return
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+    await _apply_promo_to_subscription(callback.message, code, sub_id, bonus_days)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "promo_cancel", PromoStates.waiting_for_sub_pick)
+async def cb_promo_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Отменено. Промокод не активирован.")
+    await callback.answer()
 
 
 # --- Support contacts ---
