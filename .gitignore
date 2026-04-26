@@ -1,0 +1,8 @@
+.env
+.env.local
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+bot_logs.log
+*.log

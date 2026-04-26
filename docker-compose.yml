@@ -1,0 +1,44 @@
+# Запуск: скопируйте .env.example в .env и заполните значения.
+# docker compose up -d --build
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bot-remna:latest
+    container_name: bot-remna
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/bot_database.db
+      TZ: Europe/Moscow
+      HOME: /tmp
+    volumes:
+      - bot_data:/data
+    # Только чтение корня ФС; БД и временные файлы — в смонтированных путях.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  bot_data:
+    driver: local
