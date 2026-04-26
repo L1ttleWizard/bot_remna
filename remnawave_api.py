@@ -1,3 +1,4 @@
+import asyncio
 import aiohttp
 import logging
 from datetime import datetime, timedelta, timezone
@@ -175,14 +176,17 @@ class RemnawaveAPI:
         user_uuid: str,
         start_date: str,
         end_date: str,
+        *,
+        timeout_s: float = 4.0,
     ) -> Optional[int]:
         """Сумма трафика юзера за окно [start_date..end_date] (YYYY-MM-DD).
 
         Использует Remnawave 2.4+ `/api/bandwidth-stats/users/{uuid}` (sparklineData),
         с fallback на legacy `/api/bandwidth-stats/users/{uuid}/legacy`.
-        Возвращает суммарные байты или None если эндпоинт недоступен/упал.
+        Возвращает суммарные байты или None если эндпоинт недоступен/упал/таймаут.
         """
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
             base = f"{self.base_url}/api/bandwidth-stats/users/{user_uuid}"
             params = {"start": start_date, "end": end_date, "topNodesLimit": 1}
             try:
@@ -193,9 +197,13 @@ class RemnawaveAPI:
                         return int(sum(int(v) for v in spark))
                     if resp.status not in (404, 405):
                         logger.error(
-                            "get_user_usage_range %s: статус %s, ответ: %s",
-                            user_uuid, resp.status, await resp.text(),
+                            "get_user_usage_range %s: статус %s",
+                            user_uuid, resp.status,
                         )
+                        return None
+            except asyncio.TimeoutError:
+                logger.warning("get_user_usage_range %s: timeout", user_uuid)
+                return None
             except Exception as e:
                 logger.error("get_user_usage_range %s: %s", user_uuid, e)
 
@@ -212,9 +220,11 @@ class RemnawaveAPI:
                             return int(sum(int(r.get("total") or 0) for r in rows))
                     else:
                         logger.error(
-                            "get_user_usage_range legacy %s: статус %s, ответ: %s",
-                            user_uuid, resp.status, await resp.text(),
+                            "get_user_usage_range legacy %s: статус %s",
+                            user_uuid, resp.status,
                         )
+            except asyncio.TimeoutError:
+                logger.warning("get_user_usage_range legacy %s: timeout", user_uuid)
             except Exception as e:
                 logger.error("get_user_usage_range legacy %s: %s", user_uuid, e)
         return None

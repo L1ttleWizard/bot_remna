@@ -1367,7 +1367,14 @@ async def cb_sub_info(callback: CallbackQuery):
         if expire_timestamp else "—"
     )
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
-    info = await api.get_user_info(full_uuid)
+    start_d, end_d = _analytics_date_range()
+    info_res, period_res = await asyncio.gather(
+        api.get_user_info(full_uuid),
+        api.get_user_usage_range(full_uuid, start_d, end_d),
+        return_exceptions=True,
+    )
+    info = info_res if not isinstance(info_res, BaseException) else None
+    period_30 = period_res if not isinstance(period_res, BaseException) else None
     status_text = "Активна ✅"
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
     traffic_lines = ""
@@ -1385,11 +1392,8 @@ async def cb_sub_info(callback: CallbackQuery):
         last_iso = api_data.get("lastOnlineAt") or ""
         if last_iso:
             last_online_line = f"\n**Последний онлайн:** `{format_expire_display(last_iso)}`"
-
-        start_d, end_d = _analytics_date_range()
-        period_30 = await api.get_user_usage_range(full_uuid, start_d, end_d)
-        if period_30 is not None:
-            period_30_line = f"\n**За {ANALYTICS_PERIOD_DAYS} дней:** {human_bytes(int(period_30))}"
+    if period_30 is not None:
+        period_30_line = f"\n**За {ANALYTICS_PERIOD_DAYS} дней:** {human_bytes(int(period_30))}"
 
     text = (
         f"📈 **Аналитика подписки #{sub_id}**\n\n"
@@ -2280,8 +2284,15 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         if sub[5] else "—"
     )
 
-    # Аналитика: трафик / статус / последний онлайн / HWID — из get_user_info.
-    info = await api.get_user_info(full_uuid)
+    # Аналитика: статус / трафик / онлайн / HWID — параллельно info+30-day.
+    start_d, end_d = _analytics_date_range()
+    info_res, period_res = await asyncio.gather(
+        api.get_user_info(full_uuid),
+        api.get_user_usage_range(full_uuid, start_d, end_d),
+        return_exceptions=True,
+    )
+    info = info_res if not isinstance(info_res, BaseException) else None
+    period_30 = period_res if not isinstance(period_res, BaseException) else None
     stats_block = ""
     if info and "response" in info:
         ad = info["response"]
@@ -2297,9 +2308,6 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         last_h = format_expire_display(last_iso) if last_iso else "—"
         hwid_lim = hwid_limit_caption(ad)
         hwid_count = len((ad.get("hwidDevices") or []))
-
-        start_d, end_d = _analytics_date_range()
-        period_30 = await api.get_user_usage_range(full_uuid, start_d, end_d)
         period_30_txt = (
             human_bytes(int(period_30)) if period_30 is not None else "—"
         )
@@ -3175,11 +3183,22 @@ async def _collect_panel_traffic(
 
     if with_period_range and by_uuid:
         start_d, end_d = _analytics_date_range()
-        for uuid_v, info in by_uuid.items():
-            period = await api.get_user_usage_range(uuid_v, start_d, end_d)
+        uuids = list(by_uuid.keys())
+        # Параллельно пакетами по 16, чтобы не ддосить панель и не ловить таймауты.
+        chunk = 16
+        results: list[Optional[int]] = []
+        for i in range(0, len(uuids), chunk):
+            batch = uuids[i:i + chunk]
+            batch_results = await asyncio.gather(
+                *(api.get_user_usage_range(u, start_d, end_d) for u in batch),
+                return_exceptions=True,
+            )
+            for r in batch_results:
+                results.append(None if isinstance(r, BaseException) else r)
+        for uuid_v, period in zip(uuids, results):
             if period is None:
                 continue
-            info["period"] = int(period)
+            by_uuid[uuid_v]["period"] = int(period)
             traffic_period_total += int(period)
 
     return {
