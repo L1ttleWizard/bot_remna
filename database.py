@@ -510,6 +510,78 @@ async def count_users() -> int:
     return int(row[0]) if row else 0
 
 
+async def search_users(query: str, limit: int = 50, offset: int = 0) -> list:
+    """Находит юзеров по подстроке (без учёта регистра) в tg_id, tg_username,
+    tg_first_name, tg_last_name или username последней подписки.
+
+    Возвращает тот же 9-tuple что и list_users.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    pattern = f"%{q}%"
+    digit_match = q.lstrip("@").isdigit()
+    digit_value: Optional[int] = int(q.lstrip("@")) if digit_match else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT u.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date,
+                   u.role, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, uuid, short_uuid, username, expire_date, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE
+                CAST(u.tg_id AS TEXT) LIKE ?
+                OR (u.tg_username   IS NOT NULL AND u.tg_username   LIKE ? COLLATE NOCASE)
+                OR (u.tg_first_name IS NOT NULL AND u.tg_first_name LIKE ? COLLATE NOCASE)
+                OR (u.tg_last_name  IS NOT NULL AND u.tg_last_name  LIKE ? COLLATE NOCASE)
+                OR (s.username      IS NOT NULL AND s.username      LIKE ? COLLATE NOCASE)
+                OR (? IS NOT NULL AND u.tg_id = ?)
+            ORDER BY
+                CASE WHEN s.created_at IS NULL THEN 1 ELSE 0 END,
+                COALESCE(s.created_at, u.created_at, 0) DESC,
+                u.tg_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (pattern, pattern, pattern, pattern, pattern, digit_value, digit_value, limit, offset),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+
+async def count_search_users(query: str) -> int:
+    q = (query or "").strip()
+    if not q:
+        return 0
+    pattern = f"%{q}%"
+    digit_match = q.lstrip("@").isdigit()
+    digit_value: Optional[int] = int(q.lstrip("@")) if digit_match else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*)
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, username,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE
+                CAST(u.tg_id AS TEXT) LIKE ?
+                OR (u.tg_username   IS NOT NULL AND u.tg_username   LIKE ? COLLATE NOCASE)
+                OR (u.tg_first_name IS NOT NULL AND u.tg_first_name LIKE ? COLLATE NOCASE)
+                OR (u.tg_last_name  IS NOT NULL AND u.tg_last_name  LIKE ? COLLATE NOCASE)
+                OR (s.username      IS NOT NULL AND s.username      LIKE ? COLLATE NOCASE)
+                OR (? IS NOT NULL AND u.tg_id = ?)
+            """,
+            (pattern, pattern, pattern, pattern, pattern, digit_value, digit_value),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 # --- Access tokens ---
 
 async def create_access_token(
@@ -568,7 +640,7 @@ async def revoke_access_token(token_hash: str) -> bool:
         async with db.execute(
             """
             UPDATE access_tokens SET revoked = 1
-            WHERE token_hash = ? AND consumed_by_tg_id IS NULL
+            WHERE token_hash = ? AND consumed_by_tg_id IS NULL AND revoked = 0
             """,
             (token_hash,),
         ) as cursor:

@@ -21,8 +21,12 @@ from aiogram.types import (
     BotCommandScopeDefault,
     BufferedInputFile,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
     TelegramObject,
     User,
@@ -164,6 +168,7 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens")],
         [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos")],
         [InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support")],
+        [InlineKeyboardButton(text="📖 Гайд для админа", callback_data="admin_help")],
     ]
     if has_account:
         rows.append(
@@ -640,6 +645,75 @@ async def cmd_admin(message: Message):
     )
 
 
+ADMIN_HELP_TEXT = (
+    "🛠 <b>Гайд для администратора</b>\n\n"
+    "<b>📋 Команды</b>\n"
+    "• <code>/admin</code> — открыть админ-панель (кнопки внизу).\n"
+    "• <code>/help_admin</code> — этот гайд.\n"
+    "• <code>/whois &lt;tg_id|@username&gt;</code> — найти юзера в БД (роль, аккаунт, подписка).\n"
+    "• <code>/issue_token [days] [hwid_limit]</code> — выпустить одноразовый токен. "
+    "По умолчанию: 30 дн., HWID-лимит из конфига. Возвращает <code>raw</code>-токен и invite-ссылку.\n"
+    "• <code>/revoke_token &lt;ХЭШ_ИЛИ_ПРЕФИКС&gt;</code> — отозвать неиспользованный токен. "
+    "Можно передавать сам raw-токен — посчитается хэш.\n"
+    "• <code>/import_users</code> — импорт из Remnawave всех аккаунтов с username "
+    "<code>tg_&lt;id&gt;</code> или <code>tg_&lt;id&gt;_&lt;name&gt;</code> в БД. "
+    "Существующие записи дополняются недостающими полями.\n"
+    "• <code>/issue_promo &lt;CODE&gt; &lt;дни&gt; [max_uses]</code> — создать промокод. "
+    "Без <code>max_uses</code> — использований неограниченно.\n"
+    "• <code>/revoke_promo &lt;CODE&gt;</code> — отозвать промокод (использовать его больше нельзя).\n"
+    "• <code>/list_promos</code> — список последних 20 промокодов.\n"
+    "• <code>/dm &lt;tg_id|@username&gt; &lt;текст&gt;</code> — отправить личное сообщение. "
+    "Получатель должен существовать в БД (хотя бы раз запускал бота).\n"
+    "• <code>/set_support &lt;текст&gt;</code> — задать контакты поддержки (HTML разрешён). "
+    "Пустой текст — очистить.\n"
+    "• <code>/cancel</code> — выйти из любого ввода (поиск, DM, промо, импорт и т.п.).\n\n"
+    "<b>🔘 Кнопки админ-панели</b> (<code>/admin</code>)\n"
+    "• <b>👥 Пользователи</b> — список всех юзеров в БД с пагинацией. У каждой записи кнопка-карточка.\n"
+    "  В карточке юзера:\n"
+    "    · <i>📅 #X · username · до dd.mm.yyyy</i> — открыть конкретную подписку (статус, трафик, устройства).\n"
+    "    · <b>✉️ Написать</b> — отправить ему DM от вашего имени (FSM-ввод).\n"
+    "    · <b>🗑 Удалить пользователя</b> — снести все подписки в Remnawave + запись в БД (с подтверждением).\n"
+    "    · <b>🔎 Поиск</b> в списке — фильтр по подстроке (tg_id, @username, имя, фамилия, panel-username).\n"
+    "• <b>🔑 Выдать токен</b> — выпустить новый токен (≡ <code>/issue_token</code> с дефолтами).\n"
+    "• <b>📋 Активные токены</b> — список неиспользованных токенов. У каждого:\n"
+    "    · <b>✗ Отозвать ХЭШ…</b> — мгновенно пометить токен как отозванный.\n"
+    "    · <b>🔄 Обновить</b> — перерисовать список.\n"
+    "• <b>🎁 Промокоды</b> — список последних 20 промо. Создание/отзыв через команды.\n"
+    "• <b>❓ Поддержка</b> — задать/изменить контакты поддержки (FSM-ввод текста).\n\n"
+    "<b>🔍 Inline-поиск</b>\n"
+    "В любом чате наберите <code>@&lt;имя_бота&gt; &lt;запрос&gt;</code> — получите список юзеров. "
+    "Тап по юзеру отправит <code>/whois &lt;tg_id&gt;</code> в текущий чат и бот покажет карточку.\n"
+    "<i>Нужно один раз включить inline-режим у @BotFather:</i> "
+    "<code>/mybots → ваш бот → Bot Settings → Inline Mode → Turn on</code>.\n\n"
+    "<b>👤 Пользовательский интерфейс</b> (для справки)\n"
+    "• <b>📅 Мои подписки</b> — список подписок, тап → меню одной подписки.\n"
+    "• <b>📥 Подключить</b> — выбор платформы → клиенты с импорт-ссылками "
+    "и кнопками «📋 Скопировать импорт …».\n"
+    "• <b>🎁 Промокод</b> — ввод кода, продление выбранной подписки.\n"
+    "• <b>❓ Поддержка</b> — показ контактов поддержки.\n"
+)
+
+
+@dp.message(Command("help_admin"))
+async def cmd_help_admin(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    await message.answer(ADMIN_HELP_TEXT, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "admin_help")
+async def cb_admin_help(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
+    )
+    await safe_edit(callback, ADMIN_HELP_TEXT, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
 def _parse_expire_to_ts(value: Optional[str]) -> int:
     """ISO-строка expireAt → unix timestamp (UTC). Возвращает 0, если не парсится."""
     if not value:
@@ -806,25 +880,103 @@ async def cmd_whois(message: Message, command: CommandObject):
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
+# --- Inline mode: автокомплит юзеров для админа ---
+# Включается у BotFather: /mybots → @bot → Bot Settings → Inline Mode → Turn on.
+# Использование: в любом чате (или прямо в боте) ввести @<bot_username> <запрос>.
+# Только админ получит результаты — остальные увидят пустой список с подсказкой.
+
+@dp.inline_query()
+async def inline_user_search(query: InlineQuery):
+    if not await auth.is_admin(query.from_user.id):
+        await query.answer(
+            results=[],
+            cache_time=1,
+            is_personal=True,
+            switch_pm_text="Нет доступа",
+            switch_pm_parameter="no_access",
+        )
+        return
+    q = (query.query or "").strip()
+    if not q:
+        rows = await db.list_users(limit=20, offset=0)
+    else:
+        rows = await db.search_users(q, limit=20, offset=0)
+    results: list[InlineQueryResultArticle] = []
+    for (
+        tg_id, _uuid, _short, panel_username, expire_date,
+        role, tg_username, tg_first_name, tg_last_name,
+    ) in rows:
+        marker = "👑" if role == db.ROLE_ADMIN else "👤"
+        tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
+        when = (
+            datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
+            if expire_date else "—"
+        )
+        title = f"{marker} {tg_id} · {tg_name}"[:64]
+        desc_parts = []
+        if tg_username:
+            desc_parts.append(f"@{tg_username}")
+        if panel_username:
+            desc_parts.append(panel_username)
+        desc_parts.append(f"до {when}")
+        description = " · ".join(desc_parts)[:128]
+        # При выборе — отправится `/whois <tg_id>`, бот покажет полную карточку.
+        msg = InputTextMessageContent(message_text=f"/whois {tg_id}")
+        results.append(
+            InlineQueryResultArticle(
+                id=str(tg_id),
+                title=title,
+                description=description,
+                input_message_content=msg,
+            )
+        )
+    await query.answer(
+        results=results,
+        cache_time=1,
+        is_personal=True,
+        switch_pm_text="🛠 Открыть бота",
+        switch_pm_parameter="from_inline",
+    )
+
+
 # --- Admin panel callbacks ---
 
 PAGE_SIZE = 8
 
 
-async def _send_admin_users_list(callback: CallbackQuery, page: int, *, prefer_edit: bool) -> None:
-    total = await db.count_users()
+async def _send_admin_users_list(
+    callback: CallbackQuery,
+    page: int,
+    *,
+    prefer_edit: bool,
+    query: Optional[str] = None,
+) -> None:
+    if query:
+        total = await db.count_search_users(query)
+        header = f"🔎 <b>Поиск</b>: <code>{html.escape(query)}</code> (найдено: {total})"
+    else:
+        total = await db.count_users()
+        header = f"👥 <b>Пользователи</b> (всего: {total})"
+
     if total == 0:
-        text = "Список пользователей пуст."
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
-        )
-        await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=prefer_edit)
+        text = header + "\n\n" + ("Ничего не найдено." if query else "Список пользователей пуст.")
+        kb_rows: list[list[InlineKeyboardButton]] = []
+        if query:
+            kb_rows.append([InlineKeyboardButton(text="🔎 Новый поиск", callback_data="admin_users_search")])
+            kb_rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
+        kb_rows.append([InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")])
+        await safe_edit(callback, text, parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+                        prefer_edit=prefer_edit)
         return
 
     page = max(0, page)
     offset = page * PAGE_SIZE
-    rows = await db.list_users(limit=PAGE_SIZE, offset=offset)
-    lines = [f"👥 <b>Пользователи</b> (всего: {total})"]
+    if query:
+        rows = await db.search_users(query, limit=PAGE_SIZE, offset=offset)
+    else:
+        rows = await db.list_users(limit=PAGE_SIZE, offset=offset)
+    lines = [header]
     buttons: list[list[InlineKeyboardButton]] = []
     for (
         tg_id,
@@ -853,12 +1005,18 @@ async def _send_admin_users_list(callback: CallbackQuery, page: int, *, prefer_e
         )
 
     nav_row: list[InlineKeyboardButton] = []
+    nav_prefix = "admin_users_qp" if query else "admin_users"
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_users:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"{nav_prefix}:{page - 1}"))
     if offset + PAGE_SIZE < total:
-        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_users:{page + 1}"))
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"{nav_prefix}:{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
+    if query:
+        buttons.append([InlineKeyboardButton(text="🔎 Новый поиск", callback_data="admin_users_search")])
+        buttons.append([InlineKeyboardButton(text="◀️ К полному списку", callback_data="admin_users:0")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔎 Поиск", callback_data="admin_users_search")])
     buttons.append([InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")])
 
     await safe_edit(
@@ -899,6 +1057,76 @@ async def cb_admin_users(callback: CallbackQuery):
     await callback.answer()
 
 
+class AdminSearchStates(StatesGroup):
+    waiting_for_query = State()
+
+
+@dp.callback_query(F.data == "admin_users_search")
+async def cb_admin_users_search(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.set_state(AdminSearchStates.waiting_for_query)
+    await callback.message.answer(
+        "🔎 Введите подстроку для поиска: tg_id, @username, имя/фамилия или username "
+        "аккаунта в Remnawave (можно частично). /cancel — отменить.",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminSearchStates.waiting_for_query)
+async def admin_search_capture(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    if not text:
+        await message.answer("Запрос не может быть пустым. /cancel — отменить.")
+        return
+    await state.update_data(search_query=text)
+    # Не закрываем state — пагинация остаётся завязана на запрос; чтобы выйти, кнопка
+    # «◀️ К полному списку» сбросит контекст (через переход на admin_users:0).
+    fake_cb = await _make_pseudo_callback(message)
+    await _send_admin_users_list(fake_cb, page=0, prefer_edit=False, query=text)
+
+
+@dp.callback_query(F.data.startswith("admin_users_qp:"), AdminSearchStates.waiting_for_query)
+async def cb_admin_users_search_page(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        page = 0
+    data = await state.get_data()
+    query = data.get("search_query")
+    if not query:
+        await callback.answer("Контекст поиска утерян.", show_alert=True)
+        await _send_admin_users_list(callback, page=0, prefer_edit=True)
+        return
+    await _send_admin_users_list(callback, page=page, prefer_edit=True, query=query)
+    await callback.answer()
+
+
+async def _make_pseudo_callback(message: Message):
+    """Хелпер: строит «псевдо-CallbackQuery» для переиспользования _send_admin_users_list,
+    который принимает CallbackQuery. Здесь нам нужен только .message и .from_user."""
+    class _PseudoCB:
+        def __init__(self, msg: Message):
+            self.message = msg
+            self.from_user = msg.from_user
+
+        async def answer(self, *args, **kwargs):
+            return None
+
+    return _PseudoCB(message)
+
+
 @dp.callback_query(F.data == "admin_issue_token")
 async def cb_admin_issue_token(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -932,28 +1160,60 @@ async def cb_admin_issue_token(callback: CallbackQuery):
     await callback.answer("Токен выдан")
 
 
-@dp.callback_query(F.data == "admin_tokens")
-async def cb_admin_tokens(callback: CallbackQuery):
-    if not await auth.is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещён.", show_alert=True)
-        return
+async def _render_admin_tokens(callback: CallbackQuery, *, prefer_edit: bool) -> None:
     rows = await db.list_active_tokens(limit=20)
+    buttons: list[list[InlineKeyboardButton]] = []
     if not rows:
         text = "Активных (неиспользованных) токенов нет."
     else:
         lines = ["📋 <b>Активные токены</b> (хэш-префикс · автор · дни · HWID):"]
         for token_hash, created_by, _created_at, expire_days, hwid_device_limit in rows:
+            prefix = token_hash[:12]
             lines.append(
-                f"• <code>{token_hash[:12]}…</code> · автор {created_by} · {expire_days} дн. · HWID {hwid_device_limit}"
+                f"• <code>{prefix}…</code> · автор {created_by} · {expire_days} дн. · HWID {hwid_device_limit}"
             )
+            buttons.append([InlineKeyboardButton(
+                text=f"✗ Отозвать {prefix}…",
+                callback_data=f"revtok:{prefix}",
+            )])
         lines.append("")
-        lines.append("Отозвать: <code>/revoke_token ПРЕФИКС</code>")
+        lines.append("Также можно отозвать командой: <code>/revoke_token ПРЕФИКС</code>")
         text = "\n".join(lines)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
-    )
-    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_tokens")])
+    buttons.append([InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=prefer_edit)
+
+
+@dp.callback_query(F.data == "admin_tokens")
+async def cb_admin_tokens(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await _render_admin_tokens(callback, prefer_edit=True)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("revtok:"))
+async def cb_revoke_token_inline(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    parts = callback.data.split(":", 1)
+    if len(parts) != 2 or not parts[1]:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    prefix = parts[1]
+    full_hash = await db.find_token_by_hash_prefix(prefix)
+    if not full_hash:
+        await callback.answer("Токен не найден или префикс неуникален.", show_alert=True)
+        return
+    ok = await db.revoke_access_token(full_hash)
+    if not ok:
+        await callback.answer("Не удалось отозвать (возможно, уже использован/отозван).", show_alert=True)
+    else:
+        await callback.answer(f"Отозван: {prefix}…")
+    await _render_admin_tokens(callback, prefer_edit=True)
 
 
 # --- User self-service (read-only) ---
@@ -1521,29 +1781,38 @@ async def cb_connect_platform(callback: CallbackQuery):
             "<i>У вас пока нет аккаунта в панели — ссылка появится после активации токена.</i>\n"
         )
 
+    copy_buttons: list[list[InlineKeyboardButton]] = []
     for c in clients:
         lines.append(f"<b>• {html.escape(c['name'])}</b>")
         for label, url in c["stores"]:
             lines.append(f"  · <a href=\"{html.escape(url)}\">{html.escape(label)}</a>")
         if sub_url and c.get("deeplink_template"):
             deep = c["deeplink_template"].replace("{sub}", sub_url)
-            lines.append(
-                f"  · <a href=\"{html.escape(deep)}\">Импорт в один клик</a>"
+            # `<code>...</code>` long-press копируется во всех клиентах Telegram.
+            lines.append(f"  · Импорт-ссылка: <code>{html.escape(deep)}</code>")
+            # Дополнительно — кнопка copy_text (Bot API 7.10+) для тапа в один клик.
+            copy_buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"📋 Скопировать импорт {c['name']}",
+                        copy_text=CopyTextButton(text=deep),
+                    )
+                ]
             )
         lines.append("")
 
     lines.append(
-        "📌 <b>Если deep-link не сработал</b>: скопируйте ссылку выше и в клиенте "
-        "выберите «Импорт подписки» / «Add subscription» / «+».\n"
+        "📌 <b>Как использовать импорт-ссылку</b>:\n"
+        "1) Тапните на кнопку «📋 Скопировать импорт …» ниже — ссылка попадёт в буфер обмена.\n"
+        "2) Откройте установленный клиент — он автоматически предложит добавить подписку, "
+        "либо вручную: «Добавить подписку» / «Add subscription» / «+» → вставьте.\n"
         "📷 QR-код подписки — следующим сообщением (если есть аккаунт)."
     )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
-        ]
-    )
+    kb_rows: list[list[InlineKeyboardButton]] = list(copy_buttons)
+    kb_rows.append([InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")])
+    kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await callback.message.answer(
         "\n".join(lines),
         parse_mode="HTML",
@@ -2067,6 +2336,12 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
         return
 
     if action == "dm":
+        # DM разрешён только тем, кто реально есть в БД (хотя бы /start или активация токена).
+        if not await db.get_user_full(target_tg):
+            await callback.answer(
+                "Этого юзера нет в БД (он ни разу не запускал бота).", show_alert=True,
+            )
+            return
         # переводим админа в FSM ожидания текста сообщения этому юзеру
         await state.set_state(AdminDmStates.waiting_for_text)
         await state.update_data(target_tg=target_tg)
@@ -2155,14 +2430,21 @@ async def cmd_dm(message: Message, command: CommandObject):
     target_raw, text = parts
     target_tg: Optional[int] = None
     if target_raw.isdigit():
-        target_tg = int(target_raw)
+        candidate = int(target_raw)
+        # Допускаем DM только тем, кто реально есть в нашей БД (admin или редеемнул токен).
+        existing = await db.get_user_full(candidate)
+        if existing:
+            target_tg = candidate
     else:
         uname = target_raw[1:] if target_raw.startswith("@") else target_raw
         row = await db.find_user_by_tg_username(uname)
         if row:
             target_tg = int(row[0])
     if target_tg is None:
-        await message.answer("Получатель не найден в БД. Попроси его сначала запустить бота.")
+        await message.answer(
+            "Получатель не найден в БД. Можно писать только тем, кто хотя бы раз "
+            "взаимодействовал с ботом (`/start` или активация токена)."
+        )
         return
     sender_name = format_tg_name(
         message.from_user.username,
@@ -2523,6 +2805,7 @@ DEFAULT_COMMANDS = [
 ADMIN_COMMANDS = [
     BotCommand(command="start", description="Открыть меню"),
     BotCommand(command="admin", description="🛠 Админская панель"),
+    BotCommand(command="help_admin", description="📖 Гайд для админа"),
     BotCommand(command="whois", description="🔍 Найти пользователя по tg_id или @username"),
     BotCommand(command="issue_token", description="🔑 Выдать новый токен доступа"),
     BotCommand(command="revoke_token", description="🚫 Отозвать токен по префиксу"),

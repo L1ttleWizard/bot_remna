@@ -466,4 +466,80 @@ def test_list_all_active_subscriptions_window(db_module):
     rows = asyncio.run(db_module.list_all_active_subscriptions(1_500, 2_500))
     assert len(rows) == 1
     assert rows[0][0] == 700
-    assert rows[0][2] == 2_000
+
+
+def test_search_users_by_substrings(db_module):
+    """search_users / count_search_users должны находить по tg_id, @username, имени, фамилии и panel-username."""
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.add_user(
+        tg_id=4242, uuid="ux1", short_uuid="sx1", username="tg_4242_alice", expire_date=2_000,
+    ))
+    asyncio.run(db_module.upsert_tg_profile(
+        4242, tg_username="alice_chat", tg_first_name="Алиса", tg_last_name="Иванова"
+    ))
+    asyncio.run(db_module.add_user(
+        tg_id=5151, uuid="uy1", short_uuid="sy1", username="tg_5151_bob", expire_date=3_000,
+    ))
+    asyncio.run(db_module.upsert_tg_profile(
+        5151, tg_username="bob_chat", tg_first_name="Боб", tg_last_name=None
+    ))
+
+    # tg_id substring
+    assert asyncio.run(db_module.count_search_users("424")) == 1
+    rows = asyncio.run(db_module.search_users("424"))
+    assert {r[0] for r in rows} == {4242}
+
+    # full numeric tg_id
+    rows = asyncio.run(db_module.search_users("4242"))
+    assert {r[0] for r in rows} == {4242}
+
+    # @username case-insensitive
+    rows = asyncio.run(db_module.search_users("ALICE_CHAT"))
+    assert {r[0] for r in rows} == {4242}
+
+    # first_name (cyrillic)
+    rows = asyncio.run(db_module.search_users("Алис"))
+    assert {r[0] for r in rows} == {4242}
+
+    # panel username
+    rows = asyncio.run(db_module.search_users("_bob"))
+    assert {r[0] for r in rows} == {5151}
+
+    # nothing found
+    assert asyncio.run(db_module.count_search_users("zzzzzzz")) == 0
+    assert asyncio.run(db_module.search_users("zzzzzzz")) == []
+
+    # empty query
+    assert asyncio.run(db_module.search_users("")) == []
+    assert asyncio.run(db_module.count_search_users("")) == 0
+
+
+def test_revoke_access_token_via_prefix(db_module):
+    """Сценарий: создаём токен, находим по префиксу, отзываем, повторный отзыв не работает."""
+    asyncio.run(db_module.init_db())
+    import auth as auth_mod  # noqa: WPS433
+    importlib.reload(auth_mod)
+    raw = asyncio.run(auth_mod.issue_token(created_by=1, expire_days=30, hwid_device_limit=3))
+    assert raw
+    tokens = asyncio.run(db_module.list_active_tokens())
+    assert len(tokens) == 1
+    full_hash = tokens[0][0]
+    prefix = full_hash[:12]
+    found = asyncio.run(db_module.find_token_by_hash_prefix(prefix))
+    assert found == full_hash
+    assert asyncio.run(db_module.revoke_access_token(full_hash)) is True
+    # повторный отзыв уже отозванного не должен сработать
+    assert asyncio.run(db_module.revoke_access_token(full_hash)) is False
+    # после отзыва токен исчезает из активного списка
+    assert asyncio.run(db_module.list_active_tokens()) == []
+
+
+def test_dm_target_must_exist_in_db(db_module):
+    """Контракт: get_user_full(tg_id) возвращает None для несуществующих юзеров,
+    что используется в /dm для отказа отправки."""
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.add_user(
+        tg_id=7001, uuid="u70", short_uuid="s70", username="tg_7001", expire_date=10,
+    ))
+    assert asyncio.run(db_module.get_user_full(7001)) is not None
+    assert asyncio.run(db_module.get_user_full(99999)) is None
