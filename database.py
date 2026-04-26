@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 import aiosqlite
@@ -854,3 +855,160 @@ async def delete_user(tg_id: int) -> None:
         await conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (int(tg_id),))
         await conn.execute("DELETE FROM users WHERE tg_id = ?", (int(tg_id),))
         await conn.commit()
+
+
+# --- Analytics ---
+
+async def stats_users() -> dict:
+    """Возвращает агрегаты по локальной БД пользователей и подписок.
+
+    Поля:
+      total_users, total_admins, total_subscriptions, users_with_subs, users_without_subs,
+      subs_active (expire_date > now), subs_expired (expire_date <= now и > 0),
+      subs_unlimited (expire_date >= 2099-01-01 timestamp),
+      subs_expiring_7d (expire_date в окне now..now+7d).
+    """
+    now = int(time.time())
+    week = now + 7 * 24 * 3600
+    far_future = int(datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp())
+    out: dict = {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute("SELECT COUNT(*) FROM users") as cur:
+            out["total_users"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM users WHERE role = ?", (ROLE_ADMIN,),
+        ) as cur:
+            out["total_admins"] = (await cur.fetchone())[0]
+        async with conn.execute("SELECT COUNT(*) FROM subscriptions") as cur:
+            out["total_subscriptions"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(DISTINCT tg_id) FROM subscriptions"
+        ) as cur:
+            out["users_with_subs"] = (await cur.fetchone())[0]
+        out["users_without_subs"] = max(0, out["total_users"] - out["users_with_subs"])
+        async with conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE expire_date > ?", (now,),
+        ) as cur:
+            out["subs_active"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE expire_date > 0 AND expire_date <= ?",
+            (now,),
+        ) as cur:
+            out["subs_expired"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE expire_date >= ?", (far_future,),
+        ) as cur:
+            out["subs_unlimited"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE expire_date BETWEEN ? AND ?",
+            (now, week),
+        ) as cur:
+            out["subs_expiring_7d"] = (await cur.fetchone())[0]
+    return out
+
+
+async def stats_tokens() -> dict:
+    """Агрегаты по access_tokens.
+
+    Поля: total, redeemed, revoked, active (не использован, не отозван),
+    by_admin: list of (created_by, issued, redeemed, revoked, active).
+    """
+    out: dict = {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute("SELECT COUNT(*) FROM access_tokens") as cur:
+            out["total"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM access_tokens WHERE consumed_by_tg_id IS NOT NULL"
+        ) as cur:
+            out["redeemed"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM access_tokens WHERE revoked = 1"
+        ) as cur:
+            out["revoked"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM access_tokens "
+            "WHERE consumed_by_tg_id IS NULL AND revoked = 0"
+        ) as cur:
+            out["active"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            """
+            SELECT
+                created_by,
+                COUNT(*) AS issued,
+                SUM(CASE WHEN consumed_by_tg_id IS NOT NULL THEN 1 ELSE 0 END) AS redeemed,
+                SUM(CASE WHEN revoked = 1 THEN 1 ELSE 0 END) AS revoked,
+                SUM(CASE WHEN consumed_by_tg_id IS NULL AND revoked = 0 THEN 1 ELSE 0 END) AS active
+            FROM access_tokens
+            GROUP BY created_by
+            ORDER BY issued DESC
+            """,
+        ) as cur:
+            out["by_admin"] = list(await cur.fetchall())
+    return out
+
+
+async def stats_promocodes() -> dict:
+    """Агрегаты по промокодам: total, revoked, active, total_uses, top_codes."""
+    out: dict = {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute("SELECT COUNT(*) FROM promocodes") as cur:
+            out["total"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM promocodes WHERE revoked = 1"
+        ) as cur:
+            out["revoked"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COUNT(*) FROM promocodes WHERE revoked = 0"
+        ) as cur:
+            out["active"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COALESCE(SUM(used_count), 0) FROM promocodes"
+        ) as cur:
+            out["total_uses"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            "SELECT COALESCE(SUM(used_count * bonus_days), 0) FROM promocodes"
+        ) as cur:
+            out["bonus_days_granted"] = (await cur.fetchone())[0]
+        async with conn.execute(
+            """
+            SELECT code, bonus_days, used_count, max_uses, revoked
+            FROM promocodes
+            ORDER BY used_count DESC, created_at DESC
+            LIMIT 10
+            """,
+        ) as cur:
+            out["top_codes"] = list(await cur.fetchall())
+    return out
+
+
+async def list_subs_expiring_in(window_seconds: int, limit: int = 50) -> list:
+    """Подписки, которые истекут в окне now..now+window_seconds. Возвращает
+    список (tg_id, uuid, short_uuid, username, expire_date, sub_id, tg_username,
+    tg_first_name, tg_last_name)."""
+    now = int(time.time())
+    end = now + int(window_seconds)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            """
+            SELECT s.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date, s.id,
+                   u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM subscriptions s
+            LEFT JOIN users u ON u.tg_id = s.tg_id
+            WHERE s.expire_date BETWEEN ? AND ?
+            ORDER BY s.expire_date ASC
+            LIMIT ?
+            """,
+            (now, end, int(limit)),
+        ) as cur:
+            return list(await cur.fetchall())
+
+
+async def list_all_subscriptions_with_uuid(limit: int = 1000) -> list:
+    """Возвращает все подписки с uuid (для агрегации трафика из панели):
+    list of (tg_id, uuid, username)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT tg_id, uuid, username FROM subscriptions WHERE uuid IS NOT NULL AND uuid != '' LIMIT ?",
+            (int(limit),),
+        ) as cur:
+            return list(await cur.fetchall())

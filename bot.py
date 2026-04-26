@@ -5,7 +5,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import qrcode
@@ -164,11 +164,18 @@ def main_keyboard_user() -> InlineKeyboardMarkup:
 def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users:0")],
-        [InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token")],
-        [InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens")],
-        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos")],
-        [InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support")],
-        [InlineKeyboardButton(text="📖 Гайд для админа", callback_data="admin_help")],
+        [
+            InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token"),
+            InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos"),
+            InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_stats"),
+        ],
+        [
+            InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support"),
+            InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
+        ],
     ]
     if has_account:
         rows.append(
@@ -666,6 +673,7 @@ ADMIN_HELP_TEXT = (
     "Получатель должен существовать в БД (хотя бы раз запускал бота).\n"
     "• <code>/set_support &lt;текст&gt;</code> — задать контакты поддержки (HTML разрешён). "
     "Пустой текст — очистить.\n"
+    "• <code>/stats</code> — короткая сводка по аналитике (быстрый текстовый дайджест).\n"
     "• <code>/cancel</code> — выйти из любого ввода (поиск, DM, промо, импорт и т.п.).\n\n"
     "<b>🔘 Кнопки админ-панели</b> (<code>/admin</code>)\n"
     "• <b>👥 Пользователи</b> — список всех юзеров в БД с пагинацией. У каждой записи кнопка-карточка.\n"
@@ -683,6 +691,16 @@ ADMIN_HELP_TEXT = (
     "    · <b>✗ Отозвать ХЭШ…</b> — мгновенно пометить токен как отозванный.\n"
     "    · <b>🔄 Обновить</b> — перерисовать список.\n"
     "• <b>🎁 Промокоды</b> — список последних 20 промо. Создание/отзыв через команды.\n"
+    "• <b>📊 Аналитика</b> — сводка по БД и панели (юзеры, подписки, статусы, "
+    "трафик за всё время). Подразделы:\n"
+    "    · <b>📈 Топ по трафику</b> — топ-10 юзеров панели за <b>последние 30 дней</b> "
+    "(тянется через bandwidth-stats), плюс lifetime для контекста.\n"
+    "    · <b>⏰ Скоро истекают (7 дн)</b> — список подписок, дата + сколько дней осталось.\n"
+    "    · <b>🎁 Промокоды</b> — топ кодов по использованиям, сумма выданных бонус-дней.\n"
+    "    · <b>🔑 Токены</b> — issued/redeemed/revoked/active с разбивкой по автору.\n"
+    "  В карточке любой подписки у админа показан блок 📈 Статистика "
+    "(статус, трафик за 30 дн / период / всё время, HWID, последний онлайн).\n"
+    "  У юзера в его меню подписки — кнопка <b>📈 Аналитика</b> с теми же данными.\n"
     "• <b>❓ Поддержка</b> — задать/изменить контакты поддержки (FSM-ввод текста).\n\n"
     "<b>🔍 Inline-поиск</b>\n"
     "В любом чате наберите <code>@&lt;имя_бота&gt; &lt;запрос&gt;</code> — получите список юзеров. "
@@ -1259,8 +1277,10 @@ async def _ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> O
 def _user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статус и трафик", callback_data=f"sub:info:{sub_id}")],
-            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}")],
+            [
+                InlineKeyboardButton(text="📈 Аналитика", callback_data=f"sub:info:{sub_id}"),
+                InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}"),
+            ],
             [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
             [InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")],
         ]
@@ -1347,22 +1367,41 @@ async def cb_sub_info(callback: CallbackQuery):
         if expire_timestamp else "—"
     )
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
-    info = await api.get_user_info(full_uuid)
+    start_d, end_d = _analytics_date_range()
+    info_res, period_res = await asyncio.gather(
+        api.get_user_info(full_uuid),
+        api.get_user_usage_range(full_uuid, start_d, end_d),
+        return_exceptions=True,
+    )
+    info = info_res if not isinstance(info_res, BaseException) else None
+    period_30 = period_res if not isinstance(period_res, BaseException) else None
     status_text = "Активна ✅"
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
     traffic_lines = ""
+    last_online_line = ""
+    period_30_line = ""
+    hwid_count = 0
     if info and "response" in info:
         api_data = info["response"]
         panel_status = api_data.get("status", "ACTIVE")
         if panel_status != "ACTIVE":
-            status_text = "Неактивна ❌"
+            status_text = f"Неактивна ❌ ({panel_status})"
         limit_text = hwid_limit_caption(api_data)
         traffic_lines = "\n\n" + traffic_summary_markdown(api_data)
+        hwid_count = len((api_data.get("hwidDevices") or []))
+        last_iso = api_data.get("lastOnlineAt") or ""
+        if last_iso:
+            last_online_line = f"\n**Последний онлайн:** `{format_expire_display(last_iso)}`"
+    if period_30 is not None:
+        period_30_line = f"\n**За {ANALYTICS_PERIOD_DAYS} дней:** {human_bytes(int(period_30))}"
+
     text = (
-        f"📊 **Подписка #{sub_id}**\n\n"
+        f"📈 **Аналитика подписки #{sub_id}**\n\n"
         f"**Статус:** {status_text}\n"
-        f"**Лимит устройств (HWID):** {limit_text}\n"
         f"**Действует до:** `{expire_date_str}`\n"
+        f"**HWID-устройств:** {hwid_count} / {limit_text}"
+        f"{last_online_line}"
+        f"{period_30_line}"
         f"{traffic_lines}\n\n"
         f"🔗 **Ссылка:** `{sub_url}`"
     )
@@ -2244,12 +2283,53 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         datetime.fromtimestamp(int(sub[5])).strftime("%d.%m.%Y %H:%M")
         if sub[5] else "—"
     )
+
+    # Аналитика: статус / трафик / онлайн / HWID — параллельно info+30-day.
+    start_d, end_d = _analytics_date_range()
+    info_res, period_res = await asyncio.gather(
+        api.get_user_info(full_uuid),
+        api.get_user_usage_range(full_uuid, start_d, end_d),
+        return_exceptions=True,
+    )
+    info = info_res if not isinstance(info_res, BaseException) else None
+    period_30 = period_res if not isinstance(period_res, BaseException) else None
+    stats_block = ""
+    if info and "response" in info:
+        ad = info["response"]
+        ut = ad.get("userTraffic") or {}
+        used = int(ut.get("usedTrafficBytes") or 0)
+        life = int(ut.get("lifetimeUsedTrafficBytes") or 0)
+        tlim = ad.get("trafficLimitBytes")
+        lim_txt = "без лимита"
+        if tlim is not None and int(tlim) > 0:
+            lim_txt = human_bytes(int(tlim))
+        status = ad.get("status") or "—"
+        last_iso = ad.get("lastOnlineAt") or ""
+        last_h = format_expire_display(last_iso) if last_iso else "—"
+        hwid_lim = hwid_limit_caption(ad)
+        hwid_count = len((ad.get("hwidDevices") or []))
+        period_30_txt = (
+            human_bytes(int(period_30)) if period_30 is not None else "—"
+        )
+
+        stats_block = (
+            "\n📈 <b>Статистика</b>\n"
+            f"  · Статус: <b>{html.escape(status)}</b>\n"
+            f"  · Трафик за {ANALYTICS_PERIOD_DAYS} дн: "
+            f"<b>{html.escape(period_30_txt)}</b>\n"
+            f"  · Трафик (текущий период): <b>{html.escape(human_bytes(used))}</b> / "
+            f"{html.escape(lim_txt)}\n"
+            f"  · Трафик (за всё время): <b>{html.escape(human_bytes(life))}</b>\n"
+            f"  · HWID-устройств: <b>{hwid_count}</b> / {html.escape(hwid_lim)}\n"
+            f"  · Последний онлайн: <b>{html.escape(last_h)}</b>\n"
+        )
+
     text = (
         f"📅 <b>Подписка #{sub_id}</b> пользователя <code>{target_tg}</code>\n"
         f"<b>panel username:</b> {html.escape(sub[4] or '—')}\n"
         f"<b>uuid:</b> <code>{html.escape(sub[2])}</code>\n"
         f"<b>действует до:</b> {html.escape(expire_str)}\n\n"
-    ) + text
+    ) + text + stats_block
     await safe_edit(
         callback,
         text,
@@ -3015,6 +3095,315 @@ async def cmd_set_support(message: Message, command: CommandObject):
     )
 
 
+# --- Analytics (PR #3) ---
+
+ANALYTICS_TOP_N = 10
+ANALYTICS_PANEL_PAGE_SIZE = 200
+ANALYTICS_MAX_PANEL_USERS = 5000
+ANALYTICS_PERIOD_DAYS = 30
+
+
+def _analytics_date_range(days: int = ANALYTICS_PERIOD_DAYS) -> tuple[str, str]:
+    """(start, end) в формате YYYY-MM-DD для запроса к панели за последние N дней."""
+    end_dt = datetime.now(timezone.utc).date()
+    start_dt = end_dt - timedelta(days=days - 1)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+
+def _stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Топ по трафику", callback_data="admin_stats:traffic")],
+        [InlineKeyboardButton(text="⏰ Скоро истекают (7 дн)", callback_data="admin_stats:expiring")],
+        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_stats:promos")],
+        [InlineKeyboardButton(text="🔑 Токены", callback_data="admin_stats:tokens")],
+        [InlineKeyboardButton(text="🔄 Обновить сводку", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")],
+    ])
+
+
+def _stats_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К аналитике", callback_data="admin_stats")],
+    ])
+
+
+async def _collect_panel_traffic(
+    max_users: int = ANALYTICS_MAX_PANEL_USERS,
+    *,
+    with_period_range: bool = False,
+) -> dict:
+    """Постранично выкачивает users из Remnawave, агрегирует трафик/статусы.
+
+    Если ``with_period_range=True`` — для каждого юзера дополнительно дергает
+    `/api/bandwidth-stats/users/{uuid}` за последние ANALYTICS_PERIOD_DAYS дней
+    (это медленно при больших панелях — N запросов).
+
+    Возвращает dict с ключами:
+      total_panel, by_status, traffic_period (за окно или 0 если не считалось),
+      traffic_lifetime, by_uuid (uuid → {used, lifetime, period, status,
+      last_online, username, expire_at}), period_days.
+    """
+    by_uuid: dict = {}
+    by_status: dict = {}
+    total_panel = 0
+    traffic_period_total = 0
+    traffic_lifetime = 0
+    start = 0
+    while start < max_users:
+        page = await api.list_users(size=ANALYTICS_PANEL_PAGE_SIZE, start=start)
+        if not page or "response" not in page:
+            break
+        resp = page["response"]
+        users = resp.get("users") or []
+        total_panel = int(resp.get("total") or total_panel)
+        if not users:
+            break
+        for u in users:
+            uuid_v = u.get("uuid") or ""
+            if not uuid_v:
+                continue
+            ut = u.get("userTraffic") or {}
+            used = int(ut.get("usedTrafficBytes") or 0)
+            life = int(ut.get("lifetimeUsedTrafficBytes") or 0)
+            status = u.get("status") or "UNKNOWN"
+            by_status[status] = by_status.get(status, 0) + 1
+            traffic_lifetime += life
+            by_uuid[uuid_v] = {
+                "used": used,
+                "lifetime": life,
+                "period": 0,
+                "status": status,
+                "last_online": u.get("lastOnlineAt") or "",
+                "username": u.get("username") or "",
+                "expire_at": u.get("expireAt") or "",
+            }
+        start += ANALYTICS_PANEL_PAGE_SIZE
+        if start >= total_panel:
+            break
+
+    if with_period_range and by_uuid:
+        start_d, end_d = _analytics_date_range()
+        uuids = list(by_uuid.keys())
+        # Параллельно пакетами по 16, чтобы не ддосить панель и не ловить таймауты.
+        chunk = 16
+        results: list[Optional[int]] = []
+        for i in range(0, len(uuids), chunk):
+            batch = uuids[i:i + chunk]
+            batch_results = await asyncio.gather(
+                *(api.get_user_usage_range(u, start_d, end_d) for u in batch),
+                return_exceptions=True,
+            )
+            for r in batch_results:
+                results.append(None if isinstance(r, BaseException) else r)
+        for uuid_v, period in zip(uuids, results):
+            if period is None:
+                continue
+            by_uuid[uuid_v]["period"] = int(period)
+            traffic_period_total += int(period)
+
+    return {
+        "total_panel": total_panel,
+        "by_status": by_status,
+        "traffic_period": traffic_period_total,
+        "traffic_lifetime": traffic_lifetime,
+        "by_uuid": by_uuid,
+        "period_days": ANALYTICS_PERIOD_DAYS if with_period_range else 0,
+    }
+
+
+async def _send_admin_stats_summary(callback: CallbackQuery, *, prefer_edit: bool) -> None:
+    """Главная страница аналитики — сводка БД + панели."""
+    db_stats = await db.stats_users()
+    panel = await _collect_panel_traffic()
+    by_status = panel["by_status"]
+    status_lines = [
+        f"  · {html.escape(k)}: <b>{v}</b>" for k, v in sorted(by_status.items(), key=lambda x: -x[1])
+    ] or ["  · —"]
+    text = (
+        "📊 <b>Аналитика — сводка</b>\n\n"
+        "<b>База бота</b>\n"
+        f"  · Всего юзеров в БД: <b>{db_stats['total_users']}</b> "
+        f"(админов: {db_stats['total_admins']})\n"
+        f"  · С подписками: <b>{db_stats['users_with_subs']}</b>, "
+        f"без подписок: <b>{db_stats['users_without_subs']}</b>\n"
+        f"  · Подписок всего: <b>{db_stats['total_subscriptions']}</b>\n"
+        f"  · Активных: <b>{db_stats['subs_active']}</b>, "
+        f"истекли: <b>{db_stats['subs_expired']}</b>, "
+        f"♾ без лимита времени: <b>{db_stats['subs_unlimited']}</b>\n"
+        f"  · Истекают за 7 дн: <b>{db_stats['subs_expiring_7d']}</b>\n\n"
+        "<b>Панель Remnawave</b>\n"
+        f"  · Всего юзеров в панели: <b>{panel['total_panel']}</b>\n"
+        f"  · Трафик (за всё время): <b>{html.escape(human_bytes(panel['traffic_lifetime']))}</b>\n"
+        "  · По статусам:\n"
+        + "\n".join(status_lines)
+        + f"\n\n<i>Топ за {ANALYTICS_PERIOD_DAYS} дней — кнопка «📈 Топ по трафику».</i>"
+    )
+    await safe_edit(
+        callback, text, parse_mode="HTML",
+        reply_markup=_stats_keyboard(), prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_traffic(callback: CallbackQuery, *, prefer_edit: bool) -> None:
+    panel = await _collect_panel_traffic(with_period_range=True)
+    by_uuid = panel["by_uuid"]
+    db_subs = await db.list_all_subscriptions_with_uuid(limit=10000)
+    subs_by_uuid = {row[1]: row for row in db_subs}  # uuid → (tg_id, uuid, username)
+
+    rows = []
+    for uuid_v, info in by_uuid.items():
+        rows.append((info["period"], info["lifetime"], uuid_v, info, subs_by_uuid.get(uuid_v)))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    top = rows[:ANALYTICS_TOP_N]
+
+    lines = [
+        f"📈 <b>Топ-{ANALYTICS_TOP_N} по трафику за {ANALYTICS_PERIOD_DAYS} дней</b>\n"
+        f"<i>Сумма трафика всех юзеров за окно: {html.escape(human_bytes(panel['traffic_period']))}.</i>\n",
+    ]
+    if not top:
+        lines.append("Нет данных.")
+    for i, (period, life, uuid_v, info, sub) in enumerate(top, 1):
+        username_p = info.get("username") or "—"
+        tg_part = ""
+        if sub:
+            tg_part = f" · tg=<code>{sub[0]}</code>"
+        lines.append(
+            f"{i}. <code>{html.escape(username_p)}</code>{tg_part} — "
+            f"<b>{html.escape(human_bytes(period))}</b> "
+            f"(всего: {html.escape(human_bytes(life))})"
+        )
+    await safe_edit(
+        callback, "\n".join(lines), parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(), prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_expiring(callback: CallbackQuery, *, prefer_edit: bool) -> None:
+    expiring = await db.list_subs_expiring_in(7 * 24 * 3600, limit=50)
+    lines = ["⏰ <b>Истекают в ближайшие 7 дней</b>\n"]
+    if not expiring:
+        lines.append("Пусто. Никто не истекает в этом окне.")
+    now = int(time.time())
+    for tg_id, uuid_v, _short, username_s, expire_date, sub_id, tg_username, tg_first, tg_last in expiring:
+        days_left = max(0, (int(expire_date) - now) // 86400)
+        when = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
+        name_bits = []
+        if tg_username:
+            name_bits.append(f"@{html.escape(tg_username)}")
+        if tg_first or tg_last:
+            name_bits.append(html.escape(f"{tg_first or ''} {tg_last or ''}".strip()))
+        name = " · ".join(name_bits) if name_bits else "—"
+        lines.append(
+            f"  · <code>{tg_id}</code> · {name} · "
+            f"<code>{html.escape(username_s or '')}</code> — "
+            f"до <b>{when}</b> ({days_left} дн)"
+        )
+    await safe_edit(
+        callback, "\n".join(lines), parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(), prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_promos(callback: CallbackQuery, *, prefer_edit: bool) -> None:
+    s = await db.stats_promocodes()
+    lines = [
+        "🎁 <b>Промокоды</b>\n",
+        f"  · Всего: <b>{s['total']}</b> (активных: {s['active']}, отозванных: {s['revoked']})",
+        f"  · Использований всего: <b>{s['total_uses']}</b>",
+        f"  · Бонус-дней выдано: <b>{s['bonus_days_granted']}</b>",
+        "",
+        "<b>Топ-10 по использованию:</b>",
+    ]
+    if not s["top_codes"]:
+        lines.append("  · —")
+    for code, bonus, used, max_uses, revoked in s["top_codes"]:
+        mu = "∞" if max_uses is None else str(max_uses)
+        flag = "🚫" if revoked else "✅"
+        lines.append(
+            f"  {flag} <code>{html.escape(code)}</code> — +{bonus} дн., {used}/{mu}"
+        )
+    await safe_edit(
+        callback, "\n".join(lines), parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(), prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_tokens(callback: CallbackQuery, *, prefer_edit: bool) -> None:
+    s = await db.stats_tokens()
+    lines = [
+        "🔑 <b>Токены</b>\n",
+        f"  · Всего выпущено: <b>{s['total']}</b>",
+        f"  · Активных (не использованы, не отозваны): <b>{s['active']}</b>",
+        f"  · Использовано: <b>{s['redeemed']}</b>",
+        f"  · Отозвано: <b>{s['revoked']}</b>",
+        "",
+        "<b>По авторам выпуска:</b>",
+    ]
+    if not s["by_admin"]:
+        lines.append("  · —")
+    for created_by, issued, redeemed, revoked, active in s["by_admin"]:
+        lines.append(
+            f"  · admin <code>{created_by}</code>: всего {issued}, "
+            f"активных {active}, использовано {redeemed}, отозвано {revoked}"
+        )
+    await safe_edit(
+        callback, "\n".join(lines), parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(), prefer_edit=prefer_edit,
+    )
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("Собираю статистику…")
+    await _send_admin_stats_summary(callback, prefer_edit=True)
+
+
+@dp.callback_query(F.data.startswith("admin_stats:"))
+async def cb_admin_stats_sub(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    section = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if section == "traffic":
+        await _send_admin_stats_traffic(callback, prefer_edit=True)
+    elif section == "expiring":
+        await _send_admin_stats_expiring(callback, prefer_edit=True)
+    elif section == "promos":
+        await _send_admin_stats_promos(callback, prefer_edit=True)
+    elif section == "tokens":
+        await _send_admin_stats_tokens(callback, prefer_edit=True)
+    else:
+        await _send_admin_stats_summary(callback, prefer_edit=True)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    db_stats = await db.stats_users()
+    panel = await _collect_panel_traffic()
+    by_status = panel["by_status"]
+    status_line = ", ".join(f"{k}={v}" for k, v in sorted(by_status.items(), key=lambda x: -x[1])) or "—"
+    text = (
+        "📊 <b>Аналитика — сводка</b>\n\n"
+        f"БД: юзеров <b>{db_stats['total_users']}</b> "
+        f"(админов {db_stats['total_admins']}), "
+        f"подписок <b>{db_stats['total_subscriptions']}</b> "
+        f"(активных {db_stats['subs_active']}, истекли {db_stats['subs_expired']}, "
+        f"♾ {db_stats['subs_unlimited']}, истекают за 7д {db_stats['subs_expiring_7d']})\n\n"
+        f"Панель: всего юзеров <b>{panel['total_panel']}</b>; "
+        f"трафик за всё время <b>{html.escape(human_bytes(panel['traffic_lifetime']))}</b>; "
+        f"статусы: {html.escape(status_line)}\n\n"
+        "Подробнее — <code>/admin → 📊 Аналитика</code>."
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
 # --- Main ---
 
 DEFAULT_COMMANDS = [
@@ -3035,6 +3424,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="list_promos", description="📋 Список промокодов"),
     BotCommand(command="set_support", description="❓ Задать контакты поддержки"),
     BotCommand(command="dm", description="✉️ Написать пользователю"),
+    BotCommand(command="stats", description="📊 Аналитика и сводка"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
 
