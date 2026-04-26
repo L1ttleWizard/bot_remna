@@ -670,7 +670,9 @@ ADMIN_HELP_TEXT = (
     "<b>🔘 Кнопки админ-панели</b> (<code>/admin</code>)\n"
     "• <b>👥 Пользователи</b> — список всех юзеров в БД с пагинацией. У каждой записи кнопка-карточка.\n"
     "  В карточке юзера:\n"
-    "    · <i>📅 #X · username · до dd.mm.yyyy</i> — открыть конкретную подписку (статус, трафик, устройства).\n"
+    "    · <i>📅 #X · username · до dd.mm.yyyy</i> — открыть конкретную подписку. "
+    "В её меню: <b>+7/+30 дней</b>, <b>♾ Без лимита по времени</b> (ставит дату 2099-12-31), "
+    "<b>📱 Устройства</b>, <b>🗑 Удалить эту подписку</b>.\n"
     "    · <b>✉️ Написать</b> — отправить ему DM от вашего имени (FSM-ввод).\n"
     "    · <b>➕ Привязать подписку из Remnawave</b> — выбрать существующего юзера в панели "
     "и добавить его как подписку этому tg_id (запись в панели не меняется).\n"
@@ -2204,6 +2206,7 @@ def _admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="+7 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:7"),
                 InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:30"),
             ],
+            [InlineKeyboardButton(text="♾ Без лимита по времени", callback_data=f"admu:{target_tg}:s:{sub_id}:ext_inf")],
             [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
             [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
@@ -2298,6 +2301,16 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
             await callback.answer(f"Подписка продлена на {days} дн.")
         else:
             await callback.answer("Не удалось продлить подписку.", show_alert=True)
+        return
+
+    if action == "ext_inf":
+        ok, _ = await api.set_user_expire_unlimited(full_uuid)
+        if ok:
+            await sync_local_expire_from_panel(target_tg, full_uuid)
+            await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
+            await callback.answer("♾ Без лимита по времени")
+        else:
+            await callback.answer("Не удалось снять лимит времени.", show_alert=True)
         return
 
     if action == "dev":

@@ -170,6 +170,16 @@ class RemnawaveAPI:
         """Обновляет лимит устройств по HWID (PATCH /api/users). None = снять лимит (null в JSON)."""
         return await self.patch_user({"uuid": user_uuid, "hwidDeviceLimit": new_limit})
 
+    async def set_user_expire_unlimited(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
+        """Снимает лимит времени подписки. Remnawave требует ISO-дату в expireAt
+        (null не принимается), поэтому ставим заведомо далёкое будущее — 2099-12-31.
+        Возвращает (успех, новый expireAt ISO или None).
+        """
+        far_future = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+        new_iso = _format_expire_iso_utc(far_future)
+        ok = await self.patch_user({"uuid": user_uuid, "expireAt": new_iso})
+        return ok, new_iso if ok else None
+
     async def delete_user(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
         """DELETE /api/users/{uuid} — удалить пользователя из панели.
         Возвращает (ok, error_code). 404/A025 трактуется как «уже удалён» — ok=True.
