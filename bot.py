@@ -1248,6 +1248,14 @@ CLIENT_CATALOG: dict[str, list[dict]] = {
             ],
             "deeplink_template": "shadowrocket://add/sub://{sub}",
         },
+        {
+            "name": "Karing",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/karing/id6472431552"),
+                ("Сайт", "https://karing.app/en/download"),
+            ],
+            "deeplink_template": "karing://install-config?url={sub}",
+        },
     ],
     "android": [
         {
@@ -1281,6 +1289,14 @@ CLIENT_CATALOG: dict[str, list[dict]] = {
             ],
             "deeplink_template": None,
         },
+        {
+            "name": "Karing",
+            "stores": [
+                ("GitHub", "https://github.com/KaringX/karing/releases"),
+                ("Сайт", "https://karing.app/en/download"),
+            ],
+            "deeplink_template": "karing://install-config?url={sub}",
+        },
     ],
     "windows": [
         {
@@ -1304,6 +1320,14 @@ CLIENT_CATALOG: dict[str, list[dict]] = {
                 ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
             ],
             "deeplink_template": None,
+        },
+        {
+            "name": "Karing",
+            "stores": [
+                ("Сайт", "https://karing.app/en/download"),
+                ("GitHub", "https://github.com/KaringX/karing/releases"),
+            ],
+            "deeplink_template": "karing://install-config?url={sub}",
         },
     ],
     "macos": [
@@ -1336,6 +1360,14 @@ CLIENT_CATALOG: dict[str, list[dict]] = {
             ],
             "deeplink_template": None,
         },
+        {
+            "name": "Karing",
+            "stores": [
+                ("App Store", "https://apps.apple.com/us/app/karing/id6472431552"),
+                ("Сайт", "https://karing.app/en/download"),
+            ],
+            "deeplink_template": "karing://install-config?url={sub}",
+        },
     ],
     "linux": [
         {
@@ -1352,6 +1384,14 @@ CLIENT_CATALOG: dict[str, list[dict]] = {
                 ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
             ],
             "deeplink_template": None,
+        },
+        {
+            "name": "Karing",
+            "stores": [
+                ("Сайт", "https://karing.app/en/download"),
+                ("GitHub", "https://github.com/KaringX/karing/releases"),
+            ],
+            "deeplink_template": "karing://install-config?url={sub}",
         },
     ],
 }
