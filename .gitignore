@@ -7,3 +7,6 @@ venv/
 .pytest_cache/
 bot_logs.log
 *.log
+bot_database.db
+*.sqlite
+*.sqlite3
