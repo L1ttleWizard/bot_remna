@@ -1,25 +1,29 @@
 import asyncio
-
 import html
-
+import logging
+import sys
 import time
+from datetime import datetime, timezone
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-
-from aiogram.filters import CommandStart
-
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from datetime import datetime, timezone
-
-import logging
-
-import sys
-
+import auth
+import database as db
 from config import (
+    ADMIN_TG_IDS,
     BOT_TOKEN,
+    DEFAULT_TOKEN_EXPIRE_DAYS,
+    DEFAULT_TOKEN_HWID_LIMIT,
     LOG_FILE_PATH,
     LOG_LEVEL,
     REMNAWAVE_TOKEN,
@@ -29,13 +33,7 @@ from config import (
     SCHEDULER_TIMEZONE,
     SUB_DOMAIN,
 )
-
 from remnawave_api import RemnawaveAPI
-
-import database as db
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from scheduler import check_expiring_subscriptions
 
 
@@ -51,17 +49,13 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
-
 logger = logging.getLogger(__name__)
 
 
 # Лимит устройств по HWID: значение по умолчанию при создании и если панель вернула null
-
 DEFAULT_HWID_DEVICE_LIMIT = 3
-
 # Верхняя граница при +1 / +3 (числовой лимит)
 MAX_HWID_INCREMENT_CAP = 9999
-
 # Значение «практически без лимита» (отображается как ♾)
 HWID_UNLIMITED_SENTINEL = 9_999_999
 
@@ -90,14 +84,6 @@ def hwid_limit_caption(api_data: dict) -> str:
     return str(vi)
 
 
-def back_only_keyboard() -> InlineKeyboardMarkup:
-    """Только «Назад» — для подстраниц (настройки, инструкция и т.д.)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад в главное меню",
-                              callback_data="back_main")]
-    ])
-
-
 def human_bytes(n: int) -> str:
     n = max(0, int(n))
     for div, name in ((1 << 30, "ГБ"), (1 << 20, "МБ"), (1 << 10, "КБ")):
@@ -123,7 +109,7 @@ def traffic_summary_markdown(api_data: dict) -> str:
     )
 
 
-def format_expire_display(iso_str: str | None) -> str:
+def format_expire_display(iso_str: Optional[str]) -> str:
     if not iso_str:
         return "—"
     s = iso_str.replace("Z", "+00:00") if iso_str.endswith("Z") else iso_str
@@ -134,203 +120,160 @@ def format_expire_display(iso_str: str | None) -> str:
 
 
 def sort_hwid_devices(devices: list) -> list:
-
     return sorted(devices or [], key=lambda x: (x.get("createdAt") or ""))
 
 
-def format_devices_html(devices: list, limit_label: str) -> str:
+# --- Клавиатуры ---
 
-    header = f"📱 <b>Устройства</b> (лимит HWID: {html.escape(limit_label)})"
-
-    if not devices:
-
-        return (
-
-            header
-
-            + "\n\nСписок пуст. Устройства появятся после подключения клиента "
-
-            "с поддержкой HWID (Happ, v2RayTun и др.)."
-
-        )
-
-    blocks = [header]
-
-    for i, d in enumerate(devices):
-
-        pl = html.escape(str(d.get("platform") or "—"))
-
-        model = html.escape(str(d.get("deviceModel") or "—"))
-
-        os_ver = d.get("osVersion")
-
-        os_part = f"\n   ОС: {html.escape(str(os_ver))}" if os_ver else ""
-
-        blocks.append(
-            f"\n\n<b>{i + 1}.</b> {model}{os_part}\n   Платформа: {pl}")
-
-    return "".join(blocks)
+def back_only_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")]
+        ]
+    )
 
 
-def devices_screen_keyboard(device_count: int, show_limit_buttons: bool) -> InlineKeyboardMarkup:
+def main_keyboard_user() -> InlineKeyboardMarkup:
+    """Меню обычного пользователя — без управления подпиской/устройствами."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Мои настройки", callback_data="my_settings")],
+            [InlineKeyboardButton(text="📅 Моя подписка", callback_data="my_subscription")],
+            [InlineKeyboardButton(text="📱 Мои устройства", callback_data="my_devices")],
+            [InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions")],
+        ]
+    )
 
-    rows = []
 
-    for i in range(device_count):
-
+def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users:0")],
+        [InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token")],
+        [InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens")],
+    ]
+    if has_account:
         rows.append(
-
-            [InlineKeyboardButton(
-                text=f"🗑 Удалить #{i + 1}", callback_data=f"hw_rm:{i}")]
-
+            [InlineKeyboardButton(text="⚙️ Мой аккаунт", callback_data=f"admu:{tg_id}:open")]
         )
-
-    rows.append([InlineKeyboardButton(
-        text="🔄 Обновить список", callback_data="devices_refresh")])
-
-    if show_limit_buttons:
-
-        rows.append(
-
-            [
-
-                InlineKeyboardButton(text="➕ +1 к лимиту",
-                                     callback_data="hw_limit:1"),
-
-                InlineKeyboardButton(text="➕ +3 к лимиту",
-                                     callback_data="hw_limit:3"),
-
-            ]
-
-        )
-
-        rows.append([InlineKeyboardButton(
-            text="♾ Без лимита устройств", callback_data="hw_limit:inf")])
-
-    rows.append([InlineKeyboardButton(
-        text="◀️ Назад в главное меню", callback_data="back_main")])
-
+    rows.append([InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def format_devices_html(devices: list, limit_label: str) -> str:
+    header = f"📱 <b>Устройства</b> (лимит HWID: {html.escape(limit_label)})"
+    if not devices:
+        return (
+            header
+            + "\n\nСписок пуст. Устройства появятся после подключения клиента "
+              "с поддержкой HWID (Happ, v2RayTun и др.)."
+        )
+    blocks = [header]
+    for i, d in enumerate(devices):
+        pl = html.escape(str(d.get("platform") or "—"))
+        model = html.escape(str(d.get("deviceModel") or "—"))
+        os_ver = d.get("osVersion")
+        os_part = f"\n   ОС: {html.escape(str(os_ver))}" if os_ver else ""
+        blocks.append(f"\n\n<b>{i + 1}.</b> {model}{os_part}\n   Платформа: {pl}")
+    return "".join(blocks)
+
+
+def devices_admin_keyboard(target_tg: int, device_count: int, show_limit_buttons: bool) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(device_count):
+        rows.append(
+            [InlineKeyboardButton(text=f"🗑 Удалить #{i + 1}", callback_data=f"admu:{target_tg}:hw_rm:{i}")]
+        )
+    rows.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"admu:{target_tg}:dev_refresh")])
+    if show_limit_buttons:
+        rows.append(
+            [
+                InlineKeyboardButton(text="➕ +1 к лимиту", callback_data=f"admu:{target_tg}:hw_lim:1"),
+                InlineKeyboardButton(text="➕ +3 к лимиту", callback_data=f"admu:{target_tg}:hw_lim:3"),
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="♾ Без лимита устройств", callback_data=f"admu:{target_tg}:hw_lim:inf")]
+        )
+    rows.append([InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def devices_user_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить список", callback_data="my_devices_refresh")],
+            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")],
+        ]
+    )
+
+
+def subscription_admin_keyboard(target_tg: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+7 дней", callback_data=f"admu:{target_tg}:sub_ext:7"),
+                InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:sub_ext:30"),
+            ],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:sub_refresh")],
+            [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
+        ]
+    )
+
+
+def subscription_user_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="my_subscription_refresh")],
+            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")],
+        ]
+    )
+
+
+# --- Bot wiring ---
+
 bot = Bot(token=BOT_TOKEN)
-
 dp = Dispatcher()
-
 api = RemnawaveAPI(base_url=REMNAWAVE_URL, api_token=REMNAWAVE_TOKEN)
 
 
-async def load_devices_view(full_uuid: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Текст (HTML), клавиатура экрана устройств."""
+# --- Views ---
 
+async def load_devices_text(full_uuid: str) -> tuple[str, list, bool]:
     info = await api.get_user_info(full_uuid)
-
     hw_raw = await api.get_user_hwid_devices(full_uuid)
-
     limit_label = str(DEFAULT_HWID_DEVICE_LIMIT)
-
     show_limits = True
-
     if info and "response" in info:
-
         limit_label = hwid_limit_caption(info["response"])
-
         show_limits = not is_hwid_unlimited(info["response"])
-
     devices: list = []
-
     if hw_raw and "response" in hw_raw:
-
         devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
-
-    text = format_devices_html(devices, limit_label)
-
-    kb = devices_screen_keyboard(len(devices), show_limit_buttons=show_limits)
-
-    return text, kb
+    return format_devices_html(devices, limit_label), devices, show_limits
 
 
-async def send_or_edit_devices_screen(
-
-    callback: CallbackQuery,
-
-    full_uuid: str,
-
-    *,
-
-    prefer_edit: bool,
-
-) -> None:
-
-    text, actions_kb = await load_devices_view(full_uuid)
-
-    markup = actions_kb
-
-    if prefer_edit:
-
-        try:
-
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-
-            return
-
-        except TelegramBadRequest as e:
-
-            if "message is not modified" in str(e).lower():
-
-                return
-
-            logger.info(
-                "edit_text не удался (%s), отправляем новое сообщение", e)
-
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=markup)
-
-
-def subscription_screen_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="+7 дней", callback_data="sub_extend:7"),
-            InlineKeyboardButton(text="+30 дней", callback_data="sub_extend:30"),
-        ],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="subscription_refresh")],
-        [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")],
-    ])
-
-
-async def load_subscription_view(full_uuid: str) -> tuple[str, InlineKeyboardMarkup]:
+async def load_subscription_text(full_uuid: str) -> str:
     info = await api.get_user_info(full_uuid)
     if not info or "response" not in info:
-        return (
-            "📅 <b>Управление подпиской</b>\n\nНе удалось загрузить данные с панели.",
-            subscription_screen_keyboard(),
-        )
+        return "📅 <b>Подписка</b>\n\nНе удалось загрузить данные с панели."
     ad = info["response"]
     exp_h = format_expire_display(ad.get("expireAt"))
-    text = (
-        "📅 <b>Управление подпиской</b>\n\n"
-        f"Окончание доступа: <b>{html.escape(exp_h)}</b>\n\n"
-        "Нажмите «+7 дней» или «+30 дней» — срок добавится к текущей дате окончания. "
-        "Если подписка уже истекла, отсчёт ведётся от сегодняшнего дня."
+    return (
+        "📅 <b>Подписка</b>\n\n"
+        f"Окончание доступа: <b>{html.escape(exp_h)}</b>"
     )
-    return text, subscription_screen_keyboard()
 
 
-async def send_or_edit_subscription_screen(
-    callback: CallbackQuery,
-    full_uuid: str,
-    *,
-    prefer_edit: bool,
-) -> None:
-    text, kb = await load_subscription_view(full_uuid)
+async def safe_edit(callback: CallbackQuery, text: str, *, parse_mode: str, reply_markup: InlineKeyboardMarkup, prefer_edit: bool) -> None:
     if prefer_edit:
         try:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            await callback.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             return
         except TelegramBadRequest as e:
             if "message is not modified" in str(e).lower():
                 return
-            logger.info("subscription edit_text: %s", e)
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+            logger.info("edit_text не удался (%s), отправляем новое сообщение", e)
+    await callback.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
 async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
@@ -347,552 +290,757 @@ async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     await db.update_user_expire(tg_id, int(dt.timestamp()))
 
 
-# --- КЛАВИАТУРА ---
+async def create_account_for_user(
+    tg_id: int,
+    *,
+    expire_days: int,
+    hwid_device_limit: int,
+    created_by: Optional[int] = None,
+) -> Optional[str]:
+    """Создаёт аккаунт в Remnawave, кладёт запись в БД. Возвращает subscriptionUrl."""
+    username = f"tg_{tg_id}"
+    response = await api.create_user(
+        username=username,
+        expire_days=expire_days,
+        hwid_device_limit=hwid_device_limit,
+    )
+    if not response or "response" not in response:
+        logger.error("Не удалось создать аккаунт для tg_id=%s: %s", tg_id, response)
+        return None
+    api_data = response["response"]
+    sub_url = api_data.get("subscriptionUrl", "")
+    full_uuid = api_data.get("uuid", "")
+    short_uuid = api_data.get("shortUuid", "")
+    expire_time = int(time.time()) + (expire_days * 24 * 60 * 60)
+    await db.add_user(
+        tg_id=tg_id,
+        uuid=full_uuid,
+        short_uuid=short_uuid,
+        username=username,
+        expire_date=expire_time,
+        created_by=created_by,
+    )
+    return sub_url
 
-def main_keyboard():
 
-    return InlineKeyboardMarkup(inline_keyboard=[
+# --- /start ---
 
-        [InlineKeyboardButton(text="🚀 Получить прокси",
-                              callback_data="get_proxy")],
-
-        [InlineKeyboardButton(text="⚙️ Мои настройки",
-                              callback_data="my_settings")],
-
-        [InlineKeyboardButton(text="📅 Управление подпиской",
-                              callback_data="manage_subscription")],
-
-        [InlineKeyboardButton(text="📱 Управление устройствами",
-                              callback_data="manage_devices")],
-
-        [InlineKeyboardButton(text="📖 Инструкция",
-                              callback_data="instructions")]
-
-    ])
+@dp.message(CommandStart(deep_link=True))
+async def cmd_start_with_payload(message: Message, command: CommandObject):
+    payload = (command.args or "").strip()
+    if not payload:
+        await _show_start_menu(message)
+        return
+    await _try_redeem_token(message, payload)
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    await _show_start_menu(message)
 
+
+async def _show_start_menu(message: Message) -> None:
+    tg_id = message.from_user.id
+    if await auth.is_admin(tg_id):
+        has_account = bool(await db.get_user(tg_id))
+        await message.answer(
+            f"Привет, {html.escape(message.from_user.first_name or '')}! Это админская панель бота.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard_admin(tg_id, has_account),
+        )
+        return
+    user_data = await db.get_user(tg_id)
+    if user_data and user_data[1]:
+        await message.answer(
+            f"Привет, {html.escape(message.from_user.first_name or '')}! Это бот для управления вашим VPN/Proxy.\n"
+            "Выберите нужное действие ниже:",
+            parse_mode="HTML",
+            reply_markup=main_keyboard_user(),
+        )
+        return
     await message.answer(
-
-        f"Привет, {message.from_user.first_name}! Это бот для управления вашим VPN/Proxy.\n"
-
-        "Выберите нужное действие ниже:",
-
-        reply_markup=main_keyboard()
-
+        "🔒 Доступ только по приглашению.\n\n"
+        "Получите токен у администратора и активируйте его командой:\n"
+        "<code>/redeem ВАШ_ТОКЕН</code>\n\n"
+        "Либо перейдите по ссылке-приглашению, которую выдал администратор.",
+        parse_mode="HTML",
     )
 
 
-@dp.callback_query(F.data == "get_proxy")
-async def process_get_proxy(callback: CallbackQuery):
+# --- /redeem ---
 
-    tg_id = callback.from_user.id
-
-    user_data = await db.get_user(tg_id)
-
-    if user_data:
-
-        await callback.message.answer(
-
-            "У вас уже есть активная подписка! Нажмите 'Мои настройки' для просмотра.",
-
-            reply_markup=main_keyboard(),
-
+@dp.message(Command("redeem"))
+async def cmd_redeem(message: Message, command: CommandObject):
+    raw = (command.args or "").strip()
+    if not raw:
+        await message.answer(
+            "Использование: <code>/redeem ВАШ_ТОКЕН</code>",
+            parse_mode="HTML",
         )
+        return
+    await _try_redeem_token(message, raw)
 
-        await callback.answer()
 
+async def _try_redeem_token(message: Message, raw_token: str) -> None:
+    tg_id = message.from_user.id
+
+    # Если уже авторизован — не даём активировать второй раз.
+    if await auth.is_authorized(tg_id):
+        await message.answer(
+            "У вас уже есть активный доступ. Откройте меню командой /start.",
+        )
         return
 
-    username = f"tg_{tg_id}"
-
-    response = await api.create_user(username=username, expire_days=30, hwid_device_limit=DEFAULT_HWID_DEVICE_LIMIT)
-
-    if response and "response" in response:
-
-        api_data = response["response"]
-
-        sub_url = api_data.get("subscriptionUrl", "")
-
-        full_uuid = api_data.get("uuid", "")
-
-        short_uuid = api_data.get("shortUuid", "")
-
-        expire_time = int(time.time()) + (30 * 24 * 60 * 60)
-
-        await db.add_user(tg_id, full_uuid, short_uuid, username, expire_time)
-
-        await callback.message.answer(
-
-            f"✅ Прокси успешно выдан!\n\n"
-
-            f"🔗 Ваша ссылка на подписку:\n`{sub_url}`\n\n"
-
-            f"Скопируйте эту ссылку и вставьте в приложение.",
-
-            parse_mode="Markdown",
-
-            reply_markup=main_keyboard(),
-
+    token = await auth.find_redeemable_token(raw_token.split()[0])
+    if token is None:
+        await message.answer(
+            "❌ Токен недействителен, уже использован или отозван.\n"
+            "Обратитесь к администратору."
         )
+        return
 
+    sub_url = await create_account_for_user(
+        tg_id,
+        expire_days=token.expire_days,
+        hwid_device_limit=token.hwid_device_limit,
+    )
+    if not sub_url:
+        await message.answer(
+            "❌ Не удалось создать аккаунт в панели. Сообщите администратору."
+        )
+        return
+
+    consumed = await auth.consume_token(token.token_hash, tg_id)
+    if not consumed:
+        # Кто-то опередил — крайне маловероятно, но логируем.
+        logger.warning("Token race for tg_id=%s, hash=%s", tg_id, token.token_hash[:12])
+
+    await message.answer(
+        "✅ Доступ активирован!\n\n"
+        f"🔗 Ваша ссылка на подписку:\n<code>{html.escape(sub_url)}</code>\n\n"
+        "Скопируйте ссылку и вставьте в приложение.",
+        parse_mode="HTML",
+        reply_markup=main_keyboard_user(),
+    )
+
+
+# --- Admin commands ---
+
+def _build_invite_link(bot_username: Optional[str], raw_token: str) -> Optional[str]:
+    if not bot_username:
+        return None
+    return f"https://t.me/{bot_username}?start={raw_token}"
+
+
+@dp.message(Command("issue_token"))
+async def cmd_issue_token(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    args = (command.args or "").split()
+    expire_days = DEFAULT_TOKEN_EXPIRE_DAYS
+    hwid_limit = DEFAULT_TOKEN_HWID_LIMIT
+    try:
+        if len(args) >= 1:
+            expire_days = int(args[0])
+        if len(args) >= 2:
+            hwid_limit = int(args[1])
+    except ValueError:
+        await message.answer(
+            "Использование: <code>/issue_token [days] [hwid_limit]</code>",
+            parse_mode="HTML",
+        )
+        return
+    if expire_days <= 0 or hwid_limit < 0:
+        await message.answer("days должно быть > 0, hwid_limit ≥ 0.")
+        return
+
+    raw = await auth.issue_token(
+        created_by=message.from_user.id,
+        expire_days=expire_days,
+        hwid_device_limit=hwid_limit,
+    )
+    me = await bot.get_me()
+    invite = _build_invite_link(me.username, raw)
+    text_lines = [
+        "🔑 Новый одноразовый токен:",
+        f"<code>{html.escape(raw)}</code>",
+        "",
+        f"Срок подписки при активации: <b>{expire_days}</b> дн.",
+        f"Лимит устройств (HWID): <b>{hwid_limit}</b>",
+    ]
+    if invite:
+        text_lines += ["", "Ссылка-приглашение:", f"<code>{html.escape(invite)}</code>"]
+    text_lines += ["", "⚠️ Сохраните токен сейчас — он показывается только один раз."]
+    await message.answer("\n".join(text_lines), parse_mode="HTML")
+
+
+@dp.message(Command("revoke_token"))
+async def cmd_revoke_token(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    raw = (command.args or "").strip()
+    if not raw:
+        await message.answer(
+            "Использование: <code>/revoke_token ХЭШ_ИЛИ_ПРЕФИКС</code>\n"
+            "Сам raw-токен использовать тоже можно.",
+            parse_mode="HTML",
+        )
+        return
+    # Сначала пробуем как raw-токен
+    candidate_hash = auth.hash_token(raw)
+    if not await db.get_access_token(candidate_hash):
+        # Иначе ищем по префиксу хэша
+        candidate_hash = await db.find_token_by_hash_prefix(raw) or candidate_hash
+    ok = await db.revoke_access_token(candidate_hash)
+    if ok:
+        await message.answer("✅ Токен отозван.")
     else:
+        await message.answer("❌ Не нашёл подходящий неиспользованный токен.")
 
-        logger.error(f"Неожиданный ответ от панели или ошибка: {response}")
 
-        await callback.message.answer(
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    has_account = bool(await db.get_user(message.from_user.id))
+    await message.answer(
+        "🛠 Админская панель",
+        reply_markup=main_keyboard_admin(message.from_user.id, has_account),
+    )
 
-            "❌ Ошибка при создании прокси. Обратитесь в поддержку.",
 
-            reply_markup=main_keyboard(),
+# --- Admin panel callbacks ---
 
+PAGE_SIZE = 8
+
+
+async def _send_admin_users_list(callback: CallbackQuery, page: int, *, prefer_edit: bool) -> None:
+    total = await db.count_users()
+    if total == 0:
+        text = "Список пользователей пуст."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
+        )
+        await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=prefer_edit)
+        return
+
+    page = max(0, page)
+    offset = page * PAGE_SIZE
+    rows = await db.list_users(limit=PAGE_SIZE, offset=offset)
+    lines = [f"👥 <b>Пользователи</b> (всего: {total})"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for tg_id, _uuid, _short, username, expire_date, role in rows:
+        uname = username or f"tg_{tg_id}"
+        marker = "👑" if role == db.ROLE_ADMIN else "👤"
+        when = "—"
+        if expire_date:
+            when = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
+        lines.append(f"{marker} <code>{tg_id}</code> · {html.escape(uname)} · до {when}")
+        buttons.append(
+            [InlineKeyboardButton(text=f"{marker} {uname}", callback_data=f"admu:{tg_id}:open")]
         )
 
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_users:{page - 1}"))
+    if offset + PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_users:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")])
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        prefer_edit=prefer_edit,
+    )
+
+
+@dp.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    has_account = bool(await db.get_user(callback.from_user.id))
+    await safe_edit(
+        callback,
+        "🛠 Админская панель",
+        parse_mode="HTML",
+        reply_markup=main_keyboard_admin(callback.from_user.id, has_account),
+        prefer_edit=True,
+    )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_users:"))
+async def cb_admin_users(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        page = 0
+    await _send_admin_users_list(callback, page, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_issue_token")
+async def cb_admin_issue_token(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    raw = await auth.issue_token(
+        created_by=callback.from_user.id,
+        expire_days=DEFAULT_TOKEN_EXPIRE_DAYS,
+        hwid_device_limit=DEFAULT_TOKEN_HWID_LIMIT,
+    )
+    me = await bot.get_me()
+    invite = _build_invite_link(me.username, raw)
+    text_lines = [
+        "🔑 Новый одноразовый токен:",
+        f"<code>{html.escape(raw)}</code>",
+        "",
+        f"Срок при активации: <b>{DEFAULT_TOKEN_EXPIRE_DAYS}</b> дн., HWID: <b>{DEFAULT_TOKEN_HWID_LIMIT}</b>",
+    ]
+    if invite:
+        text_lines += ["", "Ссылка-приглашение:", f"<code>{html.escape(invite)}</code>"]
+    text_lines += [
+        "",
+        "Чтобы изменить параметры — используйте команду <code>/issue_token [days] [hwid_limit]</code>.",
+        "",
+        "⚠️ Сохраните токен сейчас — он показывается только один раз.",
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
+    )
+    await callback.message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=kb)
+    await callback.answer("Токен выдан")
+
+
+@dp.callback_query(F.data == "admin_tokens")
+async def cb_admin_tokens(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    rows = await db.list_active_tokens(limit=20)
+    if not rows:
+        text = "Активных (неиспользованных) токенов нет."
+    else:
+        lines = ["📋 <b>Активные токены</b> (хэш-префикс · автор · дни · HWID):"]
+        for token_hash, created_by, _created_at, expire_days, hwid_device_limit in rows:
+            lines.append(
+                f"• <code>{token_hash[:12]}…</code> · автор {created_by} · {expire_days} дн. · HWID {hwid_device_limit}"
+            )
+        lines.append("")
+        lines.append("Отозвать: <code>/revoke_token ПРЕФИКС</code>")
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
+    )
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+# --- User self-service (read-only) ---
+
+async def _ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
+    user_data = await db.get_user(callback.from_user.id)
+    if not user_data or not user_data[1]:
+        await callback.answer(
+            "Доступ только по приглашению. Активируйте токен через /redeem.",
+            show_alert=True,
+        )
+        return None
+    return user_data
 
 
 @dp.callback_query(F.data == "my_settings")
-async def process_my_settings(callback: CallbackQuery):
-
-    tg_id = callback.from_user.id
-
-    user_data = await db.get_user(tg_id)
-
+async def cb_my_settings(callback: CallbackQuery):
+    user_data = await _ensure_authorized_user(callback)
     if not user_data:
-
-        await callback.message.answer(
-
-            "У вас еще нет подписки. Нажмите 'Получить прокси' в главном меню.",
-
-            reply_markup=main_keyboard(),
-
-        )
-
-        await callback.answer()
-
         return
-
     full_uuid = user_data[1]
-
     short_uuid = user_data[2]
-
     expire_timestamp = user_data[4]
-
-    expire_date_str = datetime.fromtimestamp(
-        expire_timestamp).strftime('%d.%m.%Y %H:%M')
-
-    sub_url = f"{SUB_DOMAIN}/{short_uuid}"
+    expire_date_str = (
+        datetime.fromtimestamp(expire_timestamp).strftime("%d.%m.%Y %H:%M")
+        if expire_timestamp
+        else "—"
+    )
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
 
     info = await api.get_user_info(full_uuid)
-
     status_text = "Активна ✅"
-
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
-
     traffic_lines = ""
-
     if info and "response" in info:
-
         api_data = info["response"]
-
         panel_status = api_data.get("status", "ACTIVE")
-
         if panel_status != "ACTIVE":
-
             status_text = "Неактивна ❌"
-
         limit_text = hwid_limit_caption(api_data)
-
         traffic_lines = "\n\n" + traffic_summary_markdown(api_data)
 
     text = (
-
-        f"👤 **Ваш профиль VPN/Proxy**\n\n"
-
+        "👤 **Ваш профиль VPN/Proxy**\n\n"
         f"**Статус:** {status_text}\n"
-
         f"**Лимит устройств (HWID):** {limit_text}\n"
-
         f"**Подписка до:** `{expire_date_str}`\n"
-
         f"{traffic_lines}\n\n"
-
         f"🔗 **Ваша ссылка для подключения:**\n`{sub_url}`\n\n"
-
-        f"*(Скопируйте ссылку и обновите в приложении)*"
-
+        "*(Скопируйте ссылку и обновите в приложении)*"
     )
+    await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_only_keyboard())
+    await callback.answer()
 
-    await callback.message.answer(
 
+@dp.callback_query(F.data.in_({"my_subscription", "my_subscription_refresh"}))
+async def cb_my_subscription(callback: CallbackQuery):
+    user_data = await _ensure_authorized_user(callback)
+    if not user_data:
+        return
+    full_uuid = user_data[1]
+    text = await load_subscription_text(full_uuid)
+    text += (
+        "\n\nℹ️ Продление подписки доступно только администратору. "
+        "Если срок подходит к концу — обратитесь к администратору."
+    )
+    await safe_edit(
+        callback,
         text,
-
-        parse_mode="Markdown",
-
-        reply_markup=back_only_keyboard(),
-
+        parse_mode="HTML",
+        reply_markup=subscription_user_keyboard(),
+        prefer_edit=callback.data == "my_subscription_refresh",
     )
+    await callback.answer("Обновлено" if callback.data == "my_subscription_refresh" else None)
 
-    await callback.answer()
 
-
-@dp.callback_query(F.data.startswith("hw_limit:"))
-async def process_hw_limit(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
+@dp.callback_query(F.data.in_({"my_devices", "my_devices_refresh"}))
+async def cb_my_devices(callback: CallbackQuery):
+    user_data = await _ensure_authorized_user(callback)
     if not user_data:
-
-        await callback.answer("Нет подписки.", show_alert=True)
-
         return
-
-    action = callback.data.split(":", 1)[1]
-
     full_uuid = user_data[1]
-
-    info = await api.get_user_info(full_uuid)
-
-    if not info or "response" not in info:
-
-        await callback.answer("Не удалось получить данные с панели.", show_alert=True)
-
-        return
-
-    ad = info["response"]
-
-    if action == "inf":
-
-        if is_hwid_unlimited(ad):
-
-            await callback.answer("Уже включён режим без лимита.", show_alert=True)
-
-            return
-
-        ok = await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_SENTINEL)
-
-        if ok:
-
-            await send_or_edit_devices_screen(callback, full_uuid, prefer_edit=True)
-
-            await callback.answer("Лимит устройств снят")
-
-        else:
-
-            await callback.answer("Не удалось обновить лимит.", show_alert=True)
-
-        return
-
-    if is_hwid_unlimited(ad):
-
-        await callback.answer("Уже без лимита устройств.", show_alert=True)
-
-        return
-
-    try:
-
-        delta = int(action)
-
-    except ValueError:
-
-        await callback.answer("Некорректное действие.", show_alert=True)
-
-        return
-
-    cur = effective_hwid_limit(ad)
-
-    new_val = min(cur + delta, MAX_HWID_INCREMENT_CAP)
-
-    if new_val == cur and cur >= MAX_HWID_INCREMENT_CAP:
-
-        await callback.answer(f"Достигнут верхний порог ({MAX_HWID_INCREMENT_CAP}).", show_alert=True)
-
-        return
-
-    ok = await api.update_hwid_device_limit(full_uuid, new_val)
-
-    if ok:
-
-        await send_or_edit_devices_screen(callback, full_uuid, prefer_edit=True)
-
-        await callback.answer(f"Лимит: {cur} → {new_val}")
-
-    else:
-
-        await callback.answer("Не удалось обновить лимит.", show_alert=True)
-
-
-@dp.callback_query(F.data == "manage_devices")
-async def process_manage_devices(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.message.answer(
-
-            "У вас еще нет подписки.",
-
-            reply_markup=main_keyboard(),
-
-        )
-
-        await callback.answer()
-
-        return
-
-    full_uuid = user_data[1]
-
-    await send_or_edit_devices_screen(callback, full_uuid, prefer_edit=False)
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "manage_subscription")
-async def process_manage_subscription(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.message.answer(
-
-            "У вас еще нет подписки.",
-
-            reply_markup=main_keyboard(),
-
-        )
-
-        await callback.answer()
-
-        return
-
-    full_uuid = user_data[1]
-
-    await send_or_edit_subscription_screen(callback, full_uuid, prefer_edit=False)
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "subscription_refresh")
-async def process_subscription_refresh(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.answer("Нет подписки.", show_alert=True)
-
-        return
-
-    await send_or_edit_subscription_screen(callback, user_data[1], prefer_edit=True)
-
-    await callback.answer("Обновлено")
-
-
-@dp.callback_query(F.data.startswith("sub_extend:"))
-async def process_sub_extend(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.answer("Нет подписки.", show_alert=True)
-
-        return
-
-    try:
-
-        days = int(callback.data.split(":", 1)[1])
-
-    except (IndexError, ValueError):
-
-        await callback.answer("Некорректные данные.", show_alert=True)
-
-        return
-
-    tg_id = user_data[0]
-
-    full_uuid = user_data[1]
-
-    ok, _ = await api.extend_user_subscription_days(full_uuid, days)
-
-    if ok:
-
-        await sync_local_expire_from_panel(tg_id, full_uuid)
-
-        await send_or_edit_subscription_screen(callback, full_uuid, prefer_edit=True)
-
-        await callback.answer(f"Подписка продлена на {days} дн.")
-
-    else:
-
-        await callback.answer("Не удалось продлить подписку.", show_alert=True)
-
-
-@dp.callback_query(F.data == "devices_refresh")
-async def process_devices_refresh(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.answer("Нет подписки.", show_alert=True)
-
-        return
-
-    full_uuid = user_data[1]
-
-    await send_or_edit_devices_screen(callback, full_uuid, prefer_edit=True)
-
-    await callback.answer("Список обновлён")
-
-
-@dp.callback_query(F.data.startswith("hw_rm:"))
-async def process_hwid_delete(callback: CallbackQuery):
-
-    user_data = await db.get_user(callback.from_user.id)
-
-    if not user_data:
-
-        await callback.answer("Нет подписки.", show_alert=True)
-
-        return
-
-    try:
-
-        idx = int(callback.data.split(":", 1)[1])
-
-    except (IndexError, ValueError):
-
-        await callback.answer("Некорректные данные.", show_alert=True)
-
-        return
-
-    full_uuid = user_data[1]
-
-    hw_raw = await api.get_user_hwid_devices(full_uuid)
-
-    devices: list = []
-
-    if hw_raw and "response" in hw_raw:
-
-        devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
-
-    if idx < 0 or idx >= len(devices):
-
-        await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
-
-        return
-
-    hwid = devices[idx].get("hwid")
-
-    if not hwid:
-
-        await callback.answer("Не удалось определить устройство.", show_alert=True)
-
-        return
-
-    ok = await api.delete_user_hwid_device(full_uuid, hwid)
-
-    if not ok:
-
-        await callback.answer("Не удалось удалить устройство.", show_alert=True)
-
-        return
-
-    await send_or_edit_devices_screen(callback, full_uuid, prefer_edit=True)
-
-    await callback.answer("Устройство удалено")
+    text, _devices, _show = await load_devices_text(full_uuid)
+    text += (
+        "\n\nℹ️ Управление устройствами и лимитами доступно только администратору."
+    )
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=devices_user_keyboard(),
+        prefer_edit=callback.data == "my_devices_refresh",
+    )
+    await callback.answer("Обновлено" if callback.data == "my_devices_refresh" else None)
 
 
 @dp.callback_query(F.data == "instructions")
-async def process_instructions(callback: CallbackQuery):
-
+async def cb_instructions(callback: CallbackQuery):
     text = (
-
         "**Как настроить прокси:**\n\n"
-
         "**Для iOS (iPhone):**\n"
-
         "1. Скачайте приложение Shadowrocket или V2Box.\n"
-
         "2. Скопируйте вашу ссылку подписки.\n"
-
         "3. В приложении нажмите '+' и выберите 'Subscribe'. Вставьте ссылку.\n\n"
-
         "**Для Android:**\n"
-
         "1. Скачайте v2rayNG.\n"
-
         "2. Откройте меню (три полоски) -> 'Подписка'. Нажмите '+' и вставьте ссылку.\n"
-
         "3. Нажмите 'Обновить подписку'."
-
     )
-
     await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_only_keyboard())
-
     await callback.answer()
 
 
 @dp.callback_query(F.data == "back_main")
-async def process_back_main(callback: CallbackQuery):
-
-    text = (
-
-        f"Привет, {callback.from_user.first_name}! Это бот для управления вашим VPN/Proxy.\n"
-
-        "Выберите нужное действие ниже:"
-
-    )
-
+async def cb_back_main(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    if await auth.is_admin(tg_id):
+        has_account = bool(await db.get_user(tg_id))
+        kb = main_keyboard_admin(tg_id, has_account)
+        text = "🛠 Админская панель"
+    elif await auth.is_authorized(tg_id):
+        kb = main_keyboard_user()
+        text = (
+            f"Привет, {html.escape(callback.from_user.first_name or '')}! "
+            "Это бот для управления вашим VPN/Proxy.\nВыберите нужное действие ниже:"
+        )
+    else:
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
     try:
-
-        await callback.message.edit_text(text, reply_markup=main_keyboard())
-
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except TelegramBadRequest:
-
-        await callback.message.answer(text, reply_markup=main_keyboard())
-
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
     await callback.answer()
 
 
-async def main():
+# --- Admin actions on a specific target user (admu:<tg>:...) ---
 
-    await db.init_db()
+def _parse_admu(data: str) -> Optional[tuple[int, str, Optional[str]]]:
+    """admu:<tg>:<action>[:<arg>] -> (tg, action, arg)."""
+    parts = data.split(":")
+    if len(parts) < 3 or parts[0] != "admu":
+        return None
+    try:
+        tg = int(parts[1])
+    except ValueError:
+        return None
+    action = parts[2]
+    arg = parts[3] if len(parts) >= 4 else None
+    return tg, action, arg
 
-    scheduler = AsyncIOScheduler(timezone=SCHEDULER_TIMEZONE)
 
-    scheduler.add_job(
+async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tuple]:
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return None
+    user_data = await db.get_user(target_tg)
+    if not user_data or not user_data[1]:
+        await callback.answer("У этого пользователя нет аккаунта в панели.", show_alert=True)
+        return None
+    return user_data
 
-        check_expiring_subscriptions,
 
-        "cron",
-
-        hour=SCHEDULER_CRON_HOUR,
-
-        minute=SCHEDULER_CRON_MINUTE,
-
-        args=[bot],
-
+async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
+    user_data = await db.get_user(target_tg)
+    if not user_data:
+        await safe_edit(
+            callback,
+            "Пользователь не найден.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")]]
+            ),
+            prefer_edit=prefer_edit,
+        )
+        return
+    _tg, full_uuid, short_uuid, username, expire_date = user_data
+    full = await db.get_user_full(target_tg)
+    role = (full[5] if full else db.ROLE_USER) or db.ROLE_USER
+    expire_str = (
+        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
+        if expire_date else "—"
+    )
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    text = (
+        f"👤 <b>Пользователь</b>\n\n"
+        f"<b>tg_id:</b> <code>{target_tg}</code>\n"
+        f"<b>username:</b> {html.escape(username or '—')}\n"
+        f"<b>роль:</b> {html.escape(role)}\n"
+        f"<b>подписка до:</b> {html.escape(expire_str)}\n"
+        f"<b>ссылка:</b> <code>{html.escape(sub_url)}</code>"
+    )
+    rows = []
+    if full_uuid:
+        rows.append([InlineKeyboardButton(text="📅 Подписка", callback_data=f"admu:{target_tg}:sub")])
+        rows.append([InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:dev")])
+    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
+    rows.append([InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")])
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=prefer_edit,
     )
 
+
+async def _send_admin_subscription(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
+    user_data = await _admin_target(callback, target_tg)
+    if not user_data:
+        return
+    full_uuid = user_data[1]
+    text = await load_subscription_text(full_uuid)
+    text += f"\n\nЦель: <code>tg_id={target_tg}</code>"
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=subscription_admin_keyboard(target_tg),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_devices(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
+    user_data = await _admin_target(callback, target_tg)
+    if not user_data:
+        return
+    full_uuid = user_data[1]
+    text, devices, show_limits = await load_devices_text(full_uuid)
+    text += f"\n\nЦель: <code>tg_id={target_tg}</code>"
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=devices_admin_keyboard(target_tg, len(devices), show_limits),
+        prefer_edit=prefer_edit,
+    )
+
+
+@dp.callback_query(F.data.startswith("admu:"))
+async def cb_admu(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    parsed = _parse_admu(callback.data)
+    if not parsed:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    target_tg, action, arg = parsed
+
+    if action == "open":
+        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "sub":
+        await _send_admin_subscription(callback, target_tg, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "sub_refresh":
+        await _send_admin_subscription(callback, target_tg, prefer_edit=True)
+        await callback.answer("Обновлено")
+        return
+
+    if action == "sub_ext":
+        try:
+            days = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректные данные.", show_alert=True)
+            return
+        user_data = await _admin_target(callback, target_tg)
+        if not user_data:
+            return
+        full_uuid = user_data[1]
+        ok, _ = await api.extend_user_subscription_days(full_uuid, days)
+        if ok:
+            await sync_local_expire_from_panel(target_tg, full_uuid)
+            await _send_admin_subscription(callback, target_tg, prefer_edit=True)
+            await callback.answer(f"Подписка продлена на {days} дн.")
+        else:
+            await callback.answer("Не удалось продлить подписку.", show_alert=True)
+        return
+
+    if action == "dev":
+        await _send_admin_devices(callback, target_tg, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "dev_refresh":
+        await _send_admin_devices(callback, target_tg, prefer_edit=True)
+        await callback.answer("Обновлено")
+        return
+
+    if action == "hw_lim":
+        user_data = await _admin_target(callback, target_tg)
+        if not user_data:
+            return
+        full_uuid = user_data[1]
+        info = await api.get_user_info(full_uuid)
+        if not info or "response" not in info:
+            await callback.answer("Не удалось получить данные с панели.", show_alert=True)
+            return
+        ad = info["response"]
+        if arg == "inf":
+            if is_hwid_unlimited(ad):
+                await callback.answer("Уже без лимита.", show_alert=True)
+                return
+            ok = await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_SENTINEL)
+            if ok:
+                await _send_admin_devices(callback, target_tg, prefer_edit=True)
+                await callback.answer("Лимит снят")
+            else:
+                await callback.answer("Не удалось обновить лимит.", show_alert=True)
+            return
+        if is_hwid_unlimited(ad):
+            await callback.answer("Уже без лимита.", show_alert=True)
+            return
+        try:
+            delta = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректное действие.", show_alert=True)
+            return
+        cur = effective_hwid_limit(ad)
+        new_val = min(cur + delta, MAX_HWID_INCREMENT_CAP)
+        if new_val == cur and cur >= MAX_HWID_INCREMENT_CAP:
+            await callback.answer(f"Достигнут верхний порог ({MAX_HWID_INCREMENT_CAP}).", show_alert=True)
+            return
+        ok = await api.update_hwid_device_limit(full_uuid, new_val)
+        if ok:
+            await _send_admin_devices(callback, target_tg, prefer_edit=True)
+            await callback.answer(f"Лимит: {cur} → {new_val}")
+        else:
+            await callback.answer("Не удалось обновить лимит.", show_alert=True)
+        return
+
+    if action == "hw_rm":
+        user_data = await _admin_target(callback, target_tg)
+        if not user_data:
+            return
+        full_uuid = user_data[1]
+        try:
+            idx = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректные данные.", show_alert=True)
+            return
+        hw_raw = await api.get_user_hwid_devices(full_uuid)
+        devices: list = []
+        if hw_raw and "response" in hw_raw:
+            devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+        if idx < 0 or idx >= len(devices):
+            await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
+            return
+        hwid = devices[idx].get("hwid")
+        if not hwid:
+            await callback.answer("Не удалось определить устройство.", show_alert=True)
+            return
+        ok = await api.delete_user_hwid_device(full_uuid, hwid)
+        if not ok:
+            await callback.answer("Не удалось удалить устройство.", show_alert=True)
+            return
+        await _send_admin_devices(callback, target_tg, prefer_edit=True)
+        await callback.answer("Устройство удалено")
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
+
+
+# --- Main ---
+
+async def main():
+    await db.init_db()
+    if ADMIN_TG_IDS:
+        await db.bootstrap_admins(ADMIN_TG_IDS)
+        logger.info("Bootstrapped admins: %s", sorted(ADMIN_TG_IDS))
+    else:
+        logger.warning(
+            "ADMIN_TG_IDS не задан — админов нет. Задайте переменную окружения ADMIN_TG_IDS."
+        )
+
+    scheduler = AsyncIOScheduler(timezone=SCHEDULER_TIMEZONE)
+    scheduler.add_job(
+        check_expiring_subscriptions,
+        "cron",
+        hour=SCHEDULER_CRON_HOUR,
+        minute=SCHEDULER_CRON_MINUTE,
+        args=[bot],
+    )
     scheduler.start()
 
-    print("Бот запущен...")
-
+    logger.info("Бот запущен...")
     try:
-
         await dp.start_polling(bot)
-
     finally:
-
         scheduler.shutdown()
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
