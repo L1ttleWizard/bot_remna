@@ -105,6 +105,49 @@ async def init_db():
             )
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id INTEGER NOT NULL,
+                uuid TEXT NOT NULL UNIQUE,
+                short_uuid TEXT,
+                username TEXT,
+                expire_date INTEGER,
+                label TEXT,
+                created_by INTEGER,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subscriptions_tg_id ON subscriptions(tg_id)"
+        )
+
+        # One-time backfill: copy legacy users.uuid → subscriptions for users
+        # that don't have a corresponding subscription yet.
+        async with db.execute(
+            """
+            SELECT u.tg_id, u.uuid, u.short_uuid, u.username, u.expire_date,
+                   u.created_by, COALESCE(u.created_at, ?)
+            FROM users u
+            WHERE u.uuid IS NOT NULL
+              AND u.uuid NOT IN (SELECT uuid FROM subscriptions)
+            """,
+            (int(time.time()),),
+        ) as cursor:
+            legacy_rows = await cursor.fetchall()
+        for tg_id, uuid, short_uuid, username, expire_date, created_by, created_at in legacy_rows:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO subscriptions
+                  (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (tg_id, uuid, short_uuid, username, expire_date, created_by, created_at),
+            )
+
         await db.commit()
 
 
@@ -118,55 +161,208 @@ async def add_user(
     role: str = ROLE_USER,
     created_by: Optional[int] = None,
 ):
+    """Создаёт identity-запись пользователя (если ещё нет) и связанную подписку.
+
+    `uuid` уникален — при повторном вызове с тем же uuid обновляются только
+    short_uuid/username/expire_date этой подписки.
+    """
+    now = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO users (tg_id, uuid, short_uuid, username, expire_date, role, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (tg_id, role, created_at, created_by)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(tg_id) DO UPDATE SET
-                uuid=excluded.uuid,
-                short_uuid=excluded.short_uuid,
-                username=excluded.username,
-                expire_date=excluded.expire_date,
-                created_by=COALESCE(users.created_by, excluded.created_by)
+                role = CASE WHEN users.role = 'admin' THEN users.role ELSE excluded.role END,
+                created_by = COALESCE(users.created_by, excluded.created_by)
             """,
-            (
-                tg_id,
-                uuid,
-                short_uuid,
-                username,
-                expire_date,
-                role,
-                int(time.time()),
-                created_by,
-            ),
+            (tg_id, role, now, created_by),
+        )
+        await db.execute(
+            """
+            INSERT INTO subscriptions
+              (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(uuid) DO UPDATE SET
+                short_uuid = excluded.short_uuid,
+                username = excluded.username,
+                expire_date = excluded.expire_date
+            """,
+            (tg_id, uuid, short_uuid, username, expire_date, created_by, now),
         )
         await db.commit()
 
 
 async def get_user(tg_id: int):
-    """Return legacy 5-tuple (tg_id, uuid, short_uuid, username, expire_date) for back-compat."""
+    """Compat: return (tg_id, uuid, short_uuid, username, expire_date) for the most recent
+    subscription, or None when the user has no subscriptions yet.
+
+    Большинство callsite'ов использует это для проверки has_account и для одноподписочных
+    операций. Новый код должен использовать `list_subscriptions(tg_id)` напрямую.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT tg_id, uuid, short_uuid, username, expire_date FROM users WHERE tg_id = ?",
+            """
+            SELECT tg_id, uuid, short_uuid, username, expire_date
+            FROM subscriptions
+            WHERE tg_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
             (tg_id,),
         ) as cursor:
             return await cursor.fetchone()
 
 
 async def get_user_full(tg_id: int):
-    """Return (tg_id, uuid, short_uuid, username, expire_date, role,
-              tg_username, tg_first_name, tg_last_name) or None."""
+    """Compat: return (tg_id, uuid, short_uuid, username, expire_date, role,
+                       tg_username, tg_first_name, tg_last_name) или None.
+
+    uuid/short_uuid/username/expire_date берутся из самой свежей подписки (или NULL,
+    если подписок нет). Если запись пользователя отсутствует целиком — None.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
-            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
-                   tg_username, tg_first_name, tg_last_name
-            FROM users WHERE tg_id = ?
+            SELECT u.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date,
+                   u.role, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, uuid, short_uuid, username, expire_date,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE u.tg_id = ?
             """,
             (tg_id,),
         ) as cursor:
             return await cursor.fetchone()
+
+
+# --- Subscription helpers (new model) ---
+
+async def add_subscription(
+    tg_id: int,
+    *,
+    uuid: str,
+    short_uuid: str,
+    username: str,
+    expire_date: int,
+    label: Optional[str] = None,
+    created_by: Optional[int] = None,
+) -> int:
+    """Insert a new subscription and return its sub_id."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO subscriptions
+              (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (tg_id, uuid, short_uuid, username, expire_date, label, created_by, now),
+        )
+        await db.commit()
+        return int(cursor.lastrowid or 0)
+
+
+async def list_subscriptions(tg_id: int) -> list:
+    """Возвращает список подписок (id, uuid, short_uuid, username, expire_date, label, created_at)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT id, uuid, short_uuid, username, expire_date, label, created_at
+            FROM subscriptions
+            WHERE tg_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (tg_id,),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+
+async def get_subscription(sub_id: int):
+    """Возвращает (id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at) или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at
+            FROM subscriptions WHERE id = ?
+            """,
+            (int(sub_id),),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def find_subscription_by_uuid(uuid: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at
+            FROM subscriptions WHERE uuid = ?
+            """,
+            (uuid,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def update_subscription_expire(sub_id: int, expire_date: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET expire_date = ? WHERE id = ?",
+            (int(expire_date), int(sub_id)),
+        )
+        await db.commit()
+
+
+async def update_subscription_expire_by_uuid(uuid: str, expire_date: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET expire_date = ? WHERE uuid = ?",
+            (int(expire_date), uuid),
+        )
+        await db.commit()
+
+
+async def update_subscription_label(sub_id: int, label: Optional[str]) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET label = ? WHERE id = ?",
+            (label, int(sub_id)),
+        )
+        await db.commit()
+
+
+async def delete_subscription(sub_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM subscriptions WHERE id = ?", (int(sub_id),))
+        await db.commit()
+
+
+async def count_subscriptions(tg_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE tg_id = ?", (int(tg_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def list_all_active_subscriptions(now_ts: int, window_end_ts: int) -> list:
+    """Все подписки, истекающие в окне (now, window_end]. Возвращает (tg_id, sub_id, expire_date, role)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT s.tg_id, s.id, s.expire_date, COALESCE(u.role, 'user')
+            FROM subscriptions s
+            JOIN users u ON u.tg_id = s.tg_id
+            WHERE s.expire_date IS NOT NULL
+              AND s.expire_date > ?
+              AND s.expire_date <= ?
+            """,
+            (now_ts, window_end_ts),
+        ) as cursor:
+            return list(await cursor.fetchall())
 
 
 async def upsert_tg_profile(
@@ -200,10 +396,15 @@ async def find_user_by_tg_username(tg_username: str):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
-            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
-                   tg_username, tg_first_name, tg_last_name
-            FROM users
-            WHERE tg_username IS NOT NULL AND tg_username = ? COLLATE NOCASE
+            SELECT u.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date,
+                   u.role, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, uuid, short_uuid, username, expire_date,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE u.tg_username IS NOT NULL AND u.tg_username = ? COLLATE NOCASE
             LIMIT 1
             """,
             (name,),
@@ -212,10 +413,20 @@ async def find_user_by_tg_username(tg_username: str):
 
 
 async def update_user_expire(tg_id: int, expire_date: int):
+    """Compat: апдейтит expire_date у самой свежей подписки пользователя.
+    В новом коде используйте `update_subscription_expire(sub_id, ts)` или _by_uuid.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET expire_date = ? WHERE tg_id = ?",
-            (expire_date, tg_id),
+            """
+            UPDATE subscriptions
+            SET expire_date = ?
+            WHERE id = (
+                SELECT id FROM subscriptions WHERE tg_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+            )
+            """,
+            (int(expire_date), int(tg_id)),
         )
         await db.commit()
 
@@ -264,13 +475,27 @@ async def bootstrap_admins(admin_ids: Iterable[int]) -> None:
 
 
 async def list_users(limit: int = 50, offset: int = 0) -> list:
+    """Возвращает per-user сводку: 9-tuple (tg_id, uuid, short_uuid, username, expire_date, role,
+    tg_username, tg_first_name, tg_last_name) — uuid/short_uuid/username/expire_date берутся из
+    самой свежей подписки (или NULL, если подписок нет).
+
+    Сортировка: пользователи с подписками выше (по самой свежей подписке), без подписок — внизу.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
-            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
-                   tg_username, tg_first_name, tg_last_name
-            FROM users
-            ORDER BY COALESCE(created_at, 0) DESC, tg_id DESC
+            SELECT u.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date,
+                   u.role, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, uuid, short_uuid, username, expire_date, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            ORDER BY
+                CASE WHEN s.created_at IS NULL THEN 1 ELSE 0 END,
+                COALESCE(s.created_at, u.created_at, 0) DESC,
+                u.tg_id DESC
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -281,6 +506,78 @@ async def list_users(limit: int = 50, offset: int = 0) -> list:
 async def count_users() -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+            row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def search_users(query: str, limit: int = 50, offset: int = 0) -> list:
+    """Находит юзеров по подстроке (без учёта регистра) в tg_id, tg_username,
+    tg_first_name, tg_last_name или username последней подписки.
+
+    Возвращает тот же 9-tuple что и list_users.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    pattern = f"%{q}%"
+    digit_match = q.lstrip("@").isdigit()
+    digit_value: Optional[int] = int(q.lstrip("@")) if digit_match else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT u.tg_id, s.uuid, s.short_uuid, s.username, s.expire_date,
+                   u.role, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, uuid, short_uuid, username, expire_date, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE
+                CAST(u.tg_id AS TEXT) LIKE ?
+                OR (u.tg_username   IS NOT NULL AND u.tg_username   LIKE ? COLLATE NOCASE)
+                OR (u.tg_first_name IS NOT NULL AND u.tg_first_name LIKE ? COLLATE NOCASE)
+                OR (u.tg_last_name  IS NOT NULL AND u.tg_last_name  LIKE ? COLLATE NOCASE)
+                OR (s.username      IS NOT NULL AND s.username      LIKE ? COLLATE NOCASE)
+                OR (? IS NOT NULL AND u.tg_id = ?)
+            ORDER BY
+                CASE WHEN s.created_at IS NULL THEN 1 ELSE 0 END,
+                COALESCE(s.created_at, u.created_at, 0) DESC,
+                u.tg_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (pattern, pattern, pattern, pattern, pattern, digit_value, digit_value, limit, offset),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+
+async def count_search_users(query: str) -> int:
+    q = (query or "").strip()
+    if not q:
+        return 0
+    pattern = f"%{q}%"
+    digit_match = q.lstrip("@").isdigit()
+    digit_value: Optional[int] = int(q.lstrip("@")) if digit_match else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*)
+            FROM users u
+            LEFT JOIN (
+                SELECT tg_id, username,
+                       ROW_NUMBER() OVER (PARTITION BY tg_id ORDER BY created_at DESC, id DESC) AS rn
+                FROM subscriptions
+            ) s ON s.tg_id = u.tg_id AND s.rn = 1
+            WHERE
+                CAST(u.tg_id AS TEXT) LIKE ?
+                OR (u.tg_username   IS NOT NULL AND u.tg_username   LIKE ? COLLATE NOCASE)
+                OR (u.tg_first_name IS NOT NULL AND u.tg_first_name LIKE ? COLLATE NOCASE)
+                OR (u.tg_last_name  IS NOT NULL AND u.tg_last_name  LIKE ? COLLATE NOCASE)
+                OR (s.username      IS NOT NULL AND s.username      LIKE ? COLLATE NOCASE)
+                OR (? IS NOT NULL AND u.tg_id = ?)
+            """,
+            (pattern, pattern, pattern, pattern, pattern, digit_value, digit_value),
+        ) as cursor:
             row = await cursor.fetchone()
     return int(row[0]) if row else 0
 
@@ -343,7 +640,7 @@ async def revoke_access_token(token_hash: str) -> bool:
         async with db.execute(
             """
             UPDATE access_tokens SET revoked = 1
-            WHERE token_hash = ? AND consumed_by_tg_id IS NULL
+            WHERE token_hash = ? AND consumed_by_tg_id IS NULL AND revoked = 0
             """,
             (token_hash,),
         ) as cursor:
@@ -436,6 +733,19 @@ async def get_promocode(code: str):
             (code.strip(),),
         ) as cursor:
             return await cursor.fetchone()
+
+
+async def has_promocode_use(code: str, tg_id: int) -> bool:
+    """True, если данный tg_id уже активировал данный промокод."""
+    code = code.strip()
+    if not code:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM promocode_uses WHERE code = ? COLLATE NOCASE AND tg_id = ?",
+            (code, int(tg_id)),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
 
 async def list_promocodes(limit: int = 50) -> list:
@@ -536,10 +846,11 @@ async def set_setting(key: str, value: Optional[str]) -> None:
 # --- User deletion ---
 
 async def delete_user(tg_id: int) -> None:
-    """Удаляет запись о юзере + все его use-записи промокодов.
-    Не удаляет аккаунт в Remnawave — это делает api.delete_user из бота.
+    """Удаляет запись о юзере, все его подписки и use-записи промокодов.
+    Не удаляет аккаунты в Remnawave — это делает api.delete_user(uuid) из бота для каждой подписки.
     """
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("DELETE FROM promocode_uses WHERE tg_id = ?", (int(tg_id),))
+        await conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (int(tg_id),))
         await conn.execute("DELETE FROM users WHERE tg_id = ?", (int(tg_id),))
         await conn.commit()
