@@ -543,3 +543,141 @@ def test_dm_target_must_exist_in_db(db_module):
     ))
     assert asyncio.run(db_module.get_user_full(7001)) is not None
     assert asyncio.run(db_module.get_user_full(99999)) is None
+
+
+def test_stats_users_counts(db_module):
+    """stats_users() возвращает корректные агрегаты:
+    активные/истёкшие/безлимитные/истекающие за 7д."""
+    import time as _t
+    from datetime import datetime, timezone
+
+    asyncio.run(db_module.init_db())
+    now = int(_t.time())
+    far_future = int(datetime(2099, 6, 1, tzinfo=timezone.utc).timestamp())
+
+    # Юзер с 3 подписками: активная (>30д), истекающая (через 3д), без лимита
+    asyncio.run(db_module.add_user(
+        tg_id=9001, uuid="ua", short_uuid="sa", username="u_active",
+        expire_date=now + 30 * 86400,
+    ))
+    asyncio.run(db_module.add_subscription(
+        9001, uuid="ub", short_uuid="sb", username="u_soon",
+        expire_date=now + 3 * 86400, created_by=1,
+    ))
+    asyncio.run(db_module.add_subscription(
+        9001, uuid="uc", short_uuid="sc", username="u_inf",
+        expire_date=far_future, created_by=1,
+    ))
+    # Юзер с истёкшей
+    asyncio.run(db_module.add_user(
+        tg_id=9002, uuid="ud", short_uuid="sd", username="u_expired",
+        expire_date=now - 86400,
+    ))
+    # Юзер без подписок
+    asyncio.run(db_module.upsert_tg_profile(
+        9003, tg_username="noone", tg_first_name="No", tg_last_name="Body",
+    ))
+
+    stats = asyncio.run(db_module.stats_users())
+    assert stats["total_users"] == 3
+    assert stats["users_with_subs"] == 2
+    assert stats["users_without_subs"] == 1
+    assert stats["total_subscriptions"] == 4
+    assert stats["subs_active"] == 3  # active, soon, inf
+    assert stats["subs_expired"] == 1
+    assert stats["subs_unlimited"] == 1
+    assert stats["subs_expiring_7d"] == 1
+
+
+def test_stats_tokens_aggregation(db_module):
+    """stats_tokens() считает выпущенные/использованные/отозванные и группирует по автору."""
+    asyncio.run(db_module.init_db())
+    # admin 100 — два токена, один использован
+    asyncio.run(db_module.create_access_token(
+        token_hash="h1", created_by=100, expire_days=30, hwid_device_limit=2,
+    ))
+    asyncio.run(db_module.create_access_token(
+        token_hash="h2", created_by=100, expire_days=30, hwid_device_limit=2,
+    ))
+    asyncio.run(db_module.consume_access_token(token_hash="h1", tg_id=555))
+    # admin 200 — один отозванный
+    asyncio.run(db_module.create_access_token(
+        token_hash="h3", created_by=200, expire_days=30, hwid_device_limit=2,
+    ))
+    asyncio.run(db_module.revoke_access_token("h3"))
+
+    stats = asyncio.run(db_module.stats_tokens())
+    assert stats["total"] == 3
+    assert stats["redeemed"] == 1
+    assert stats["revoked"] == 1
+    assert stats["active"] == 1  # h2
+    by_admin = {row[0]: row for row in stats["by_admin"]}
+    assert by_admin[100][1] == 2 and by_admin[100][2] == 1
+    assert by_admin[200][1] == 1 and by_admin[200][3] == 1
+
+
+def test_stats_promocodes_top(db_module):
+    """stats_promocodes() сортирует топ-коды по used_count и считает выданные бонус-дни."""
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.create_promocode(
+        code="ALPHA", bonus_days=7, max_uses=10, created_by=1,
+    ))
+    asyncio.run(db_module.create_promocode(
+        code="BETA", bonus_days=3, max_uses=None, created_by=1,
+    ))
+    asyncio.run(db_module.create_promocode(
+        code="GAMMA", bonus_days=1, max_uses=5, created_by=1,
+    ))
+    # ALPHA: 2 использования, BETA: 5 использований, GAMMA: 0
+    asyncio.run(db_module.add_user(tg_id=1, uuid="u1", short_uuid="s1", username="x", expire_date=0))
+    for tg in (1, 2, 3, 4, 5):
+        asyncio.run(db_module.redeem_promocode(code="BETA", tg_id=tg))
+    for tg in (10, 11):
+        asyncio.run(db_module.redeem_promocode(code="ALPHA", tg_id=tg))
+
+    stats = asyncio.run(db_module.stats_promocodes())
+    assert stats["total"] == 3
+    assert stats["active"] == 3
+    assert stats["total_uses"] == 7
+    # 5*3 + 2*7 + 0*1 = 29
+    assert stats["bonus_days_granted"] == 29
+    top_codes = [row[0] for row in stats["top_codes"]]
+    assert top_codes[0] == "BETA"
+    assert top_codes[1] == "ALPHA"
+
+
+def test_list_subs_expiring_in_window(db_module):
+    """list_subs_expiring_in возвращает только подписки в окне now..now+window."""
+    import time as _t
+    asyncio.run(db_module.init_db())
+    now = int(_t.time())
+    asyncio.run(db_module.add_user(
+        tg_id=8001, uuid="e1", short_uuid="s1", username="soon",
+        expire_date=now + 2 * 86400,
+    ))
+    asyncio.run(db_module.add_subscription(
+        8001, uuid="e2", short_uuid="s2", username="far",
+        expire_date=now + 30 * 86400, created_by=1,
+    ))
+    asyncio.run(db_module.add_subscription(
+        8001, uuid="e3", short_uuid="s3", username="past",
+        expire_date=now - 86400, created_by=1,
+    ))
+
+    rows = asyncio.run(db_module.list_subs_expiring_in(7 * 86400))
+    assert len(rows) == 1
+    assert rows[0][1] == "e1"
+
+
+def test_list_all_subscriptions_with_uuid(db_module):
+    """list_all_subscriptions_with_uuid отдаёт только записи с непустым uuid."""
+    asyncio.run(db_module.init_db())
+    asyncio.run(db_module.add_user(
+        tg_id=9100, uuid="x1", short_uuid="s1", username="a", expire_date=0,
+    ))
+    asyncio.run(db_module.add_subscription(
+        9100, uuid="x2", short_uuid="s2", username="b", expire_date=0, created_by=1,
+    ))
+    rows = asyncio.run(db_module.list_all_subscriptions_with_uuid())
+    uuids = {r[1] for r in rows}
+    assert uuids == {"x1", "x2"}
