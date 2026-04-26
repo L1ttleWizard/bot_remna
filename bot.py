@@ -2,19 +2,16 @@ import asyncio
 import html
 import io
 import logging
-import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Optional
 
 import qrcode
-from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram import F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -28,28 +25,65 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
     Message,
-    TelegramObject,
-    User,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import auth
 import database as db
+from app import (
+    AdminDmStates,
+    AdminSearchStates,
+    PromoStates,
+    SUPPORT_KEY,
+    api,
+    bot,
+    dp,
+    safe_edit,
+    sync_local_expire_from_panel,
+)
+from clients import CLIENT_CATALOG, PLATFORM_TITLES, connect_platform_keyboard
 from config import (
     ADMIN_TG_IDS,
-    BOT_TOKEN,
     DEFAULT_TOKEN_EXPIRE_DAYS,
     DEFAULT_TOKEN_HWID_LIMIT,
     LOG_FILE_PATH,
     LOG_LEVEL,
-    REMNAWAVE_TOKEN,
-    REMNAWAVE_URL,
     SCHEDULER_CRON_HOUR,
     SCHEDULER_CRON_MINUTE,
     SCHEDULER_TIMEZONE,
     SUB_DOMAIN,
 )
-from remnawave_api import RemnawaveAPI
+from formatters import (
+    DEFAULT_HWID_DEVICE_LIMIT,
+    HWID_UNLIMITED_SENTINEL,
+    MAX_HWID_INCREMENT_CAP,
+    REMNAWAVE_USERNAME_MAX_LEN,
+    TG_USERNAME_RE,
+    build_panel_username,
+    effective_hwid_limit,
+    format_devices_html,
+    format_expire_display,
+    format_sub_caption as _format_sub_caption,
+    format_tg_name,
+    human_bytes,
+    hwid_limit_caption,
+    is_hwid_unlimited,
+    parse_expire_to_ts as _parse_expire_to_ts,
+    sort_hwid_devices,
+    traffic_summary_markdown,
+)
+from keyboards import (
+    admin_sub_devices_keyboard as _admin_sub_devices_keyboard,
+    admin_sub_keyboard as _admin_sub_keyboard,
+    back_only_keyboard,
+    devices_admin_keyboard,
+    devices_user_keyboard,
+    main_keyboard_admin,
+    main_keyboard_user,
+    subscription_admin_keyboard,
+    subscription_user_keyboard,
+    user_sub_menu_keyboard as _user_sub_menu_keyboard,
+)
 from scheduler import check_expiring_subscriptions
 
 
@@ -68,244 +102,7 @@ _setup_logging()
 logger = logging.getLogger(__name__)
 
 
-# Лимит устройств по HWID: значение по умолчанию при создании и если панель вернула null
-DEFAULT_HWID_DEVICE_LIMIT = 3
-# Верхняя граница при +1 / +3 (числовой лимит)
-MAX_HWID_INCREMENT_CAP = 9999
-# Значение «практически без лимита» (отображается как ♾)
-HWID_UNLIMITED_SENTINEL = 9_999_999
 
-
-def effective_hwid_limit(api_data: dict) -> int:
-    v = api_data.get("hwidDeviceLimit")
-    if v is None:
-        return DEFAULT_HWID_DEVICE_LIMIT
-    return int(v)
-
-
-def is_hwid_unlimited(api_data: dict) -> bool:
-    v = api_data.get("hwidDeviceLimit")
-    if v is None:
-        return False
-    return int(v) >= HWID_UNLIMITED_SENTINEL
-
-
-def hwid_limit_caption(api_data: dict) -> str:
-    v = api_data.get("hwidDeviceLimit")
-    if v is None:
-        return str(DEFAULT_HWID_DEVICE_LIMIT)
-    vi = int(v)
-    if vi >= HWID_UNLIMITED_SENTINEL:
-        return "♾ без лимита"
-    return str(vi)
-
-
-def human_bytes(n: int) -> str:
-    n = max(0, int(n))
-    for div, name in ((1 << 30, "ГБ"), (1 << 20, "МБ"), (1 << 10, "КБ")):
-        if n >= div:
-            x = n / div
-            s = f"{x:.2f}".rstrip("0").rstrip(".")
-            return f"{s} {name}"
-    return f"{n} Б"
-
-
-def traffic_summary_markdown(api_data: dict) -> str:
-    ut = api_data.get("userTraffic") or {}
-    used = int(ut.get("usedTrafficBytes") or 0)
-    life = int(ut.get("lifetimeUsedTrafficBytes") or 0)
-    tlim = api_data.get("trafficLimitBytes")
-    lim_txt = "без лимита"
-    if tlim is not None and int(tlim) > 0:
-        lim_txt = human_bytes(int(tlim))
-    return (
-        f"**Использовано (период):** {human_bytes(used)}\n"
-        f"**За всё время:** {human_bytes(life)}\n"
-        f"**Лимит трафика:** {lim_txt}"
-    )
-
-
-def format_expire_display(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "—"
-    s = iso_str.replace("Z", "+00:00") if iso_str.endswith("Z") else iso_str
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-
-
-def sort_hwid_devices(devices: list) -> list:
-    return sorted(devices or [], key=lambda x: (x.get("createdAt") or ""))
-
-
-# --- Клавиатуры ---
-
-def back_only_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")]
-        ]
-    )
-
-
-def main_keyboard_user() -> InlineKeyboardMarkup:
-    """Меню обычного пользователя — read-only, с поддержкой нескольких подписок."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Мои подписки", callback_data="my_subs")],
-            [InlineKeyboardButton(text="📥 Подключить", callback_data="connect")],
-            [InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_input")],
-            [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
-        ]
-    )
-
-
-def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users:0")],
-        [
-            InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token"),
-            InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens"),
-        ],
-        [
-            InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos"),
-            InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_stats"),
-        ],
-        [
-            InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support"),
-            InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
-        ],
-    ]
-    if has_account:
-        rows.append(
-            [InlineKeyboardButton(text="⚙️ Мой аккаунт", callback_data=f"admu:{tg_id}:open")]
-        )
-    rows.append([InlineKeyboardButton(text="📥 Подключить", callback_data="connect")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def format_devices_html(devices: list, limit_label: str) -> str:
-    header = f"📱 <b>Устройства</b> (лимит HWID: {html.escape(limit_label)})"
-    if not devices:
-        return (
-            header
-            + "\n\nСписок пуст. Устройства появятся после подключения клиента "
-              "с поддержкой HWID (Happ, v2RayTun и др.)."
-        )
-    blocks = [header]
-    for i, d in enumerate(devices):
-        pl = html.escape(str(d.get("platform") or "—"))
-        model = html.escape(str(d.get("deviceModel") or "—"))
-        os_ver = d.get("osVersion")
-        os_part = f"\n   ОС: {html.escape(str(os_ver))}" if os_ver else ""
-        blocks.append(f"\n\n<b>{i + 1}.</b> {model}{os_part}\n   Платформа: {pl}")
-    return "".join(blocks)
-
-
-def devices_admin_keyboard(target_tg: int, device_count: int, show_limit_buttons: bool) -> InlineKeyboardMarkup:
-    rows = []
-    for i in range(device_count):
-        rows.append(
-            [InlineKeyboardButton(text=f"🗑 Удалить #{i + 1}", callback_data=f"admu:{target_tg}:hw_rm:{i}")]
-        )
-    rows.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"admu:{target_tg}:dev_refresh")])
-    if show_limit_buttons:
-        rows.append(
-            [
-                InlineKeyboardButton(text="➕ +1 к лимиту", callback_data=f"admu:{target_tg}:hw_lim:1"),
-                InlineKeyboardButton(text="➕ +3 к лимиту", callback_data=f"admu:{target_tg}:hw_lim:3"),
-            ]
-        )
-        rows.append(
-            [InlineKeyboardButton(text="♾ Без лимита устройств", callback_data=f"admu:{target_tg}:hw_lim:inf")]
-        )
-    rows.append([InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def devices_user_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить список", callback_data="my_devices_refresh")],
-            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")],
-        ]
-    )
-
-
-def subscription_admin_keyboard(target_tg: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="+7 дней", callback_data=f"admu:{target_tg}:sub_ext:7"),
-                InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:sub_ext:30"),
-            ],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:sub_refresh")],
-            [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
-        ]
-    )
-
-
-def subscription_user_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="my_subscription_refresh")],
-            [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")],
-        ]
-    )
-
-
-# --- Bot wiring ---
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-api = RemnawaveAPI(base_url=REMNAWAVE_URL, api_token=REMNAWAVE_TOKEN)
-
-
-class PromoStates(StatesGroup):
-    waiting_for_code = State()
-    waiting_for_sub_pick = State()
-
-
-SUPPORT_KEY = "support_text"
-
-
-class TgProfileMiddleware(BaseMiddleware):
-    """Сохраняет/обновляет Telegram-имя пользователя при каждом обращении к боту."""
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user: Optional[User] = data.get("event_from_user")
-        if user is not None and not user.is_bot:
-            try:
-                await db.upsert_tg_profile(
-                    user.id,
-                    tg_username=user.username,
-                    tg_first_name=user.first_name,
-                    tg_last_name=user.last_name,
-                )
-            except Exception as exc:  # не ломаем хендлер из-за БД
-                logger.warning("upsert_tg_profile failed for tg_id=%s: %s", user.id, exc)
-        return await handler(event, data)
-
-
-dp.message.middleware(TgProfileMiddleware())
-dp.callback_query.middleware(TgProfileMiddleware())
-
-
-def format_tg_name(tg_username: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> str:
-    """Человекочитаемое имя из TG-полей. Возвращает '—' если ничего не известно."""
-    parts: list[str] = []
-    full = " ".join(p for p in (first_name, last_name) if p)
-    if full:
-        parts.append(full)
-    if tg_username:
-        parts.append(f"@{tg_username}")
-    return " · ".join(parts) if parts else "—"
 
 
 # --- Views ---
@@ -336,65 +133,10 @@ async def load_subscription_text(full_uuid: str) -> str:
     )
 
 
-async def safe_edit(callback: CallbackQuery, text: str, *, parse_mode: str, reply_markup: InlineKeyboardMarkup, prefer_edit: bool) -> None:
-    if prefer_edit:
-        try:
-            await callback.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-            return
-        except TelegramBadRequest as e:
-            if "message is not modified" in str(e).lower():
-                return
-            logger.info("edit_text не удался (%s), отправляем новое сообщение", e)
-    await callback.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
-async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
-    """Синкает expire_date конкретной подписки (по uuid) с тем, что отдаёт панель."""
-    info = await api.get_user_info(full_uuid)
-    if not info or "response" not in info:
-        return
-    iso = info["response"].get("expireAt")
-    if not iso:
-        return
-    s = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    await db.update_subscription_expire_by_uuid(full_uuid, int(dt.timestamp()))
 
 
-_USERNAME_SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
-_REMNAWAVE_USERNAME_MAX_LEN = 32
-
-
-def build_panel_username(
-    tg_id: int,
-    tg_username: Optional[str],
-    tg_first_name: Optional[str],
-) -> str:
-    """Собирает username для Remnawave из TG-профиля.
-
-    Шаблоны (по приоритету):
-      `tg_<id>_<sanitized(@username)>` → если есть @username;
-      `tg_<id>_<sanitized(first_name)>` → если есть first_name;
-      `tg_<id>` → fallback.
-    Sanitize: оставляем только [A-Za-z0-9_], обрезаем до общего лимита 32 символа.
-    """
-    base = f"tg_{tg_id}"
-    raw = tg_username or tg_first_name or ""
-    if not raw:
-        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
-    suffix = _USERNAME_SAFE_CHARS_RE.sub("", raw).strip("_")
-    if not suffix:
-        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
-    full = f"{base}_{suffix}"
-    if len(full) <= _REMNAWAVE_USERNAME_MAX_LEN:
-        return full
-    # обрезаем суффикс, чтобы влезть
-    avail = _REMNAWAVE_USERNAME_MAX_LEN - len(base) - 1
-    if avail <= 0:
-        return base[:_REMNAWAVE_USERNAME_MAX_LEN]
-    return f"{base}_{suffix[:avail]}"
 
 
 async def create_account_for_user(
@@ -429,7 +171,7 @@ async def create_account_for_user(
             else f"{base_username}_{attempt + 1}"
         )
         # Если получился слишком длинный — обрежем (Remnawave ограничивает 32 символа).
-        candidate = candidate[:_REMNAWAVE_USERNAME_MAX_LEN]
+        candidate = candidate[:REMNAWAVE_USERNAME_MAX_LEN]
         response = await api.create_user(
             username=candidate,
             expire_days=expire_days,
@@ -736,21 +478,6 @@ async def cb_admin_help(callback: CallbackQuery):
     await callback.answer()
 
 
-def _parse_expire_to_ts(value: Optional[str]) -> int:
-    """ISO-строка expireAt → unix timestamp (UTC). Возвращает 0, если не парсится."""
-    if not value:
-        return 0
-    try:
-        s = value.replace("Z", "+00:00") if value.endswith("Z") else value
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return 0
-
-
-_TG_USERNAME_RE = re.compile(r"^tg_(\d+)(?:_[A-Za-z0-9_]*)?$")
 
 
 @dp.message(Command("import_users"))
@@ -792,7 +519,7 @@ async def cmd_import_users(message: Message):
         seen_pages += 1
         for u in users:
             username = u.get("username") or ""
-            m = _TG_USERNAME_RE.match(username)
+            m = TG_USERNAME_RE.match(username)
             if not m:
                 continue
             try:
@@ -1079,9 +806,6 @@ async def cb_admin_users(callback: CallbackQuery):
     await callback.answer()
 
 
-class AdminSearchStates(StatesGroup):
-    waiting_for_query = State()
-
 
 @dp.callback_query(F.data == "admin_users_search")
 async def cb_admin_users_search(callback: CallbackQuery, state: FSMContext):
@@ -1251,19 +975,6 @@ async def _ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
     return user_data
 
 
-def _format_sub_caption(sub: tuple) -> str:
-    """Делает читаемое название из (id, uuid, short_uuid, username, expire_date, label, created_at)."""
-    sid, _uuid, _short, username, expire_date, label, _created = sub
-    if label:
-        head = label
-    elif username:
-        head = username
-    else:
-        head = f"#{sid}"
-    if expire_date:
-        ts = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
-        return f"#{sid} · {head} · до {ts}"
-    return f"#{sid} · {head}"
 
 
 async def _ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> Optional[tuple]:
@@ -1273,18 +984,6 @@ async def _ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> O
         return None
     return sub
 
-
-def _user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📈 Аналитика", callback_data=f"sub:info:{sub_id}"),
-                InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}"),
-            ],
-            [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
-            [InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")],
-        ]
-    )
 
 
 @dp.callback_query(F.data == "my_subs")
@@ -1518,207 +1217,6 @@ async def cb_my_devices(callback: CallbackQuery):
 
 # --- Connect / VPN client instructions ---
 
-# Каталог рекомендуемых клиентов по платформам.
-# `deeplink_template` — шаблон импорта подписки в клиент. `{sub}` — URL подписки целиком.
-# Для клиентов без подтверждённого deep-link оставляем None — будет только инструкция и QR.
-CLIENT_CATALOG: dict[str, list[dict]] = {
-    "ios": [
-        {
-            "name": "Happ",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
-            ],
-            "deeplink_template": "happ://add/{sub}",
-        },
-        {
-            "name": "V2Box",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690"),
-            ],
-            "deeplink_template": "v2box://install-sub?url={sub}",
-        },
-        {
-            "name": "Streisand",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/streisand/id6450534064"),
-            ],
-            "deeplink_template": "streisand://import/{sub}",
-        },
-        {
-            "name": "Shadowrocket",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/shadowrocket/id932747118"),
-            ],
-            "deeplink_template": "shadowrocket://add/sub://{sub}",
-        },
-        {
-            "name": "Karing",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/karing/id6472431552"),
-                ("Сайт", "https://karing.app/en/download"),
-            ],
-            "deeplink_template": "karing://install-config?url={sub}",
-        },
-    ],
-    "android": [
-        {
-            "name": "Happ",
-            "stores": [
-                ("Google Play", "https://play.google.com/store/apps/details?id=com.happproxy"),
-                ("Сайт", "https://happ.su/"),
-            ],
-            "deeplink_template": "happ://add/{sub}",
-        },
-        {
-            "name": "v2rayNG",
-            "stores": [
-                ("Google Play", "https://play.google.com/store/apps/details?id=com.v2ray.ang"),
-                ("GitHub", "https://github.com/2dust/v2rayNG/releases"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "Hiddify",
-            "stores": [
-                ("Google Play", "https://play.google.com/store/apps/details?id=app.hiddify.com"),
-                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
-            ],
-            "deeplink_template": "hiddify://install-config?url={sub}",
-        },
-        {
-            "name": "NekoBox",
-            "stores": [
-                ("GitHub", "https://github.com/MatsuriDayo/NekoBoxForAndroid/releases"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "Karing",
-            "stores": [
-                ("GitHub", "https://github.com/KaringX/karing/releases"),
-                ("Сайт", "https://karing.app/en/download"),
-            ],
-            "deeplink_template": "karing://install-config?url={sub}",
-        },
-    ],
-    "windows": [
-        {
-            "name": "Hiddify",
-            "stores": [
-                ("Сайт", "https://hiddify.com/"),
-                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
-            ],
-            "deeplink_template": "hiddify://install-config?url={sub}",
-        },
-        {
-            "name": "v2rayN",
-            "stores": [
-                ("GitHub", "https://github.com/2dust/v2rayN/releases"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "NekoRay",
-            "stores": [
-                ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "Karing",
-            "stores": [
-                ("Сайт", "https://karing.app/en/download"),
-                ("GitHub", "https://github.com/KaringX/karing/releases"),
-            ],
-            "deeplink_template": "karing://install-config?url={sub}",
-        },
-    ],
-    "macos": [
-        {
-            "name": "Happ",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
-            ],
-            "deeplink_template": "happ://add/{sub}",
-        },
-        {
-            "name": "V2Box",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690"),
-            ],
-            "deeplink_template": "v2box://install-sub?url={sub}",
-        },
-        {
-            "name": "Hiddify",
-            "stores": [
-                ("Сайт", "https://hiddify.com/"),
-                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
-            ],
-            "deeplink_template": "hiddify://install-config?url={sub}",
-        },
-        {
-            "name": "FoXray",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/foxray/id6448898396"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "Karing",
-            "stores": [
-                ("App Store", "https://apps.apple.com/us/app/karing/id6472431552"),
-                ("Сайт", "https://karing.app/en/download"),
-            ],
-            "deeplink_template": "karing://install-config?url={sub}",
-        },
-    ],
-    "linux": [
-        {
-            "name": "Hiddify",
-            "stores": [
-                ("Сайт", "https://hiddify.com/"),
-                ("GitHub", "https://github.com/hiddify/hiddify-app/releases"),
-            ],
-            "deeplink_template": "hiddify://install-config?url={sub}",
-        },
-        {
-            "name": "NekoRay",
-            "stores": [
-                ("GitHub", "https://github.com/MatsuriDayo/nekoray/releases"),
-            ],
-            "deeplink_template": None,
-        },
-        {
-            "name": "Karing",
-            "stores": [
-                ("Сайт", "https://karing.app/en/download"),
-                ("GitHub", "https://github.com/KaringX/karing/releases"),
-            ],
-            "deeplink_template": "karing://install-config?url={sub}",
-        },
-    ],
-}
-
-PLATFORM_TITLES = {
-    "ios": "📱 iOS (iPhone/iPad)",
-    "android": "🤖 Android",
-    "windows": "🪟 Windows",
-    "macos": "🍎 macOS",
-    "linux": "🐧 Linux",
-}
-
-
-def connect_platform_keyboard(sub_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data=f"connect_p:{sub_id}:ios")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["android"], callback_data=f"connect_p:{sub_id}:android")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data=f"connect_p:{sub_id}:windows")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data=f"connect_p:{sub_id}:macos")],
-            [InlineKeyboardButton(text=PLATFORM_TITLES["linux"], callback_data=f"connect_p:{sub_id}:linux")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="connect")],
-        ]
-    )
 
 
 async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> None:
@@ -2238,38 +1736,6 @@ async def _send_admin_devices(callback: CallbackQuery, target_tg: int, *, prefer
     )
 
 
-def _admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="+7 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:7"),
-                InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:30"),
-            ],
-            [InlineKeyboardButton(text="♾ Без лимита по времени", callback_data=f"admu:{target_tg}:s:{sub_id}:ext_inf")],
-            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
-            [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
-            [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
-        ]
-    )
-
-
-def _admin_sub_devices_keyboard(target_tg: int, sub_id: int, devices_count: int, show_limits: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for i in range(devices_count):
-        rows.append([InlineKeyboardButton(
-            text=f"🗑 Удалить #{i + 1}",
-            callback_data=f"admu:{target_tg}:s:{sub_id}:hw_rm:{i}",
-        )])
-    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")])
-    if show_limits:
-        rows.append([
-            InlineKeyboardButton(text="➕ +1", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:1"),
-            InlineKeyboardButton(text="➕ +3", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:3"),
-        ])
-        rows.append([InlineKeyboardButton(text="♾ Без лимита", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:inf")])
-    rows.append([InlineKeyboardButton(text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool) -> None:
@@ -2707,9 +2173,6 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
 
 
 # --- Admin: DM message to a specific user ---
-
-class AdminDmStates(StatesGroup):
-    waiting_for_text = State()
 
 
 @dp.message(Command("dm"))
@@ -3429,7 +2892,7 @@ ADMIN_COMMANDS = [
 ]
 
 
-async def setup_bot_commands(bot_: Bot, admin_ids: set[int]) -> None:
+async def setup_bot_commands(bot_, admin_ids: set[int]) -> None:
     try:
         await bot_.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeDefault())
     except Exception as exc:
