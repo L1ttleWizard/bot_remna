@@ -672,6 +672,8 @@ ADMIN_HELP_TEXT = (
     "  В карточке юзера:\n"
     "    · <i>📅 #X · username · до dd.mm.yyyy</i> — открыть конкретную подписку (статус, трафик, устройства).\n"
     "    · <b>✉️ Написать</b> — отправить ему DM от вашего имени (FSM-ввод).\n"
+    "    · <b>➕ Привязать подписку из Remnawave</b> — выбрать существующего юзера в панели "
+    "и добавить его как подписку этому tg_id (запись в панели не меняется).\n"
     "    · <b>🗑 Удалить пользователя</b> — снести все подписки в Remnawave + запись в БД (с подтверждением).\n"
     "    · <b>🔎 Поиск</b> в списке — фильтр по подстроке (tg_id, @username, имя, фамилия, panel-username).\n"
     "• <b>🔑 Выдать токен</b> — выпустить новый токен (≡ <code>/issue_token</code> с дефолтами).\n"
@@ -1955,6 +1957,10 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
             callback_data=f"admu:{target_tg}:s:{sub[0]}:open",
         )])
     rows.append([InlineKeyboardButton(text="✉️ Написать", callback_data=f"admu:{target_tg}:dm")])
+    rows.append([InlineKeyboardButton(
+        text="➕ Привязать подписку из Remnawave",
+        callback_data=f"admu:{target_tg}:link:0",
+    )])
     rows.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admu:{target_tg}:del")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
     rows.append([InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel")])
@@ -1965,6 +1971,198 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         prefer_edit=prefer_edit,
     )
+
+
+LINK_PICKER_PAGE_SIZE = 10
+
+
+async def _send_admin_link_picker(
+    callback: CallbackQuery,
+    target_tg: int,
+    page: int,
+    *,
+    prefer_edit: bool,
+) -> None:
+    """Постраничный пикер для админа: показывает юзеров из Remnawave-панели,
+    которые ещё не привязаны как подписка ни к одному tg_id в БД бота. Тап
+    по строке открывает шаг подтверждения привязки."""
+    page = max(0, int(page))
+    panel_page = await api.list_users(
+        size=LINK_PICKER_PAGE_SIZE, start=page * LINK_PICKER_PAGE_SIZE,
+    )
+    if not panel_page or "response" not in panel_page:
+        await safe_edit(
+            callback,
+            "❌ Не удалось получить список пользователей из панели. Попробуйте позже.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open"),
+            ]]),
+            prefer_edit=prefer_edit,
+        )
+        return
+    resp = panel_page["response"]
+    total = int(resp.get("total") or 0)
+    panel_users = resp.get("users") or []
+
+    rows: list[list[InlineKeyboardButton]] = []
+    lines = [
+        f"➕ <b>Привязать подписку из Remnawave</b> к <code>{target_tg}</code>",
+        f"Всего в панели: <b>{total}</b>. Страница {page + 1}.",
+        "",
+    ]
+    available = 0
+    for u in panel_users:
+        uuid_v = u.get("uuid") or ""
+        if not uuid_v:
+            continue
+        existing = await db.find_subscription_by_uuid(uuid_v)
+        username_p = u.get("username") or "—"
+        if existing:
+            lines.append(f"  · <s>{html.escape(username_p)}</s> — уже у tg_id <code>{existing[1]}</code>")
+            continue
+        available += 1
+        expire_iso = u.get("expireAt") or ""
+        when = "—"
+        if expire_iso:
+            ts = _parse_expire_to_ts(expire_iso)
+            if ts:
+                when = datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
+        label = f"➕ {username_p[:32]} · до {when}"
+        rows.append([InlineKeyboardButton(
+            text=label[:64],
+            callback_data=f"lnk:{target_tg}:{uuid_v}",
+        )])
+
+    if not rows and available == 0 and not panel_users:
+        lines.append("Пусто.")
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"admu:{target_tg}:link:{page - 1}",
+        ))
+    if (page + 1) * LINK_PICKER_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"admu:{target_tg}:link:{page + 1}",
+        ))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")])
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=prefer_edit,
+    )
+
+
+@dp.callback_query(F.data.startswith("lnk:"))
+async def cb_admu_link_pick(callback: CallbackQuery):
+    """lnk:<tg>:<uuid> — шаг подтверждения привязки."""
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    try:
+        target_tg = int(parts[1])
+    except ValueError:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    uuid_v = parts[2]
+    info = await api.get_user_info(uuid_v)
+    if not info or "response" not in info:
+        await callback.answer("Не удалось получить данные из панели.", show_alert=True)
+        return
+    panel_user = info["response"]
+    panel_username = panel_user.get("username") or "—"
+    short_uuid = panel_user.get("shortUuid") or ""
+    expire_iso = panel_user.get("expireAt") or ""
+    expire_h = format_expire_display(expire_iso) if expire_iso else "—"
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+
+    existing = await db.find_subscription_by_uuid(uuid_v)
+    if existing:
+        await callback.answer(
+            f"Эта подписка уже привязана к tg_id {existing[1]}.", show_alert=True,
+        )
+        return
+
+    text = (
+        "➕ <b>Привязать подписку</b>\n\n"
+        f"К tg_id: <code>{target_tg}</code>\n"
+        f"Из Remnawave:\n"
+        f"  · username: <code>{html.escape(panel_username)}</code>\n"
+        f"  · uuid: <code>{html.escape(uuid_v)}</code>\n"
+        f"  · до: <b>{html.escape(expire_h)}</b>\n"
+        f"  · ссылка: <code>{html.escape(sub_url)}</code>\n\n"
+        "Запись в панели не изменится — добавится только связь в БД бота."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Подтвердить привязку",
+            callback_data=f"lnkok:{target_tg}:{uuid_v}",
+        )],
+        [InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"admu:{target_tg}:link:0",
+        )],
+    ])
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("lnkok:"))
+async def cb_admu_link_confirm(callback: CallbackQuery):
+    """lnkok:<tg>:<uuid> — финальная привязка."""
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    try:
+        target_tg = int(parts[1])
+    except ValueError:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    uuid_v = parts[2]
+    if await db.find_subscription_by_uuid(uuid_v):
+        await callback.answer("Эта подписка уже привязана.", show_alert=True)
+        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
+        return
+    info = await api.get_user_info(uuid_v)
+    if not info or "response" not in info:
+        await callback.answer("Не удалось получить данные из панели.", show_alert=True)
+        return
+    panel_user = info["response"]
+    panel_username = panel_user.get("username") or ""
+    short_uuid = panel_user.get("shortUuid") or ""
+    expire_ts = _parse_expire_to_ts(panel_user.get("expireAt"))
+    # Гарантируем, что у tg-юзера есть запись в users (для FK / отображения).
+    if not await db.get_user_full(target_tg):
+        await db.add_user(
+            tg_id=target_tg,
+            uuid="", short_uuid="", username="",
+            expire_date=0,
+            created_by=callback.from_user.id,
+        )
+    sub_id = await db.add_subscription(
+        target_tg,
+        uuid=uuid_v,
+        short_uuid=short_uuid,
+        username=panel_username,
+        expire_date=expire_ts,
+        created_by=callback.from_user.id,
+    )
+    await callback.answer(f"✅ Привязано (sub #{sub_id}).")
+    await _send_admin_user_card(callback, target_tg, prefer_edit=True)
 
 
 async def _send_admin_subscription(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
@@ -2222,6 +2420,15 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
 
     if action == "open":
         await _send_admin_user_card(callback, target_tg, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "link":
+        try:
+            page = int(arg or "0")
+        except ValueError:
+            page = 0
+        await _send_admin_link_picker(callback, target_tg, page, prefer_edit=True)
         await callback.answer()
         return
 
