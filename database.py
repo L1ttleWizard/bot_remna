@@ -26,6 +26,12 @@ async def _ensure_user_columns(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE users ADD COLUMN created_at INTEGER")
     if not await _column_exists(db, "users", "created_by"):
         await db.execute("ALTER TABLE users ADD COLUMN created_by INTEGER")
+    if not await _column_exists(db, "users", "tg_username"):
+        await db.execute("ALTER TABLE users ADD COLUMN tg_username TEXT")
+    if not await _column_exists(db, "users", "tg_first_name"):
+        await db.execute("ALTER TABLE users ADD COLUMN tg_first_name TEXT")
+    if not await _column_exists(db, "users", "tg_last_name"):
+        await db.execute("ALTER TABLE users ADD COLUMN tg_last_name TEXT")
 
 
 async def init_db():
@@ -40,11 +46,17 @@ async def init_db():
                 expire_date TIMESTAMP,
                 role TEXT NOT NULL DEFAULT 'user',
                 created_at INTEGER,
-                created_by INTEGER
+                created_by INTEGER,
+                tg_username TEXT,
+                tg_first_name TEXT,
+                tg_last_name TEXT
             )
             """
         )
         await _ensure_user_columns(db)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username COLLATE NOCASE)"
+        )
 
         await db.execute(
             """
@@ -110,11 +122,58 @@ async def get_user(tg_id: int):
 
 
 async def get_user_full(tg_id: int):
-    """Return (tg_id, uuid, short_uuid, username, expire_date, role) or None."""
+    """Return (tg_id, uuid, short_uuid, username, expire_date, role,
+              tg_username, tg_first_name, tg_last_name) or None."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT tg_id, uuid, short_uuid, username, expire_date, role FROM users WHERE tg_id = ?",
+            """
+            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
+                   tg_username, tg_first_name, tg_last_name
+            FROM users WHERE tg_id = ?
+            """,
             (tg_id,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def upsert_tg_profile(
+    tg_id: int,
+    *,
+    tg_username: Optional[str],
+    tg_first_name: Optional[str],
+    tg_last_name: Optional[str],
+) -> None:
+    """Сохраняет/обновляет Telegram-имена. Создаёт пустую запись, если её ещё нет."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO users (tg_id, role, created_at, tg_username, tg_first_name, tg_last_name)
+            VALUES (?, 'user', ?, ?, ?, ?)
+            ON CONFLICT(tg_id) DO UPDATE SET
+                tg_username   = excluded.tg_username,
+                tg_first_name = excluded.tg_first_name,
+                tg_last_name  = excluded.tg_last_name
+            """,
+            (tg_id, int(time.time()), tg_username, tg_first_name, tg_last_name),
+        )
+        await db.commit()
+
+
+async def find_user_by_tg_username(tg_username: str):
+    """Поиск по @username (без @, без учёта регистра). Возвращает get_user_full-кортеж или None."""
+    name = tg_username.lstrip("@").strip()
+    if not name:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
+                   tg_username, tg_first_name, tg_last_name
+            FROM users
+            WHERE tg_username IS NOT NULL AND tg_username = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (name,),
         ) as cursor:
             return await cursor.fetchone()
 
@@ -175,7 +234,8 @@ async def list_users(limit: int = 50, offset: int = 0) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
-            SELECT tg_id, uuid, short_uuid, username, expire_date, role
+            SELECT tg_id, uuid, short_uuid, username, expire_date, role,
+                   tg_username, tg_first_name, tg_last_name
             FROM users
             ORDER BY COALESCE(created_at, 0) DESC, tg_id DESC
             LIMIT ? OFFSET ?

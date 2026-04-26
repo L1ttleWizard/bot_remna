@@ -4,16 +4,21 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
+    User,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -234,6 +239,44 @@ def subscription_user_keyboard() -> InlineKeyboardMarkup:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 api = RemnawaveAPI(base_url=REMNAWAVE_URL, api_token=REMNAWAVE_TOKEN)
+
+
+class TgProfileMiddleware(BaseMiddleware):
+    """Сохраняет/обновляет Telegram-имя пользователя при каждом обращении к боту."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user: Optional[User] = data.get("event_from_user")
+        if user is not None and not user.is_bot:
+            try:
+                await db.upsert_tg_profile(
+                    user.id,
+                    tg_username=user.username,
+                    tg_first_name=user.first_name,
+                    tg_last_name=user.last_name,
+                )
+            except Exception as exc:  # не ломаем хендлер из-за БД
+                logger.warning("upsert_tg_profile failed for tg_id=%s: %s", user.id, exc)
+        return await handler(event, data)
+
+
+dp.message.middleware(TgProfileMiddleware())
+dp.callback_query.middleware(TgProfileMiddleware())
+
+
+def format_tg_name(tg_username: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> str:
+    """Человекочитаемое имя из TG-полей. Возвращает '—' если ничего не известно."""
+    parts: list[str] = []
+    full = " ".join(p for p in (first_name, last_name) if p)
+    if full:
+        parts.append(full)
+    if tg_username:
+        parts.append(f"@{tg_username}")
+    return " · ".join(parts) if parts else "—"
 
 
 # --- Views ---
@@ -512,6 +555,66 @@ async def cmd_admin(message: Message):
     )
 
 
+@dp.message(Command("whois"))
+async def cmd_whois(message: Message, command: CommandObject):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer(
+            "Использование: <code>/whois &lt;tg_id&gt;</code> или <code>/whois @username</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    full = None
+    if arg.lstrip("-").isdigit():
+        full = await db.get_user_full(int(arg))
+    else:
+        full = await db.find_user_by_tg_username(arg)
+
+    if not full:
+        await message.answer("Пользователь не найден в базе бота.")
+        return
+
+    (
+        tg_id,
+        full_uuid,
+        short_uuid,
+        username,
+        expire_date,
+        role,
+        tg_username,
+        tg_first_name,
+        tg_last_name,
+    ) = full
+    role = role or db.ROLE_USER
+    tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
+    expire_str = (
+        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
+        if expire_date else "—"
+    )
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    text = (
+        "🔍 <b>Найден пользователь</b>\n\n"
+        f"<b>tg_id:</b> <code>{tg_id}</code>\n"
+        f"<b>имя в TG:</b> {html.escape(tg_name)}\n"
+        f"<b>panel username:</b> {html.escape(username or '—')}\n"
+        f"<b>роль:</b> {html.escape(role)}\n"
+        f"<b>подписка до:</b> {html.escape(expire_str)}\n"
+        f"<b>ссылка:</b> <code>{html.escape(sub_url)}</code>"
+    )
+    if not full_uuid:
+        text += "\n\n⚠️ Нет аккаунта в Remnawave (токен не активирован)."
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Открыть карточку", callback_data=f"admu:{tg_id}:open")]
+        ]
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
 # --- Admin panel callbacks ---
 
 PAGE_SIZE = 8
@@ -532,15 +635,30 @@ async def _send_admin_users_list(callback: CallbackQuery, page: int, *, prefer_e
     rows = await db.list_users(limit=PAGE_SIZE, offset=offset)
     lines = [f"👥 <b>Пользователи</b> (всего: {total})"]
     buttons: list[list[InlineKeyboardButton]] = []
-    for tg_id, _uuid, _short, username, expire_date, role in rows:
-        uname = username or f"tg_{tg_id}"
+    for (
+        tg_id,
+        _uuid,
+        _short,
+        _username,
+        expire_date,
+        role,
+        tg_username,
+        tg_first_name,
+        tg_last_name,
+    ) in rows:
         marker = "👑" if role == db.ROLE_ADMIN else "👤"
+        tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
         when = "—"
         if expire_date:
             when = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
-        lines.append(f"{marker} <code>{tg_id}</code> · {html.escape(uname)} · до {when}")
+        lines.append(
+            f"{marker} <code>{tg_id}</code> · {html.escape(tg_name)} · до {when}"
+        )
+        button_label = f"{marker} {tg_id} · {tg_name}"
+        if len(button_label) > 60:
+            button_label = button_label[:57] + "…"
         buttons.append(
-            [InlineKeyboardButton(text=f"{marker} {uname}", callback_data=f"admu:{tg_id}:open")]
+            [InlineKeyboardButton(text=button_label, callback_data=f"admu:{tg_id}:open")]
         )
 
     nav_row: list[InlineKeyboardButton] = []
@@ -809,8 +927,8 @@ async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tup
 
 
 async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
-    user_data = await db.get_user(target_tg)
-    if not user_data:
+    full = await db.get_user_full(target_tg)
+    if not full:
         await safe_edit(
             callback,
             "Пользователь не найден.",
@@ -821,24 +939,38 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
             prefer_edit=prefer_edit,
         )
         return
-    _tg, full_uuid, short_uuid, username, expire_date = user_data
-    full = await db.get_user_full(target_tg)
-    role = (full[5] if full else db.ROLE_USER) or db.ROLE_USER
+    (
+        _tg,
+        full_uuid,
+        short_uuid,
+        username,
+        expire_date,
+        role,
+        tg_username,
+        tg_first_name,
+        tg_last_name,
+    ) = full
+    role = role or db.ROLE_USER
     expire_str = (
         datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
         if expire_date else "—"
     )
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
+    has_account = bool(full_uuid)
     text = (
         f"👤 <b>Пользователь</b>\n\n"
         f"<b>tg_id:</b> <code>{target_tg}</code>\n"
-        f"<b>username:</b> {html.escape(username or '—')}\n"
+        f"<b>имя в TG:</b> {html.escape(tg_name)}\n"
+        f"<b>panel username:</b> {html.escape(username or '—')}\n"
         f"<b>роль:</b> {html.escape(role)}\n"
         f"<b>подписка до:</b> {html.escape(expire_str)}\n"
-        f"<b>ссылка:</b> <code>{html.escape(sub_url)}</code>"
+        f"<b>ссылка:</b> <code>{html.escape(sub_url)}</code>\n"
     )
+    if not has_account:
+        text += "\n⚠️ У пользователя нет аккаунта в Remnawave (токен не активирован)."
     rows = []
-    if full_uuid:
+    if has_account:
         rows.append([InlineKeyboardButton(text="📅 Подписка", callback_data=f"admu:{target_tg}:sub")])
         rows.append([InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:dev")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
@@ -1015,6 +1147,35 @@ async def cb_admu(callback: CallbackQuery):
 
 # --- Main ---
 
+DEFAULT_COMMANDS = [
+    BotCommand(command="start", description="Запустить бота / открыть меню"),
+    BotCommand(command="redeem", description="Активировать токен доступа"),
+]
+
+ADMIN_COMMANDS = [
+    BotCommand(command="start", description="Открыть меню"),
+    BotCommand(command="admin", description="🛠 Админская панель"),
+    BotCommand(command="whois", description="🔍 Найти пользователя по tg_id или @username"),
+    BotCommand(command="issue_token", description="🔑 Выдать новый токен доступа"),
+    BotCommand(command="revoke_token", description="🚫 Отозвать токен по префиксу"),
+    BotCommand(command="redeem", description="Активировать токен доступа"),
+]
+
+
+async def setup_bot_commands(bot_: Bot, admin_ids: set[int]) -> None:
+    try:
+        await bot_.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeDefault())
+    except Exception as exc:
+        logger.warning("set_my_commands(default) failed: %s", exc)
+    for admin_id in admin_ids:
+        try:
+            await bot_.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as exc:
+            logger.warning("set_my_commands(admin=%s) failed: %s", admin_id, exc)
+
+
 async def main():
     await db.init_db()
     if ADMIN_TG_IDS:
@@ -1024,6 +1185,8 @@ async def main():
         logger.warning(
             "ADMIN_TG_IDS не задан — админов нет. Задайте переменную окружения ADMIN_TG_IDS."
         )
+
+    await setup_bot_commands(bot, ADMIN_TG_IDS)
 
     scheduler = AsyncIOScheduler(timezone=SCHEDULER_TIMEZONE)
     scheduler.add_job(

@@ -134,3 +134,71 @@ def test_unknown_token_not_redeemable(db_module):
     import auth
     importlib.reload(auth)
     assert asyncio.run(auth.find_redeemable_token("definitely-not-a-token")) is None
+
+
+def test_upsert_tg_profile_and_lookup(db_module):
+    asyncio.run(db_module.init_db())
+    # Создаём профиль для нового tg_id (никогда не активировал токен).
+    asyncio.run(
+        db_module.upsert_tg_profile(
+            555,
+            tg_username="Alice_TG",
+            tg_first_name="Alice",
+            tg_last_name="Smith",
+        )
+    )
+    full = asyncio.run(db_module.get_user_full(555))
+    assert full is not None
+    # Кортеж: (tg_id, uuid, short_uuid, username, expire_date, role,
+    #         tg_username, tg_first_name, tg_last_name)
+    assert full[0] == 555
+    assert full[5] == "user"  # дефолтная роль
+    assert full[6] == "Alice_TG"
+    assert full[7] == "Alice"
+    assert full[8] == "Smith"
+
+    # Поиск по @username (без учёта регистра) находит того же пользователя.
+    found = asyncio.run(db_module.find_user_by_tg_username("alice_tg"))
+    assert found is not None and found[0] == 555
+
+    # С префиксом @ — тоже находит.
+    found2 = asyncio.run(db_module.find_user_by_tg_username("@ALICE_tg"))
+    assert found2 is not None and found2[0] == 555
+
+    # Несуществующий username — None.
+    assert asyncio.run(db_module.find_user_by_tg_username("nobody_here")) is None
+    assert asyncio.run(db_module.find_user_by_tg_username("")) is None
+
+
+def test_upsert_tg_profile_overwrites(db_module):
+    asyncio.run(db_module.init_db())
+    asyncio.run(
+        db_module.upsert_tg_profile(
+            777, tg_username="oldname", tg_first_name="Old", tg_last_name=None
+        )
+    )
+    asyncio.run(
+        db_module.upsert_tg_profile(
+            777, tg_username="newname", tg_first_name="New", tg_last_name="Surname"
+        )
+    )
+    full = asyncio.run(db_module.get_user_full(777))
+    assert full[6] == "newname"
+    assert full[7] == "New"
+    assert full[8] == "Surname"
+
+
+def test_bootstrap_admin_preserves_tg_profile(db_module):
+    """Bootstrap админа поверх уже сохранённого профиля не должен затирать имя."""
+    asyncio.run(db_module.init_db())
+    asyncio.run(
+        db_module.upsert_tg_profile(
+            999, tg_username="boss", tg_first_name="Boss", tg_last_name="One"
+        )
+    )
+    asyncio.run(db_module.bootstrap_admins([999]))
+    assert asyncio.run(db_module.is_admin(999)) is True
+    full = asyncio.run(db_module.get_user_full(999))
+    assert full[5] == "admin"
+    assert full[6] == "boss"
+    assert full[7] == "Boss"
