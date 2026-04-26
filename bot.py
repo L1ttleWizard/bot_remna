@@ -5,7 +5,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import qrcode
@@ -164,12 +164,18 @@ def main_keyboard_user() -> InlineKeyboardMarkup:
 def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users:0")],
-        [InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token")],
-        [InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens")],
-        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos")],
-        [InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support")],
-        [InlineKeyboardButton(text="📖 Гайд для админа", callback_data="admin_help")],
+        [
+            InlineKeyboardButton(text="🔑 Выдать токен", callback_data="admin_issue_token"),
+            InlineKeyboardButton(text="📋 Активные токены", callback_data="admin_tokens"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promos"),
+            InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_stats"),
+        ],
+        [
+            InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support"),
+            InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
+        ],
     ]
     if has_account:
         rows.append(
@@ -686,13 +692,15 @@ ADMIN_HELP_TEXT = (
     "    · <b>🔄 Обновить</b> — перерисовать список.\n"
     "• <b>🎁 Промокоды</b> — список последних 20 промо. Создание/отзыв через команды.\n"
     "• <b>📊 Аналитика</b> — сводка по БД и панели (юзеры, подписки, статусы, "
-    "трафик period/lifetime). Подразделы:\n"
-    "    · <b>📈 Топ по трафику</b> — топ-10 юзеров панели по lifetime-трафику.\n"
+    "трафик за всё время). Подразделы:\n"
+    "    · <b>📈 Топ по трафику</b> — топ-10 юзеров панели за <b>последние 30 дней</b> "
+    "(тянется через bandwidth-stats), плюс lifetime для контекста.\n"
     "    · <b>⏰ Скоро истекают (7 дн)</b> — список подписок, дата + сколько дней осталось.\n"
     "    · <b>🎁 Промокоды</b> — топ кодов по использованиям, сумма выданных бонус-дней.\n"
     "    · <b>🔑 Токены</b> — issued/redeemed/revoked/active с разбивкой по автору.\n"
-    "  В карточке любой подписки админу также показывается блок 📈 Статистика "
-    "(статус, трафик period/lifetime, HWID, последний онлайн).\n"
+    "  В карточке любой подписки у админа показан блок 📈 Статистика "
+    "(статус, трафик за 30 дн / период / всё время, HWID, последний онлайн).\n"
+    "  У юзера в его меню подписки — кнопка <b>📈 Аналитика</b> с теми же данными.\n"
     "• <b>❓ Поддержка</b> — задать/изменить контакты поддержки (FSM-ввод текста).\n\n"
     "<b>🔍 Inline-поиск</b>\n"
     "В любом чате наберите <code>@&lt;имя_бота&gt; &lt;запрос&gt;</code> — получите список юзеров. "
@@ -1269,8 +1277,10 @@ async def _ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> O
 def _user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статус и трафик", callback_data=f"sub:info:{sub_id}")],
-            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}")],
+            [
+                InlineKeyboardButton(text="📈 Аналитика", callback_data=f"sub:info:{sub_id}"),
+                InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}"),
+            ],
             [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
             [InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")],
         ]
@@ -1361,18 +1371,33 @@ async def cb_sub_info(callback: CallbackQuery):
     status_text = "Активна ✅"
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
     traffic_lines = ""
+    last_online_line = ""
+    period_30_line = ""
+    hwid_count = 0
     if info and "response" in info:
         api_data = info["response"]
         panel_status = api_data.get("status", "ACTIVE")
         if panel_status != "ACTIVE":
-            status_text = "Неактивна ❌"
+            status_text = f"Неактивна ❌ ({panel_status})"
         limit_text = hwid_limit_caption(api_data)
         traffic_lines = "\n\n" + traffic_summary_markdown(api_data)
+        hwid_count = len((api_data.get("hwidDevices") or []))
+        last_iso = api_data.get("lastOnlineAt") or ""
+        if last_iso:
+            last_online_line = f"\n**Последний онлайн:** `{format_expire_display(last_iso)}`"
+
+        start_d, end_d = _analytics_date_range()
+        period_30 = await api.get_user_usage_range(full_uuid, start_d, end_d)
+        if period_30 is not None:
+            period_30_line = f"\n**За {ANALYTICS_PERIOD_DAYS} дней:** {human_bytes(int(period_30))}"
+
     text = (
-        f"📊 **Подписка #{sub_id}**\n\n"
+        f"📈 **Аналитика подписки #{sub_id}**\n\n"
         f"**Статус:** {status_text}\n"
-        f"**Лимит устройств (HWID):** {limit_text}\n"
         f"**Действует до:** `{expire_date_str}`\n"
+        f"**HWID-устройств:** {hwid_count} / {limit_text}"
+        f"{last_online_line}"
+        f"{period_30_line}"
         f"{traffic_lines}\n\n"
         f"🔗 **Ссылка:** `{sub_url}`"
     )
@@ -2272,10 +2297,19 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         last_h = format_expire_display(last_iso) if last_iso else "—"
         hwid_lim = hwid_limit_caption(ad)
         hwid_count = len((ad.get("hwidDevices") or []))
+
+        start_d, end_d = _analytics_date_range()
+        period_30 = await api.get_user_usage_range(full_uuid, start_d, end_d)
+        period_30_txt = (
+            human_bytes(int(period_30)) if period_30 is not None else "—"
+        )
+
         stats_block = (
             "\n📈 <b>Статистика</b>\n"
             f"  · Статус: <b>{html.escape(status)}</b>\n"
-            f"  · Трафик (период): <b>{html.escape(human_bytes(used))}</b> / "
+            f"  · Трафик за {ANALYTICS_PERIOD_DAYS} дн: "
+            f"<b>{html.escape(period_30_txt)}</b>\n"
+            f"  · Трафик (текущий период): <b>{html.escape(human_bytes(used))}</b> / "
             f"{html.escape(lim_txt)}\n"
             f"  · Трафик (за всё время): <b>{html.escape(human_bytes(life))}</b>\n"
             f"  · HWID-устройств: <b>{hwid_count}</b> / {html.escape(hwid_lim)}\n"
@@ -3058,6 +3092,14 @@ async def cmd_set_support(message: Message, command: CommandObject):
 ANALYTICS_TOP_N = 10
 ANALYTICS_PANEL_PAGE_SIZE = 200
 ANALYTICS_MAX_PANEL_USERS = 5000
+ANALYTICS_PERIOD_DAYS = 30
+
+
+def _analytics_date_range(days: int = ANALYTICS_PERIOD_DAYS) -> tuple[str, str]:
+    """(start, end) в формате YYYY-MM-DD для запроса к панели за последние N дней."""
+    end_dt = datetime.now(timezone.utc).date()
+    start_dt = end_dt - timedelta(days=days - 1)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
 
 
 def _stats_keyboard() -> InlineKeyboardMarkup:
@@ -3077,17 +3119,26 @@ def _stats_back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def _collect_panel_traffic(max_users: int = ANALYTICS_MAX_PANEL_USERS) -> dict:
+async def _collect_panel_traffic(
+    max_users: int = ANALYTICS_MAX_PANEL_USERS,
+    *,
+    with_period_range: bool = False,
+) -> dict:
     """Постранично выкачивает users из Remnawave, агрегирует трафик/статусы.
 
+    Если ``with_period_range=True`` — для каждого юзера дополнительно дергает
+    `/api/bandwidth-stats/users/{uuid}` за последние ANALYTICS_PERIOD_DAYS дней
+    (это медленно при больших панелях — N запросов).
+
     Возвращает dict с ключами:
-      total_panel, by_status (dict), traffic_total, traffic_lifetime,
-      by_uuid (dict uuid → {used, lifetime, status, last_online, username}).
+      total_panel, by_status, traffic_period (за окно или 0 если не считалось),
+      traffic_lifetime, by_uuid (uuid → {used, lifetime, period, status,
+      last_online, username, expire_at}), period_days.
     """
     by_uuid: dict = {}
     by_status: dict = {}
     total_panel = 0
-    traffic_total = 0
+    traffic_period_total = 0
     traffic_lifetime = 0
     start = 0
     while start < max_users:
@@ -3108,11 +3159,11 @@ async def _collect_panel_traffic(max_users: int = ANALYTICS_MAX_PANEL_USERS) -> 
             life = int(ut.get("lifetimeUsedTrafficBytes") or 0)
             status = u.get("status") or "UNKNOWN"
             by_status[status] = by_status.get(status, 0) + 1
-            traffic_total += used
             traffic_lifetime += life
             by_uuid[uuid_v] = {
                 "used": used,
                 "lifetime": life,
+                "period": 0,
                 "status": status,
                 "last_online": u.get("lastOnlineAt") or "",
                 "username": u.get("username") or "",
@@ -3121,12 +3172,23 @@ async def _collect_panel_traffic(max_users: int = ANALYTICS_MAX_PANEL_USERS) -> 
         start += ANALYTICS_PANEL_PAGE_SIZE
         if start >= total_panel:
             break
+
+    if with_period_range and by_uuid:
+        start_d, end_d = _analytics_date_range()
+        for uuid_v, info in by_uuid.items():
+            period = await api.get_user_usage_range(uuid_v, start_d, end_d)
+            if period is None:
+                continue
+            info["period"] = int(period)
+            traffic_period_total += int(period)
+
     return {
         "total_panel": total_panel,
         "by_status": by_status,
-        "traffic_total": traffic_total,
+        "traffic_period": traffic_period_total,
         "traffic_lifetime": traffic_lifetime,
         "by_uuid": by_uuid,
+        "period_days": ANALYTICS_PERIOD_DAYS if with_period_range else 0,
     }
 
 
@@ -3152,10 +3214,10 @@ async def _send_admin_stats_summary(callback: CallbackQuery, *, prefer_edit: boo
         f"  · Истекают за 7 дн: <b>{db_stats['subs_expiring_7d']}</b>\n\n"
         "<b>Панель Remnawave</b>\n"
         f"  · Всего юзеров в панели: <b>{panel['total_panel']}</b>\n"
-        f"  · Трафик (период): <b>{html.escape(human_bytes(panel['traffic_total']))}</b>\n"
         f"  · Трафик (за всё время): <b>{html.escape(human_bytes(panel['traffic_lifetime']))}</b>\n"
         "  · По статусам:\n"
         + "\n".join(status_lines)
+        + f"\n\n<i>Топ за {ANALYTICS_PERIOD_DAYS} дней — кнопка «📈 Топ по трафику».</i>"
     )
     await safe_edit(
         callback, text, parse_mode="HTML",
@@ -3164,31 +3226,32 @@ async def _send_admin_stats_summary(callback: CallbackQuery, *, prefer_edit: boo
 
 
 async def _send_admin_stats_traffic(callback: CallbackQuery, *, prefer_edit: bool) -> None:
-    panel = await _collect_panel_traffic()
+    panel = await _collect_panel_traffic(with_period_range=True)
     by_uuid = panel["by_uuid"]
     db_subs = await db.list_all_subscriptions_with_uuid(limit=10000)
     subs_by_uuid = {row[1]: row for row in db_subs}  # uuid → (tg_id, uuid, username)
 
     rows = []
     for uuid_v, info in by_uuid.items():
-        rows.append((info["used"], info["lifetime"], uuid_v, info, subs_by_uuid.get(uuid_v)))
-    rows.sort(key=lambda r: r[1], reverse=True)
+        rows.append((info["period"], info["lifetime"], uuid_v, info, subs_by_uuid.get(uuid_v)))
+    rows.sort(key=lambda r: r[0], reverse=True)
     top = rows[:ANALYTICS_TOP_N]
 
     lines = [
-        f"📈 <b>Топ-{ANALYTICS_TOP_N} по трафику</b> (за всё время)\n",
+        f"📈 <b>Топ-{ANALYTICS_TOP_N} по трафику за {ANALYTICS_PERIOD_DAYS} дней</b>\n"
+        f"<i>Сумма трафика всех юзеров за окно: {html.escape(human_bytes(panel['traffic_period']))}.</i>\n",
     ]
     if not top:
         lines.append("Нет данных.")
-    for i, (used, life, uuid_v, info, sub) in enumerate(top, 1):
+    for i, (period, life, uuid_v, info, sub) in enumerate(top, 1):
         username_p = info.get("username") or "—"
         tg_part = ""
         if sub:
             tg_part = f" · tg=<code>{sub[0]}</code>"
         lines.append(
             f"{i}. <code>{html.escape(username_p)}</code>{tg_part} — "
-            f"<b>{html.escape(human_bytes(life))}</b> "
-            f"(период: {html.escape(human_bytes(used))})"
+            f"<b>{html.escape(human_bytes(period))}</b> "
+            f"(всего: {html.escape(human_bytes(life))})"
         )
     await safe_edit(
         callback, "\n".join(lines), parse_mode="HTML",
@@ -3315,8 +3378,7 @@ async def cmd_stats(message: Message):
         f"(активных {db_stats['subs_active']}, истекли {db_stats['subs_expired']}, "
         f"♾ {db_stats['subs_unlimited']}, истекают за 7д {db_stats['subs_expiring_7d']})\n\n"
         f"Панель: всего юзеров <b>{panel['total_panel']}</b>; "
-        f"трафик период <b>{html.escape(human_bytes(panel['traffic_total']))}</b>, "
-        f"за всё время <b>{html.escape(human_bytes(panel['traffic_lifetime']))}</b>; "
+        f"трафик за всё время <b>{html.escape(human_bytes(panel['traffic_lifetime']))}</b>; "
         f"статусы: {html.escape(status_line)}\n\n"
         "Подробнее — <code>/admin → 📊 Аналитика</code>."
     )
