@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -553,6 +554,112 @@ async def cmd_admin(message: Message):
         "🛠 Админская панель",
         reply_markup=main_keyboard_admin(message.from_user.id, has_account),
     )
+
+
+def _parse_expire_to_ts(value: Optional[str]) -> int:
+    """ISO-строка expireAt → unix timestamp (UTC). Возвращает 0, если не парсится."""
+    if not value:
+        return 0
+    try:
+        s = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+_TG_USERNAME_RE = re.compile(r"^tg_(\d+)$")
+
+
+@dp.message(Command("import_users"))
+async def cmd_import_users(message: Message):
+    """Импортирует пользователей из Remnawave с username вида tg_<id> в локальную БД.
+
+    Существующие записи не затираются по роли/created_by — только дополняются
+    uuid/short_uuid/expire_date, чтобы админ мог управлять ими через бот.
+    """
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    progress = await message.answer("⏳ Сканирую панель Remnawave…")
+
+    page_size = 200
+    start = 0
+    total_in_panel = 0
+    matched = 0
+    inserted = 0
+    updated = 0
+    skipped_invalid_id = 0
+    examples: list[str] = []
+
+    seen_pages = 0
+    while True:
+        page = await api.list_users(size=page_size, start=start)
+        if not page or "response" not in page:
+            await progress.edit_text(
+                f"❌ Не удалось получить список пользователей с панели "
+                f"(start={start}). Проверьте логи бота."
+            )
+            return
+        resp = page["response"]
+        total_in_panel = int(resp.get("total") or 0)
+        users = resp.get("users") or []
+        if not users:
+            break
+        seen_pages += 1
+        for u in users:
+            username = u.get("username") or ""
+            m = _TG_USERNAME_RE.match(username)
+            if not m:
+                continue
+            try:
+                tg_id = int(m.group(1))
+            except ValueError:
+                skipped_invalid_id += 1
+                continue
+            matched += 1
+            uuid_v = u.get("uuid") or ""
+            short_uuid = u.get("shortUuid") or ""
+            expire_ts = _parse_expire_to_ts(u.get("expireAt"))
+
+            existing = await db.get_user(tg_id)
+            await db.add_user(
+                tg_id=tg_id,
+                uuid=uuid_v,
+                short_uuid=short_uuid,
+                username=username,
+                expire_date=expire_ts,
+                created_by=message.from_user.id,
+            )
+            if existing:
+                updated += 1
+            else:
+                inserted += 1
+                if len(examples) < 5:
+                    examples.append(f"<code>{tg_id}</code> → {html.escape(username)}")
+
+        start += len(users)
+        if start >= total_in_panel:
+            break
+        # safety: do not loop forever
+        if seen_pages > 200:
+            break
+
+    lines = [
+        "✅ <b>Импорт завершён</b>",
+        f"Юзеров в панели всего: <b>{total_in_panel}</b>",
+        f"Подходят под <code>tg_&lt;id&gt;</code>: <b>{matched}</b>",
+        f"Добавлено новых: <b>{inserted}</b>",
+        f"Обновлено существующих: <b>{updated}</b>",
+    ]
+    if skipped_invalid_id:
+        lines.append(f"Пропущено (битый id): {skipped_invalid_id}")
+    if examples:
+        lines.append("\nПримеры новых:\n" + "\n".join(examples))
+    await progress.edit_text("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("whois"))
@@ -1158,6 +1265,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="whois", description="🔍 Найти пользователя по tg_id или @username"),
     BotCommand(command="issue_token", description="🔑 Выдать новый токен доступа"),
     BotCommand(command="revoke_token", description="🚫 Отозвать токен по префиксу"),
+    BotCommand(command="import_users", description="📥 Импорт юзеров tg_<id> из Remnawave"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
 

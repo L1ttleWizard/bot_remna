@@ -170,6 +170,24 @@ class RemnawaveAPI:
         """Обновляет лимит устройств по HWID (PATCH /api/users). None = снять лимит (null в JSON)."""
         return await self.patch_user({"uuid": user_uuid, "hwidDeviceLimit": new_limit})
 
+    async def list_users(self, size: int = 100, start: int = 0) -> Optional[dict]:
+        """GET /api/users?size=&start= — постраничный список юзеров.
+        Возвращает dict вида {'response': {'total': int, 'users': [...]}} или None при ошибке.
+        """
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/users"
+            params = {"size": size, "start": start}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    err = await resp.text()
+                    logger.error(f"list_users: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_users: {e}")
+                return None
+
     async def get_user_info(self, user_id: str) -> dict:
         """Получает информацию о пользователе. В user_id можно пробовать передавать UUID или username."""
         async with aiohttp.ClientSession(headers=self.headers) as session:
