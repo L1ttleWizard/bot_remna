@@ -237,12 +237,12 @@ async def cb_node_card(callback: CallbackQuery):
         await callback.answer("Доступ только для администраторов.", show_alert=True)
         return
     uuid = callback.data.split(":", 2)[2]
-    await callback.answer("Загрузка…")
     payload = await api.get_node(uuid)
     node = (payload or {}).get("response") if isinstance(payload, dict) else None
     if not node:
         await callback.answer("Нода не найдена.", show_alert=True)
         return
+    await callback.answer("Загрузка…")
     await safe_edit(
         callback,
         _node_card_text(node),

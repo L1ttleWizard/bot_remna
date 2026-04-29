@@ -307,12 +307,15 @@ async def _stream_to_message(
     last_edit = 0.0
     last_text = ""
 
-    def _render() -> str:
-        # Telegram 4096 limit; берём хвост.
+    def _render(custom_header: Optional[str] = None) -> str:
+        """Telegram 4096 limit; режем по escaped длине, а не по сырой."""
+        h = custom_header if custom_header is not None else header
         body = "\n".join(buffer)
-        if len(body) > 3500:
-            body = "…\n" + body[-3500:]
-        return f"{header}<pre>{html.escape(body)}</pre>"
+        escaped = html.escape(body)
+        max_body = 4096 - len(h) - len("<pre></pre>") - 64  # запас
+        if len(escaped) > max_body:
+            escaped = "…\n" + escaped[-max_body:]
+        return f"{h}<pre>{escaped}</pre>"
 
     async def _maybe_edit(force: bool = False) -> None:
         nonlocal last_edit, last_text
@@ -350,15 +353,24 @@ async def _stream_to_message(
         if ok
         else f"❌ <b>Не удалось раскатать ноду {html.escape(name)}</b>\n"
     )
-    body = "\n".join(buffer)
-    if len(body) > 3500:
-        body = "…\n" + body[-3500:]
-    await safe_edit(
-        callback,
-        f"{final_header}<pre>{html.escape(body)}</pre>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌐 К списку нод", callback_data="admin_nodes")],
-        ]),
-        prefer_edit=True,
-    )
+    final_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 К списку нод", callback_data="admin_nodes")],
+    ])
+    try:
+        await safe_edit(
+            callback,
+            _render(final_header),
+            parse_mode="HTML",
+            reply_markup=final_keyboard,
+            prefer_edit=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Финальный safe_edit упал (%s) — шлю кратко.", e)
+        try:
+            await callback.message.answer(
+                final_header + "<i>(лог обрезан / превысил лимит Telegram)</i>",
+                parse_mode="HTML",
+                reply_markup=final_keyboard,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить даже краткий финальный статус")
