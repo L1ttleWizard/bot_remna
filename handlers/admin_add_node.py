@@ -323,13 +323,13 @@ async def _stream_to_message(
         if text == last_text:
             return
         try:
-            await safe_edit(callback, text, parse_mode="HTML", prefer_edit=True)
+            await safe_edit(callback, text, parse_mode="HTML", reply_markup=None, prefer_edit=True)
             last_edit = now
             last_text = text
         except Exception as e:  # noqa: BLE001
             logger.debug("safe_edit во время стрима: %s", e)
 
-    await safe_edit(callback, _render(), parse_mode="HTML", prefer_edit=True)
+    await safe_edit(callback, _render(), parse_mode="HTML", reply_markup=None, prefer_edit=True)
     ok = True
     try:
         async for line in run_command_streaming(cfg, cmd, timeout=1800.0):

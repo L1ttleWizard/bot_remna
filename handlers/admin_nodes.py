@@ -164,12 +164,12 @@ def _ok_alert(action: str, success: bool) -> str:
 
 # ---------- handlers ----------
 
-@dp.callback_query(F.data == "admin_nodes")
-async def cb_admin_nodes(callback: CallbackQuery):
-    if not await auth.is_admin(callback.from_user.id):
-        await callback.answer("Доступ только для администраторов.", show_alert=True)
-        return
-    await callback.answer("Загрузка…")
+async def _render_nodes_list(callback: CallbackQuery) -> None:
+    """Дёргает список нод и редактирует сообщение. НЕ вызывает callback.answer().
+
+    Используется и из самого `cb_admin_nodes`, и из других хендлеров (после
+    delete / restart_all), которые уже сделали callback.answer() со своим алертом.
+    """
     nodes = await api.list_nodes()
     if nodes is None:
         await safe_edit(
@@ -222,6 +222,15 @@ async def cb_admin_nodes(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "admin_nodes")
+async def cb_admin_nodes(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+    await callback.answer("Загрузка…")
+    await _render_nodes_list(callback)
+
+
 @dp.callback_query(F.data.startswith("nodes:card:"))
 async def cb_node_card(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -270,7 +279,7 @@ async def cb_node_action(callback: CallbackQuery):
     if action == "delete":
         # после удаления карточки уже нет — возвращаемся к списку
         if ok:
-            await cb_admin_nodes(callback)
+            await _render_nodes_list(callback)
         return
     # перерисуем карточку для нерегруппирующих действий
     payload = await api.get_node(uuid)
@@ -332,7 +341,7 @@ async def cb_nodes_restart_all(callback: CallbackQuery):
         return
     ok = await api.restart_all_nodes()
     await callback.answer(_ok_alert("restart_all", ok), show_alert=True)
-    await cb_admin_nodes(callback)
+    await _render_nodes_list(callback)
 
 
 # ---------- /nodes command (текстовый дайджест) ----------
