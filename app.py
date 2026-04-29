@@ -107,6 +107,29 @@ async def safe_edit(
     await callback.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
+async def ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
+    """Проверяет, что вызывающий есть в users и привязан к панели.
+
+    Возвращает кортеж юзера или None (с alert «Доступ только по приглашению»)."""
+    user_data = await db.get_user(callback.from_user.id)
+    if not user_data or not user_data[1]:
+        await callback.answer(
+            "Доступ только по приглашению. Активируйте токен через /redeem.",
+            show_alert=True,
+        )
+        return None
+    return user_data
+
+
+async def ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> Optional[tuple]:
+    """Проверяет, что подписка существует и принадлежит callback.from_user."""
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return None
+    return sub
+
+
 async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     """Синкает expire_date конкретной подписки (по uuid) с тем, что отдаёт панель."""
     info = await api.get_user_info(full_uuid)
