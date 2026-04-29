@@ -259,6 +259,7 @@ async def cb_node_action(callback: CallbackQuery):
         "enable": api.enable_node,
         "disable": api.disable_node,
         "reset_traffic": api.reset_node_traffic,
+        "delete": api.delete_node,
     }
     method = method_map.get(action)
     if not method:
@@ -266,7 +267,12 @@ async def cb_node_action(callback: CallbackQuery):
         return
     ok = await method(uuid)
     await callback.answer(_ok_alert(action, ok), show_alert=True)
-    # перерисуем карточку
+    if action == "delete":
+        # после удаления карточки уже нет — возвращаемся к списку
+        if ok:
+            await cb_admin_nodes(callback)
+        return
+    # перерисуем карточку для нерегруппирующих действий
     payload = await api.get_node(uuid)
     node = (payload or {}).get("response") if isinstance(payload, dict) else None
     if node:
@@ -298,19 +304,6 @@ async def cb_node_del_confirm(callback: CallbackQuery):
         prefer_edit=True,
     )
     await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("nodes:act:delete:"))
-async def cb_node_delete(callback: CallbackQuery):
-    if not await auth.is_admin(callback.from_user.id):
-        await callback.answer("Доступ только для администраторов.", show_alert=True)
-        return
-    uuid = callback.data.split(":", 3)[3]
-    ok = await api.delete_node(uuid)
-    await callback.answer(_ok_alert("delete", ok), show_alert=True)
-    if ok:
-        # вернёмся на список
-        await cb_admin_nodes(callback)
 
 
 @dp.callback_query(F.data == "nodes:restart_all_confirm")
