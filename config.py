@@ -63,3 +63,21 @@ ADMIN_TG_IDS: set[int] = _parse_admin_ids(os.environ.get("ADMIN_TG_IDS", ""))
 # Параметры по умолчанию для выдаваемых токенов (если админ не указал явно).
 DEFAULT_TOKEN_EXPIRE_DAYS = int(os.environ.get("DEFAULT_TOKEN_EXPIRE_DAYS", "30"))
 DEFAULT_TOKEN_HWID_LIMIT = int(os.environ.get("DEFAULT_TOKEN_HWID_LIMIT", "3"))
+
+
+# === Master node SSH (для добавления новых нод через ansible) ===
+# Если задано MASTER_SSH_HOST — кнопка «➕ Добавить ноду» в админ-панели
+# становится активной, бот SSH-ит на master-ноду и запускает там helper-скрипт.
+MASTER_SSH_HOST = os.environ.get("MASTER_SSH_HOST", "").strip() or None
+MASTER_SSH_PORT = int(os.environ.get("MASTER_SSH_PORT", "22"))
+MASTER_SSH_USER = os.environ.get("MASTER_SSH_USER", "root").strip() or "root"
+MASTER_SSH_KEY_PATH = os.environ.get("MASTER_SSH_KEY_PATH", "").strip() or None
+MASTER_ANSIBLE_REPO_PATH = os.environ.get(
+    "MASTER_ANSIBLE_REPO_PATH",
+    "/root/Ansible-deploy_new_node-playbook",
+).strip()
+
+
+def master_ssh_configured() -> bool:
+    """True если задан хотя бы host+key — кнопку «➕ Добавить ноду» можно показать."""
+    return bool(MASTER_SSH_HOST and MASTER_SSH_KEY_PATH)

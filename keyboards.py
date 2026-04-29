@@ -37,7 +37,10 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Аналитика", callback_data="admin_stats"),
         ],
         [
+            InlineKeyboardButton(text="🌐 Ноды", callback_data="admin_nodes"),
             InlineKeyboardButton(text="❓ Поддержка", callback_data="admin_support"),
+        ],
+        [
             InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
         ],
     ]

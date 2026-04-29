@@ -92,7 +92,7 @@ async def safe_edit(
     text: str,
     *,
     parse_mode: str,
-    reply_markup: InlineKeyboardMarkup,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
     prefer_edit: bool,
 ) -> None:
     """Редактирует исходное сообщение, либо шлёт новое если редактирование не удалось."""

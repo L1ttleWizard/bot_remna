@@ -17,7 +17,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py config.py database.py remnawave_api.py scheduler.py ./
+# Корневые модули
+COPY bot.py app.py auth.py config.py database.py remnawave_api.py scheduler.py ./
+COPY clients.py formatters.py keyboards.py ./
+# Хендлеры и сервисы
+COPY handlers/ ./handlers/
+COPY services/ ./services/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh

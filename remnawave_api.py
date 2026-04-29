@@ -326,3 +326,127 @@ class RemnawaveAPI:
             except Exception as e:
                 logger.error(f"delete_user_hwid_device: {e}")
                 return False
+
+    # =========================================================================
+    # Nodes management
+    # =========================================================================
+
+    async def list_nodes(self) -> Optional[list]:
+        """GET /api/nodes — все ноды панели. Возвращает список dict'ов или None."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data if isinstance(data, list) else None
+                    err = await resp.text()
+                    logger.error(f"list_nodes: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_nodes: {e}")
+                return None
+
+    async def get_node(self, uuid: str) -> Optional[dict]:
+        """GET /api/nodes/{uuid} — карточка одной ноды."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes/{uuid}"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    err = await resp.text()
+                    logger.error(f"get_node: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_node: {e}")
+                return None
+
+    async def create_node(self, payload: dict) -> Optional[dict]:
+        """POST /api/nodes — создать ноду. payload: name/address/port/configProfileUuid и т.д."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status in (200, 201):
+                        try:
+                            return await resp.json()
+                        except Exception:
+                            return None
+                    err = await resp.text()
+                    logger.error(f"create_node: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"create_node: {e}")
+                return None
+
+    async def update_node(self, payload: dict) -> Optional[dict]:
+        """PATCH /api/nodes — обновить ноду (uuid передаётся в payload)."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes"
+            try:
+                async with session.patch(url, json=payload) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    err = await resp.text()
+                    logger.error(f"update_node: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"update_node: {e}")
+                return None
+
+    async def delete_node(self, uuid: str) -> bool:
+        """DELETE /api/nodes/{uuid}."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes/{uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status not in (200, 204):
+                        err = await resp.text()
+                        logger.error(f"delete_node: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 204)
+            except Exception as e:
+                logger.error(f"delete_node: {e}")
+                return False
+
+    async def _node_action(self, uuid: str, action: str) -> bool:
+        """POST /api/nodes/{uuid}/actions/{action} — общий метод для enable/disable/restart/reset-traffic."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes/{uuid}/actions/{action}"
+            try:
+                async with session.post(url) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logger.error(f"_node_action({action}): статус {resp.status}, ответ: {err}")
+                    return resp.status == 200
+            except Exception as e:
+                logger.error(f"_node_action({action}): {e}")
+                return False
+
+    async def enable_node(self, uuid: str) -> bool:
+        return await self._node_action(uuid, "enable")
+
+    async def disable_node(self, uuid: str) -> bool:
+        return await self._node_action(uuid, "disable")
+
+    async def restart_node(self, uuid: str) -> bool:
+        return await self._node_action(uuid, "restart")
+
+    async def reset_node_traffic(self, uuid: str) -> bool:
+        return await self._node_action(uuid, "reset-traffic")
+
+    async def restart_all_nodes(self) -> bool:
+        """POST /api/nodes/actions/restart-all."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/nodes/actions/restart-all"
+            try:
+                async with session.post(url, json={}) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logger.error(f"restart_all_nodes: статус {resp.status}, ответ: {err}")
+                    return resp.status == 200
+            except Exception as e:
+                logger.error(f"restart_all_nodes: {e}")
+                return False

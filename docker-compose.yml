@@ -18,6 +18,9 @@ services:
       HOME: /tmp
     volumes:
       - bot_data:/data
+      # Опционально: SSH-ключ для управления нодами через ansible (см. .env).
+      # Раскомментируй и подставь свой путь, если задал MASTER_SSH_*.
+      # - /root/.ssh/id_ed25519_master:/run/secrets/master_ssh_key:ro
     # Только чтение корня ФС; БД и временные файлы — в смонтированных путях.
     read_only: true
     tmpfs:
