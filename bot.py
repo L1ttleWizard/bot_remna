@@ -36,11 +36,27 @@ from app import (
     sync_local_expire_from_panel,
 )
 from handlers.admin_analytics import ANALYTICS_PERIOD_DAYS, _analytics_date_range
-from handlers import admin_dm, admin_promos, connect, inline_search, support
+from handlers import (
+    admin_add_node,
+    admin_dm,
+    admin_nodes,
+    admin_promos,
+    connect,
+    inline_search,
+    support,
+)
 
 # Регистрация хендлеров происходит при импорте — ссылка нужна, чтобы линтеры
 # не выкидывали импорт как неиспользуемый.
-_REGISTERED_HANDLERS = (admin_dm, admin_promos, connect, inline_search, support)
+_REGISTERED_HANDLERS = (
+    admin_add_node,
+    admin_dm,
+    admin_nodes,
+    admin_promos,
+    connect,
+    inline_search,
+    support,
+)
 from config import (
     ADMIN_TG_IDS,
     DEFAULT_TOKEN_EXPIRE_DAYS,
