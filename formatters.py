@@ -15,7 +15,11 @@ from typing import Optional
 DEFAULT_HWID_DEVICE_LIMIT = 3
 # Верхняя граница при +1 / +3 (числовой лимит)
 MAX_HWID_INCREMENT_CAP = 9999
-# Значение «практически без лимита» (отображается как ♾)
+# Значение, которое отправляем в панель при нажатии «без лимита».
+# Remnawave трактует 0 как «лимит снят».
+HWID_UNLIMITED_VALUE = 0
+# Старый sentinel всё ещё распознаётся при отображении —
+# раньше бот отправлял именно его.
 HWID_UNLIMITED_SENTINEL = 9_999_999
 
 
@@ -30,7 +34,9 @@ def is_hwid_unlimited(api_data: dict) -> bool:
     v = api_data.get("hwidDeviceLimit")
     if v is None:
         return False
-    return int(v) >= HWID_UNLIMITED_SENTINEL
+    vi = int(v)
+    # 0 = новое значение «без лимита». >= 9_999_999 — legacy-значение.
+    return vi <= 0 or vi >= HWID_UNLIMITED_SENTINEL
 
 
 def hwid_limit_caption(api_data: dict) -> str:
@@ -38,7 +44,7 @@ def hwid_limit_caption(api_data: dict) -> str:
     if v is None:
         return str(DEFAULT_HWID_DEVICE_LIMIT)
     vi = int(v)
-    if vi >= HWID_UNLIMITED_SENTINEL:
+    if vi <= 0 or vi >= HWID_UNLIMITED_SENTINEL:
         return "♾ без лимита"
     return str(vi)
 

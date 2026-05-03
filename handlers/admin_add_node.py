@@ -53,13 +53,33 @@ class AddNodeStates(StatesGroup):
     waiting_for_node_port = State()
     waiting_for_sni = State()
     waiting_for_country = State()
+    waiting_for_auth_method = State()
+    waiting_for_ssh_user = State()
+    waiting_for_ssh_password = State()
     waiting_for_confirm = State()
+
+
+USERNAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,30}$")
 
 
 def _cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✖️ Отменить", callback_data="addnode:cancel")]]
     )
+
+
+def _auth_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔑 Ключ master-ноды (Болгария)",
+            callback_data="addnode:auth:key",
+        )],
+        [InlineKeyboardButton(
+            text="🔐 Логин + пароль",
+            callback_data="addnode:auth:pass",
+        )],
+        [InlineKeyboardButton(text="✖️ Отменить", callback_data="addnode:cancel")],
+    ])
 
 
 def _confirm_keyboard() -> InlineKeyboardMarkup:
@@ -86,7 +106,7 @@ async def cb_addnode_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddNodeStates.waiting_for_name)
     await safe_edit(
         callback,
-        "➕ <b>Добавление ноды</b> (1/6)\n\n"
+        "➕ <b>Добавление ноды</b> (1/7)\n\n"
         "Введи короткое <b>имя ноды</b> для inventory (a-z, 0-9, '-', '_').\n"
         "Например: <code>eu_node_3</code>",
         parse_mode="HTML",
@@ -127,7 +147,7 @@ async def step_name(message: Message, state: FSMContext):
     await state.update_data(name=name)
     await state.set_state(AddNodeStates.waiting_for_address)
     await message.answer(
-        "<b>2/6</b> · Введи <b>адрес</b> новой ноды — IP или домен.\n"
+        "<b>2/7</b> · Введи <b>адрес</b> новой ноды — IP или домен.\n"
         "Например: <code>caffeinated.example.com</code> или <code>1.2.3.4</code>",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
@@ -148,7 +168,7 @@ async def step_address(message: Message, state: FSMContext):
     await state.update_data(address=addr)
     await state.set_state(AddNodeStates.waiting_for_ssh_port)
     await message.answer(
-        "<b>3/6</b> · SSH-порт новой ноды (по умолчанию 22).\n"
+        "<b>3/7</b> · SSH-порт новой ноды (по умолчанию 22).\n"
         "Введи число или просто <code>22</code>.",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
@@ -181,7 +201,7 @@ async def step_ssh_port(message: Message, state: FSMContext):
     await state.update_data(ssh_port=port)
     await state.set_state(AddNodeStates.waiting_for_node_port)
     await message.answer(
-        "<b>4/6</b> · Порт <b>Remnawave node</b> внутри ноды (например <code>3743</code>).",
+        "<b>4/7</b> · Порт <b>Remnawave node</b> внутри ноды (например <code>3743</code>).",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
     )
@@ -200,7 +220,7 @@ async def step_node_port(message: Message, state: FSMContext):
     await state.update_data(node_port=port)
     await state.set_state(AddNodeStates.waiting_for_sni)
     await message.answer(
-        "<b>5/6</b> · <b>SNI</b> для bridge (домен под который маскируемся).\n"
+        "<b>5/7</b> · <b>SNI</b> для bridge (домен под который маскируемся).\n"
         "Например: <code>www.microsoft.com</code>",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
@@ -221,7 +241,7 @@ async def step_sni(message: Message, state: FSMContext):
     await state.update_data(bridge_sni=sni)
     await state.set_state(AddNodeStates.waiting_for_country)
     await message.answer(
-        "<b>6/6</b> · ISO-код страны (2 буквы, верхний регистр).\n"
+        "<b>6/7</b> · ISO-код страны (2 буквы, верхний регистр).\n"
         "Например: <code>BG</code>, <code>NL</code>, <code>DE</code>",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
@@ -241,26 +261,141 @@ async def step_country(message: Message, state: FSMContext):
         )
         return
     await state.update_data(country_code=cc)
+    await state.set_state(AddNodeStates.waiting_for_auth_method)
+    await message.answer(
+        "<b>7/7</b> · Как бот должен зайти на новую ноду?\n\n"
+        "🔑 <b>Ключ master-ноды</b> — подходит если публичный ключ мастера\n"
+        "   уже лежит в <code>~/.ssh/authorized_keys</code> на ноде.\n\n"
+        "🔐 <b>Логин + пароль</b> — первичная раскатка:\n"
+        "   бот сам положит SSH-ключ мастера на ноду.",
+        parse_mode="HTML",
+        reply_markup=_auth_method_keyboard(),
+    )
+
+
+# ---------- auth selector ----------
+
+@dp.callback_query(F.data == "addnode:auth:key", AddNodeStates.waiting_for_auth_method)
+async def cb_addnode_auth_key(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+    await state.update_data(auth_method="key", ssh_user=None, ssh_password=None)
+    await _show_summary(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "addnode:auth:pass", AddNodeStates.waiting_for_auth_method)
+async def cb_addnode_auth_pass(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+    await state.update_data(auth_method="pass")
+    await state.set_state(AddNodeStates.waiting_for_ssh_user)
+    await safe_edit(
+        callback,
+        "🔐 <b>Способ: логин + пароль</b>\n\n"
+        "Введи SSH-логин для первичного входа на ноду "
+        "(обычно <code>root</code>).",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
+        prefer_edit=True,
+    )
+    await callback.answer()
+
+
+@dp.message(AddNodeStates.waiting_for_ssh_user)
+async def step_ssh_user(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    user = (message.text or "").strip()
+    if not USERNAME_RE.match(user):
+        await message.answer(
+            "Логин выглядит некорректно. Допустимы: a-z A-Z 0-9 '_' '-' (до 31 символа).",
+            reply_markup=_cancel_keyboard(),
+        )
+        return
+    await state.update_data(ssh_user=user)
+    await state.set_state(AddNodeStates.waiting_for_ssh_password)
+    await message.answer(
+        "🔐 Теперь введи <b>SSH-пароль</b> этого пользователя.\n\n"
+        "<i>Сообщение с паролем будет удалено ботом сразу после прочтения. "
+        "Пароль используется только один раз для ssh-copy-id, в логах не сохраняется.</i>",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
+    )
+
+
+@dp.message(AddNodeStates.waiting_for_ssh_password)
+async def step_ssh_password(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    pwd = message.text or ""
+    # Быстро удаляем сообщение с паролем, чтобы не висел в чате.
+    try:
+        await message.delete()
+    except Exception:  # noqa: BLE001
+        logger.debug("Не удалось удалить сообщение с паролем (нет прав?). Продолжаю.")
+    if not pwd:
+        await message.answer(
+            "Пароль не может быть пустым. Попробуй ещё раз или отмени.",
+            reply_markup=_cancel_keyboard(),
+        )
+        return
+    await state.update_data(ssh_password=pwd)
+    await _show_summary_msg(message, state)
+
+
+# ---------- summary + run ansible ----------
+
+async def _show_summary(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await state.set_state(AddNodeStates.waiting_for_confirm)
-    summary = (
+    await safe_edit(
+        callback,
+        _summary_text(data),
+        parse_mode="HTML",
+        reply_markup=_confirm_keyboard(),
+        prefer_edit=True,
+    )
+
+
+async def _show_summary_msg(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.set_state(AddNodeStates.waiting_for_confirm)
+    await message.answer(
+        _summary_text(data),
+        parse_mode="HTML",
+        reply_markup=_confirm_keyboard(),
+    )
+
+
+def _summary_text(data: dict) -> str:
+    auth_method = data.get("auth_method", "key")
+    if auth_method == "pass":
+        auth_line = (
+            f"Авторизация: <code>логин + пароль</code>\n"
+            f"SSH-логин: <code>{html.escape(data.get('ssh_user') or 'root')}</code>\n"
+            "SSH-пароль: <code>***скрыт***</code>"
+        )
+    else:
+        auth_line = "Авторизация: <code>ключ master-ноды</code>"
+    return (
         "🔍 <b>Проверь параметры</b>\n\n"
         f"Имя: <code>{html.escape(data['name'])}</code>\n"
         f"Адрес: <code>{html.escape(data['address'])}</code>\n"
         f"SSH-порт: <code>{data['ssh_port']}</code>\n"
         f"Node-порт: <code>{data['node_port']}</code>\n"
         f"SNI: <code>{html.escape(data['bridge_sni'])}</code>\n"
-        f"Страна: <code>{html.escape(data['country_code'])}</code>\n\n"
+        f"Страна: <code>{html.escape(data['country_code'])}</code>\n"
+        f"{auth_line}\n\n"
         "Бот зайдёт на master-ноду и запустит <code>scripts/add_node.sh</code>:\n"
         "  1. Допишет хост в <code>inventory.ini</code>\n"
         "  2. Положит SSH-ключ master на новую ноду\n"
         "  3. Запустит <code>ansible-playbook deploy.yml -l NAME</code>\n\n"
         "Лог будет редактироваться сюда же. Запускаем?"
     )
-    await message.answer(summary, parse_mode="HTML", reply_markup=_confirm_keyboard())
 
-
-# ---------- run ansible ----------
 
 @dp.callback_query(F.data == "addnode:run", AddNodeStates.waiting_for_confirm)
 async def cb_addnode_run(callback: CallbackQuery, state: FSMContext):
@@ -291,8 +426,12 @@ async def cb_addnode_run(callback: CallbackQuery, state: FSMContext):
         node_port=int(data["node_port"]),
         bridge_sni=data["bridge_sni"],
         country_code=data["country_code"],
+        ssh_user=data.get("ssh_user"),
     )
-    await _stream_to_message(callback, cmd, cfg, name=data["name"])
+    env: Optional[dict[str, str]] = None
+    if data.get("auth_method") == "pass" and data.get("ssh_password"):
+        env = {"SSHPASS_INITIAL": data["ssh_password"]}
+    await _stream_to_message(callback, cmd, cfg, name=data["name"], env=env)
 
 
 async def _stream_to_message(
@@ -300,6 +439,7 @@ async def _stream_to_message(
     cmd: str,
     cfg: MasterSSHConfig,
     name: str,
+    env: Optional[dict[str, str]] = None,
 ) -> None:
     """Стримим вывод ssh-команды редактируя одно сообщение, не чаще раза в 1.5с."""
     header = f"⏳ <b>Деплой ноды {html.escape(name)}</b>\n"
@@ -335,7 +475,7 @@ async def _stream_to_message(
     await safe_edit(callback, _render(), parse_mode="HTML", reply_markup=None, prefer_edit=True)
     ok = True
     try:
-        async for line in run_command_streaming(cfg, cmd, timeout=1800.0):
+        async for line in run_command_streaming(cfg, cmd, timeout=1800.0, env=env):
             buffer.append(line)
             if len(buffer) > 600:
                 buffer.pop(0)

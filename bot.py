@@ -71,6 +71,7 @@ from config import (
 from formatters import (
     DEFAULT_HWID_DEVICE_LIMIT,
     HWID_UNLIMITED_SENTINEL,
+    HWID_UNLIMITED_VALUE,
     MAX_HWID_INCREMENT_CAP,
     REMNAWAVE_USERNAME_MAX_LEN,
     TG_USERNAME_RE,
@@ -1660,7 +1661,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
             if is_hwid_unlimited(ad):
                 await callback.answer("Уже без лимита.", show_alert=True)
                 return
-            if await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_SENTINEL):
+            if await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_VALUE):
                 await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
                 await callback.answer("Лимит снят")
             else:
@@ -1830,7 +1831,7 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
             if is_hwid_unlimited(ad):
                 await callback.answer("Уже без лимита.", show_alert=True)
                 return
-            ok = await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_SENTINEL)
+            ok = await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_VALUE)
             if ok:
                 await _send_admin_devices(callback, target_tg, prefer_edit=True)
                 await callback.answer("Лимит снят")

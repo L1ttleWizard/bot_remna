@@ -58,17 +58,27 @@ async def run_command_streaming(
     cfg: MasterSSHConfig,
     command: str,
     timeout: float = 1800.0,
+    env: Optional[dict[str, str]] = None,
 ) -> AsyncIterator[str]:
     """Подключается по SSH к master, запускает команду и стримит stdout/stderr построчно.
 
     Yields строки с уже отрезанным `\\n`. По окончании генератор завершается; если
     команда вернула не 0, бросает MasterSSHError с кодом возврата.
+
+    Если задан `env` — переменные подставляются перед командой через инлайн
+    `KEY=value`-префикс (sshd по умолчанию режет `env-vars`, поэтому надёжнее
+    префиксом). Значения экранируются через shlex.quote.
     """
     asyncssh = _import_asyncssh()
     logger.info(
         "Master SSH connect %s@%s:%d (key=%s)",
         cfg.user, cfg.host, cfg.port, cfg.key_path,
     )
+    if env:
+        env_prefix = " ".join(
+            f"{k}={shlex.quote(v)}" for k, v in env.items()
+        )
+        command = f"{env_prefix} {command}"
     async with asyncssh.connect(
         host=cfg.host,
         port=cfg.port,
@@ -107,6 +117,7 @@ def build_add_node_command(
     node_port: int,
     bridge_sni: str,
     country_code: str,
+    ssh_user: Optional[str] = None,
 ) -> str:
     """Собрать shell-команду, которая на master вызывает helper-скрипт."""
     script = f"{cfg.ansible_repo_path}/scripts/add_node.sh"
@@ -119,6 +130,8 @@ def build_add_node_command(
         "--bridge-sni", bridge_sni,
         "--country", country_code,
     ]
+    if ssh_user:
+        args.extend(["--ssh-user", ssh_user])
     return " ".join(shlex.quote(a) for a in args)
 
 
@@ -127,11 +140,12 @@ async def collect_command_output(
     command: str,
     timeout: float = 1800.0,
     max_lines: int = 4000,
+    env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, list[str]]:
     """Запустить команду, собрать вывод в список (с лимитом) и вернуть (ok, lines)."""
     lines: list[str] = []
     try:
-        async for line in run_command_streaming(cfg, command, timeout=timeout):
+        async for line in run_command_streaming(cfg, command, timeout=timeout, env=env):
             lines.append(line)
             if len(lines) > max_lines:
                 lines = lines[-max_lines:]
