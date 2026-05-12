@@ -99,17 +99,35 @@ def _node_card_text(node: dict) -> str:
     cc = html.escape(str(node.get("countryCode") or ""))
     is_disabled = bool(node.get("isDisabled"))
     is_connected = bool(node.get("isConnected"))
-    is_xray = bool(node.get("isXrayRunning"))
-    xray_ver = html.escape(str(node.get("xrayVersion") or "—"))
     uptime_s = node.get("xrayUptime")
+    # Remnawave API больше не отдаёт `isXrayRunning` / `xrayVersion` на верхнем
+    # уровне ноды. Состояние xray вычисляем как «нода connected + xray uptime>0»
+    # (uptime в секундах, считается с момента запуска xray на remnanode).
+    # Если поля isXrayRunning ещё приходит у каких-то нод — учитываем как fallback.
+    versions = node.get("versions") or {}
+    xray_ver_raw = (
+        node.get("xrayVersion")
+        or versions.get("xray")
+        or "—"
+    )
+    xray_ver = html.escape(str(xray_ver_raw))
+    if "isXrayRunning" in node:
+        is_xray = bool(node.get("isXrayRunning"))
+    else:
+        try:
+            is_xray = is_connected and uptime_s is not None and int(uptime_s) > 0
+        except (TypeError, ValueError):
+            is_xray = is_connected
     last_status_change = html.escape(str(node.get("lastStatusChange") or "—"))
     last_status_msg = html.escape(str(node.get("lastStatusMessage") or "—")[:200])
     users_online = node.get("usersOnline") or 0
     traffic_used = node.get("trafficUsedBytes") or 0
     traffic_limit = node.get("trafficLimitBytes") or 0
     traffic_reset = html.escape(str(node.get("trafficResetDay") or "—"))
-    cpu = node.get("cpuModel")
-    total_ram = node.get("totalRam")
+    # В новой схеме железо ноды лежит в node["system"]["info"] / ["stats"].
+    sys_info = (node.get("system") or {}).get("info") or {}
+    cpu = node.get("cpuModel") or sys_info.get("cpuModel")
+    total_ram = node.get("totalRam") or sys_info.get("memoryTotal")
 
     lines = [
         f"🌐 <b>{name}</b> {f'({cc})' if cc else ''}",
