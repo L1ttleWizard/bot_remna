@@ -126,11 +126,43 @@ def admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="♾ Без лимита по времени", callback_data=f"admu:{target_tg}:s:{sub_id}:ext_inf")],
             [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
+            [InlineKeyboardButton(text="🧩 Профили", callback_data=f"admu:{target_tg}:s:{sub_id}:sq")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
             [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
             [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
         ]
     )
+
+
+def admin_sub_squads_keyboard(
+    target_tg: int,
+    sub_id: int,
+    squads: list,
+    active_uuids: set,
+) -> InlineKeyboardMarkup:
+    """Клавиатура мульти-селекта профилей (internal squads).
+
+    `squads` — список словарей с ключами `uuid` и `name`. Порядок важен:
+    индекс в этом списке используется в callback_data, чтобы уложиться
+    в 64-байтный лимит Telegram (UUID туда не помещаются вместе с префиксом).
+    `active_uuids` — UUID'ы уже назначенных пользователю профилей.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, sq in enumerate(squads):
+        uuid = sq.get("uuid") or ""
+        name = sq.get("name") or "—"
+        prefix = "✅" if uuid in active_uuids else "⬜"
+        rows.append([InlineKeyboardButton(
+            text=f"{prefix} {name}",
+            callback_data=f"admu:{target_tg}:s:{sub_id}:sq_tog:{idx}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:sq",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_sub_devices_keyboard(target_tg: int, sub_id: int, devices_count: int, show_limits: bool) -> InlineKeyboardMarkup:
