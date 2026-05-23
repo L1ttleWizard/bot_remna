@@ -225,6 +225,6 @@ def draw_text_bar_chart(sparkline_data: list[int], dates: list[str]) -> str:
             bar_str = "█" * 10
             
         formatted_val = human_bytes(val)
-        lines.append(f"`{date}` | `{bar_str}` | `{formatted_val}`")
+        lines.append(f"{date} | {bar_str} | {formatted_val}")
     return "\n".join(lines)
 

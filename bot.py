@@ -1057,7 +1057,7 @@ async def cb_sub_info(callback: CallbackQuery):
 
     chart_lines = ""
     if spark_7:
-        chart_lines = "\n\n📊 **Использование за неделю:**\n" + draw_text_bar_chart(spark_7, dates_7)
+        chart_lines = "\n\n📊 **Использование за неделю:**\n```\n" + draw_text_bar_chart(spark_7, dates_7) + "\n```"
 
     text = (
         f"📈 **Аналитика подписки #{sub_id}**\n\n"
@@ -1592,15 +1592,24 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         if sub[5] else "—"
     )
 
-    # Аналитика: статус / трафик / онлайн / HWID — параллельно info+30-day.
+    # 7-day range for daily traffic chart
+    from datetime import timedelta, timezone
+    end_dt = datetime.now(timezone.utc).date()
+    dates_7 = [(end_dt - timedelta(days=i)).strftime("%d.%m") for i in range(6, -1, -1)]
+    start_7_d = (end_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    end_7_d = end_dt.strftime("%Y-%m-%d")
+
+    # Аналитика: статус / трафик / онлайн / HWID + sparkline — параллельно.
     start_d, end_d = _analytics_date_range()
-    info_res, period_res = await asyncio.gather(
+    info_res, period_res, spark_res = await asyncio.gather(
         api.get_user_info(full_uuid),
         api.get_user_usage_range(full_uuid, start_d, end_d),
+        api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
         return_exceptions=True,
     )
     info = info_res if not isinstance(info_res, BaseException) else None
     period_30 = period_res if not isinstance(period_res, BaseException) else None
+    spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
     stats_block = ""
     if info and "response" in info:
         ad = info["response"]
@@ -1620,6 +1629,13 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
             human_bytes(int(period_30)) if period_30 is not None else "—"
         )
 
+        chart_lines = ""
+        if spark_7:
+            chart_lines = (
+                "\n\n📊 <b>Использование за неделю:</b>\n"
+                f"<pre>{html.escape(draw_text_bar_chart(spark_7, dates_7))}</pre>"
+            )
+
         stats_block = (
             "\n📈 <b>Статистика</b>\n"
             f"  · Статус: <b>{html.escape(status)}</b>\n"
@@ -1629,7 +1645,8 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
             f"{html.escape(lim_txt)}\n"
             f"  · Трафик (за всё время): <b>{html.escape(human_bytes(life))}</b>\n"
             f"  · HWID-устройств: <b>{hwid_count}</b> / {html.escape(hwid_lim)}\n"
-            f"  · Последний онлайн: <b>{html.escape(last_h)}</b>\n"
+            f"  · Последний онлайн: <b>{html.escape(last_h)}</b>"
+            f"{chart_lines}\n"
         )
 
     text = (
