@@ -81,3 +81,9 @@ MASTER_ANSIBLE_REPO_PATH = os.environ.get(
 def master_ssh_configured() -> bool:
     """True если задан хотя бы host+key — кнопку «➕ Добавить ноду» можно показать."""
     return bool(MASTER_SSH_HOST and MASTER_SSH_KEY_PATH)
+
+
+# Настройки уведомлений по умолчанию
+DEFAULT_CLIENT_NOTIFY_DAYS = [3, 1, 0]
+DEFAULT_ADMIN_NOTIFY_DAYS = [3, 1, 0, -1]
+

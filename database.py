@@ -126,6 +126,22 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_subscriptions_tg_id ON subscriptions(tg_id)"
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notification_log (
+                tg_id INTEGER NOT NULL,
+                sub_id INTEGER NOT NULL,
+                days_left INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY (tg_id, sub_id, days_left)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_log_sent_at ON notification_log(sent_at)"
+        )
+
+
         # One-time backfill: copy legacy users.uuid → subscriptions for users
         # that don't have a corresponding subscription yet.
         async with db.execute(
@@ -1012,3 +1028,61 @@ async def list_all_subscriptions_with_uuid(limit: int = 1000) -> list:
             (int(limit),),
         ) as cur:
             return list(await cur.fetchall())
+
+
+async def list_admins() -> list[int]:
+    """Возвращает Telegram ID всех администраторов."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT tg_id FROM users WHERE role = ?", (ROLE_ADMIN,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+async def was_notification_sent(tg_id: int, sub_id: int, days_left: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM notification_log WHERE tg_id = ? AND sub_id = ? AND days_left = ?",
+            (int(tg_id), int(sub_id), int(days_left)),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def mark_notification_sent(tg_id: int, sub_id: int, days_left: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO notification_log (tg_id, sub_id, days_left, sent_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(tg_id), int(sub_id), int(days_left), int(time.time())),
+        )
+        await db.commit()
+
+
+async def cleanup_old_notifications(before_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM notification_log WHERE sent_at < ?", (int(before_ts),))
+        await db.commit()
+
+
+async def list_expiring_and_expired_subscriptions(start_ts: int, end_ts: int) -> list:
+    """Возвращает подписки, истекающие или истёкшие в интервале [start_ts, end_ts].
+    Возвращает список кортежей (tg_id, sub_id, expire_date, role, label, username, tg_username, tg_first_name, tg_last_name).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT s.tg_id, s.id, s.expire_date, COALESCE(u.role, 'user'),
+                   s.label, s.username, u.tg_username, u.tg_first_name, u.tg_last_name
+            FROM subscriptions s
+            JOIN users u ON u.tg_id = s.tg_id
+            WHERE s.expire_date IS NOT NULL
+              AND s.expire_date >= ?
+              AND s.expire_date <= ?
+            """,
+            (start_ts, end_ts),
+        ) as cursor:
+            return list(await cursor.fetchall())
+

@@ -55,10 +55,23 @@ class AdminBroadcastStates(StatesGroup):
     waiting_for_message = State()
 
 
+class AdminNotifyStates(StatesGroup):
+    waiting_for_days = State()
+    waiting_for_text = State()
+
+
+
 
 # --- Settings KV keys ---
 
 SUPPORT_KEY = "support_text"
+CLIENT_NOTIFY_ENABLED_KEY = "client_notify_enabled"
+ADMIN_NOTIFY_ENABLED_KEY = "admin_notify_enabled"
+CLIENT_NOTIFY_DAYS_KEY = "client_notify_days"
+ADMIN_NOTIFY_DAYS_KEY = "admin_notify_days"
+CLIENT_NOTIFY_TEXT_KEY = "client_notify_text"
+ADMIN_NOTIFY_TEXT_KEY = "admin_notify_text"
+
 
 
 # --- Middleware ---
