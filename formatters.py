@@ -196,3 +196,35 @@ def build_panel_username(
     if avail <= 0:
         return base[:REMNAWAVE_USERNAME_MAX_LEN]
     return f"{base}_{suffix[:avail]}"
+
+
+def draw_text_bar_chart(sparkline_data: list[int], dates: list[str]) -> str:
+    """Генерирует моноширинный текстовый график использования трафика."""
+    if not sparkline_data:
+        return "Нет данных за последнюю неделю."
+    data_len = min(len(sparkline_data), len(dates))
+    sparkline_data = sparkline_data[-data_len:]
+    dates = dates[-data_len:]
+    
+    max_val = max(sparkline_data) or 1
+    bars = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
+    lines = []
+    for val, date in zip(sparkline_data, dates):
+        fraction = val / max_val
+        bar_len = fraction * 10
+        full_blocks = int(bar_len)
+        remainder = bar_len - full_blocks
+        
+        bar_str = "█" * full_blocks
+        if full_blocks < 10:
+            part_idx = int(remainder * 8)
+            bar_str += bars[part_idx]
+            # Добиваем пробелами до фиксированной ширины в 10 символов
+            bar_str += " " * (10 - len(bar_str))
+        else:
+            bar_str = "█" * 10
+            
+        formatted_val = human_bytes(val)
+        lines.append(f"`{date}` | `{bar_str}` | `{formatted_val}`")
+    return "\n".join(lines)
+

@@ -229,6 +229,65 @@ class RemnawaveAPI:
                 logger.error("get_user_usage_range legacy %s: %s", user_uuid, e)
         return None
 
+    async def get_user_sparkline_traffic(
+        self,
+        user_uuid: str,
+        start_date: str,
+        end_date: str,
+        *,
+        timeout_s: float = 4.0,
+    ) -> Optional[list[int]]:
+        """Получает ежедневный трафик пользователя (список байт) за указанное окно.
+        
+        Использует Remnawave 2.4+ `/api/bandwidth-stats/users/{uuid}` (sparklineData),
+        с fallback на legacy `/api/bandwidth-stats/users/{uuid}/legacy`.
+        Возвращает список интов или None при ошибке.
+        """
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
+            base = f"{self.base_url}/api/bandwidth-stats/users/{user_uuid}"
+            params = {"start": start_date, "end": end_date, "topNodesLimit": 1}
+            try:
+                async with session.get(base, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        spark = (data.get("response") or {}).get("sparklineData")
+                        if isinstance(spark, list):
+                            return [int(v) for v in spark]
+                    if resp.status not in (404, 405):
+                        logger.error(
+                            "get_user_sparkline_traffic %s: статус %s",
+                            user_uuid, resp.status,
+                        )
+                        return None
+            except asyncio.TimeoutError:
+                logger.warning("get_user_sparkline_traffic %s: timeout", user_uuid)
+                return None
+            except Exception as e:
+                logger.error("get_user_sparkline_traffic %s: %s", user_uuid, e)
+
+            # Fallback: legacy endpoint
+            try:
+                async with session.get(
+                    f"{base}/legacy",
+                    params={"start": start_date, "end": end_date},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("response") or []
+                        if isinstance(rows, list):
+                            return [int(r.get("total") or 0) for r in rows]
+                    else:
+                        logger.error(
+                            "get_user_sparkline_traffic legacy %s: статус %s",
+                            user_uuid, resp.status,
+                        )
+            except asyncio.TimeoutError:
+                logger.warning("get_user_sparkline_traffic legacy %s: timeout", user_uuid)
+            except Exception as e:
+                logger.error("get_user_sparkline_traffic legacy %s: %s", user_uuid, e)
+        return None
+
     async def set_user_expire_unlimited(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
         """Снимает лимит времени подписки. Remnawave требует ISO-дату в expireAt
         (null не принимается), поэтому ставим заведомо далёкое будущее — 2099-12-31.

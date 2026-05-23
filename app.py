@@ -51,6 +51,11 @@ class AdminDmStates(StatesGroup):
     waiting_for_text = State()
 
 
+class AdminBroadcastStates(StatesGroup):
+    waiting_for_message = State()
+
+
+
 # --- Settings KV keys ---
 
 SUPPORT_KEY = "support_text"
