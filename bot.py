@@ -24,6 +24,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import auth
 import database as db
 from app import (
+    AdminBroadcastStates,
     AdminDmStates,
     AdminSearchStates,
     PromoStates,
@@ -40,6 +41,7 @@ from handlers import (
     admin_add_node,
     admin_dm,
     admin_nodes,
+    admin_notifications,
     admin_promos,
     connect,
     inline_search,
@@ -52,6 +54,7 @@ _REGISTERED_HANDLERS = (
     admin_add_node,
     admin_dm,
     admin_nodes,
+    admin_notifications,
     admin_promos,
     connect,
     inline_search,
@@ -76,6 +79,7 @@ from formatters import (
     REMNAWAVE_USERNAME_MAX_LEN,
     TG_USERNAME_RE,
     build_panel_username,
+    draw_text_bar_chart,
     effective_hwid_limit,
     format_devices_html,
     format_expire_display,
@@ -1016,14 +1020,25 @@ async def cb_sub_info(callback: CallbackQuery):
         if expire_timestamp else "—"
     )
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
+    
+    # 7-day range for daily traffic chart
+    from datetime import timedelta, timezone
+    end_dt = datetime.now(timezone.utc).date()
+    dates_7 = [(end_dt - timedelta(days=i)).strftime("%d.%m") for i in range(6, -1, -1)]
+    start_7_d = (end_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    end_7_d = end_dt.strftime("%Y-%m-%d")
+    
     start_d, end_d = _analytics_date_range()
-    info_res, period_res = await asyncio.gather(
+    info_res, period_res, spark_res = await asyncio.gather(
         api.get_user_info(full_uuid),
         api.get_user_usage_range(full_uuid, start_d, end_d),
+        api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
         return_exceptions=True,
     )
     info = info_res if not isinstance(info_res, BaseException) else None
     period_30 = period_res if not isinstance(period_res, BaseException) else None
+    spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
+    
     status_text = "Активна ✅"
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
     traffic_lines = ""
@@ -1044,6 +1059,10 @@ async def cb_sub_info(callback: CallbackQuery):
     if period_30 is not None:
         period_30_line = f"\n**За {ANALYTICS_PERIOD_DAYS} дней:** {human_bytes(int(period_30))}"
 
+    chart_lines = ""
+    if spark_7:
+        chart_lines = "\n\n📊 **Использование за неделю:**\n```\n" + draw_text_bar_chart(spark_7, dates_7) + "\n```"
+
     text = (
         f"📈 **Аналитика подписки #{sub_id}**\n\n"
         f"**Статус:** {status_text}\n"
@@ -1051,7 +1070,8 @@ async def cb_sub_info(callback: CallbackQuery):
         f"**HWID-устройств:** {hwid_count} / {limit_text}"
         f"{last_online_line}"
         f"{period_30_line}"
-        f"{traffic_lines}\n\n"
+        f"{traffic_lines}"
+        f"{chart_lines}\n\n"
         f"🔗 **Ссылка:** `{sub_url}`"
     )
     kb = InlineKeyboardMarkup(
@@ -1071,17 +1091,54 @@ async def cb_sub_devices(callback: CallbackQuery):
     if not sub:
         return
     full_uuid = sub[2]
-    text, _devices, _show = await load_devices_text(full_uuid)
+    text, devices, _show = await load_devices_text(full_uuid)
     text = f"📱 <b>Устройства подписки #{sub_id}</b>\n\n" + text
     text += "\n\nℹ️ Управление лимитами доступно только администратору."
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sub:dev:{sub_id}")],
-            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"sub:open:{sub_id}")],
-        ]
-    )
+    
+    inline_keyboard = []
+    for i, d in enumerate(devices):
+        model = d.get("deviceModel") or f"Устройство #{i + 1}"
+        inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🗑 Удалить {model}",
+                callback_data=f"sub:dev_rm:{sub_id}:{i}"
+            )
+        ])
+    inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sub:dev:{sub_id}")])
+    inline_keyboard.append([InlineKeyboardButton(text="◀️ К подписке", callback_data=f"sub:open:{sub_id}")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sub:dev_rm:"))
+async def cb_sub_device_remove(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    sub_id = int(parts[2])
+    device_idx = int(parts[3])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    full_uuid = sub[2]
+    hw_raw = await api.get_user_hwid_devices(full_uuid)
+    devices: list = []
+    if hw_raw and "response" in hw_raw:
+        devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+    if device_idx < 0 or device_idx >= len(devices):
+        await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
+        return
+    hwid = devices[device_idx].get("hwid")
+    if not hwid:
+        await callback.answer("Не удалось определить устройство.", show_alert=True)
+        return
+    ok = await api.delete_user_hwid_device(full_uuid, hwid)
+    if ok:
+        await callback.answer("✅ Устройство успешно удалено!")
+    else:
+        await callback.answer("❌ Не удалось удалить устройство.", show_alert=True)
+    await cb_sub_devices(callback)
+
 
 
 @dp.callback_query(F.data == "my_settings")
@@ -1539,15 +1596,24 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         if sub[5] else "—"
     )
 
-    # Аналитика: статус / трафик / онлайн / HWID — параллельно info+30-day.
+    # 7-day range for daily traffic chart
+    from datetime import timedelta, timezone
+    end_dt = datetime.now(timezone.utc).date()
+    dates_7 = [(end_dt - timedelta(days=i)).strftime("%d.%m") for i in range(6, -1, -1)]
+    start_7_d = (end_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    end_7_d = end_dt.strftime("%Y-%m-%d")
+
+    # Аналитика: статус / трафик / онлайн / HWID + sparkline — параллельно.
     start_d, end_d = _analytics_date_range()
-    info_res, period_res = await asyncio.gather(
+    info_res, period_res, spark_res = await asyncio.gather(
         api.get_user_info(full_uuid),
         api.get_user_usage_range(full_uuid, start_d, end_d),
+        api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
         return_exceptions=True,
     )
     info = info_res if not isinstance(info_res, BaseException) else None
     period_30 = period_res if not isinstance(period_res, BaseException) else None
+    spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
     stats_block = ""
     if info and "response" in info:
         ad = info["response"]
@@ -1572,6 +1638,13 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
             if active_squads else "—"
         )
 
+        chart_lines = ""
+        if spark_7:
+            chart_lines = (
+                "\n\n📊 <b>Использование за неделю:</b>\n"
+                f"<pre>{html.escape(draw_text_bar_chart(spark_7, dates_7))}</pre>"
+            )
+
         stats_block = (
             "\n📈 <b>Статистика</b>\n"
             f"  · Статус: <b>{html.escape(status)}</b>\n"
@@ -1582,7 +1655,8 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
             f"{html.escape(lim_txt)}\n"
             f"  · Трафик (за всё время): <b>{html.escape(human_bytes(life))}</b>\n"
             f"  · HWID-устройств: <b>{hwid_count}</b> / {html.escape(hwid_lim)}\n"
-            f"  · Последний онлайн: <b>{html.escape(last_h)}</b>\n"
+            f"  · Последний онлайн: <b>{html.escape(last_h)}</b>"
+            f"{chart_lines}\n"
         )
 
     text = (
@@ -2228,6 +2302,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="list_promos", description="📋 Список промокодов"),
     BotCommand(command="set_support", description="❓ Задать контакты поддержки"),
     BotCommand(command="dm", description="✉️ Написать пользователю"),
+    BotCommand(command="broadcast", description="📢 Массовая рассылка сообщений"),
     BotCommand(command="stats", description="📊 Аналитика и сводка"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]

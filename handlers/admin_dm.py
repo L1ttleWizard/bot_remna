@@ -4,7 +4,9 @@
 - `/dm <tg_id|@username> <текст>` — однократно
 - FSM `AdminDmStates.waiting_for_text` — после клика по «✉️ Написать» в карточке
 """
+import asyncio
 import html
+import time
 from typing import Optional
 
 from aiogram.filters import Command, CommandObject
@@ -13,7 +15,7 @@ from aiogram.types import Message
 
 import auth
 import database as db
-from app import AdminDmStates, bot, dp
+from app import AdminBroadcastStates, AdminDmStates, bot, dp
 from formatters import format_tg_name
 
 
@@ -102,3 +104,67 @@ async def admin_dm_capture(message: Message, state: FSMContext):
             f"❌ Не удалось доставить: <code>{html.escape(str(exc))}</code>",
             parse_mode="HTML",
         )
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminBroadcastStates.waiting_for_message)
+    await message.answer(
+        "📝 <b>Режим массовой рассылки</b>\n\n"
+        "Отправьте сообщение (текст с HTML-форматированием, медиа, фото и т.д.), "
+        "которое хотите разослать всем пользователям бота.\n\n"
+        "Для отмены отправьте <code>/cancel</code>.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminBroadcastStates.waiting_for_message)
+async def process_broadcast_message(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Рассылка отменена.")
+        return
+
+    await state.clear()
+    status_msg = await message.answer("⏳ Рассылка запущена...")
+
+    # Извлекаем всех пользователей из БД.
+    users = await db.list_users(limit=100000)
+    success_count = 0
+    failed_count = 0
+
+    start_time = time.time()
+
+    for u in users:
+        tg_id = u[0]
+        # Не шлем отправителю (админу)
+        if tg_id == message.from_user.id:
+            continue
+        try:
+            # Копируем сообщение целиком (с текстом, форматированием, фото/видео и т.д.)
+            await bot.copy_message(
+                chat_id=tg_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+            success_count += 1
+            # Защита от лимитов (30 сообщений в секунду)
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed_count += 1
+
+    elapsed = time.time() - start_time
+    await status_msg.answer(
+        f"📢 <b>Рассылка завершена!</b>\n\n"
+        f"✅ Доставлено: <b>{success_count}</b>\n"
+        f"❌ Ошибок: <b>{failed_count}</b>\n"
+        f"⏱ Время выполнения: <b>{elapsed:.1f}</b> сек.",
+        parse_mode="HTML"
+    )
+

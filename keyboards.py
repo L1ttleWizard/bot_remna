@@ -42,6 +42,7 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
+            InlineKeyboardButton(text="🔔 Уведомления", callback_data="admin_notify_settings"),
         ],
     ]
     if has_account:
