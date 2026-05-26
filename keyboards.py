@@ -135,6 +135,28 @@ def admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def admin_sub_squads_keyboard(
+    target_tg: int,
+    sub_id: int,
+    squads: list,
+    active_uuids: set,
+) -> InlineKeyboardMarkup:
+    """Клавиатура управления сквадами подписки (internal squads)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, sq in enumerate(squads):
+        uuid = sq.get("uuid") or ""
+        name = sq.get("name") or "—"
+        icon = "🟢" if uuid in active_uuids else "🔴"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {name}",
+            callback_data=f"admu:{target_tg}:s:{sub_id}:sq_s:{idx}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def admin_sub_devices_keyboard(target_tg: int, sub_id: int, devices_count: int, show_limits: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(devices_count):

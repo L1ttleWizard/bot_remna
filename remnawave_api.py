@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,19 @@ class RemnawaveAPI:
     async def update_hwid_device_limit(self, user_uuid: str, new_limit: Union[int, None]) -> bool:
         """Обновляет лимит устройств по HWID (PATCH /api/users). None = снять лимит (null в JSON)."""
         return await self.patch_user({"uuid": user_uuid, "hwidDeviceLimit": new_limit})
+
+    async def update_active_internal_squads(
+        self, user_uuid: str, squad_uuids: List[str]
+    ) -> bool:
+        """Заменяет список активных internal squads (профилей) пользователя.
+
+        Передаваемый список — это полный набор UUID, который должен быть назначен.
+        Пустой список = снять все профили.
+        """
+        # Remnawave PATCH /api/users принимает activeInternalSquads как массив UUID.
+        return await self.patch_user(
+            {"uuid": user_uuid, "activeInternalSquads": list(squad_uuids)}
+        )
 
     async def get_user_usage_range(
         self,

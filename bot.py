@@ -95,6 +95,7 @@ from formatters import (
 from keyboards import (
     admin_sub_devices_keyboard as _admin_sub_devices_keyboard,
     admin_sub_keyboard as _admin_sub_keyboard,
+    admin_sub_squads_keyboard as _admin_sub_squads_keyboard,
     back_only_keyboard,
     devices_admin_keyboard,
     devices_user_keyboard,
@@ -442,7 +443,8 @@ ADMIN_HELP_TEXT = (
     "  В карточке юзера:\n"
     "    · <i>📅 #X · username · до dd.mm.yyyy</i> — открыть конкретную подписку. "
     "В её меню: <b>+7/+30 дней</b>, <b>♾ Без лимита по времени</b> (ставит дату 2099-12-31), "
-    "<b>📱 Устройства</b>, <b>🗑 Удалить эту подписку</b>.\n"
+    "<b>📱 Устройства</b>, <b>🧩 Профили</b> (мульти-селект internal squads), "
+    "<b>🗑 Удалить эту подписку</b>.\n"
     "    · <b>✉️ Написать</b> — отправить ему DM от вашего имени (FSM-ввод).\n"
     "    · <b>➕ Привязать подписку из Remnawave</b> — выбрать существующего юзера в панели "
     "и добавить его как подписку этому tg_id (запись в панели не меняется).\n"
@@ -1630,6 +1632,11 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         period_30_txt = (
             human_bytes(int(period_30)) if period_30 is not None else "—"
         )
+        active_squads = ad.get("activeInternalSquads") or []
+        squads_txt = (
+            ", ".join(html.escape(sq.get("name") or "—") for sq in active_squads)
+            if active_squads else "—"
+        )
 
         chart_lines = ""
         if spark_7:
@@ -1641,6 +1648,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         stats_block = (
             "\n📈 <b>Статистика</b>\n"
             f"  · Статус: <b>{html.escape(status)}</b>\n"
+            f"  · Профили: <b>{squads_txt}</b>\n"
             f"  · Трафик за {ANALYTICS_PERIOD_DAYS} дн: "
             f"<b>{html.escape(period_30_txt)}</b>\n"
             f"  · Трафик (текущий период): <b>{html.escape(human_bytes(used))}</b> / "
@@ -1683,36 +1691,54 @@ async def _send_admin_sub_devices(callback: CallbackQuery, target_tg: int, sub_i
     )
 
 
-async def _send_admin_sub_squads(callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool) -> None:
+async def _load_squads_state(full_uuid: str) -> Optional[tuple[list[dict], set[str]]]:
+    """Параллельно подтягивает полный список internal squads и набор активных
+    у пользователя. Возвращает (squads_sorted, active_uuids_set) либо None
+    если панель недоступна.
+
+    Список сортируем по `viewPosition` (если есть) затем по имени, чтобы
+    индексация в callback_data была стабильной между рендерами.
+    """
+    squads_raw, info = await asyncio.gather(
+        api.get_internal_squads(),
+        api.get_user_info(full_uuid),
+        return_exceptions=True,
+    )
+    if isinstance(squads_raw, BaseException) or not squads_raw or "response" not in squads_raw:
+        return None
+    squads = squads_raw["response"].get("internalSquads") or []
+    squads = sorted(
+        squads,
+        key=lambda s: (
+            int(s.get("viewPosition") or 10_000),
+            str(s.get("name") or ""),
+        ),
+    )
+    active: set[str] = set()
+    if not isinstance(info, BaseException) and info and "response" in info:
+        for sq in info["response"].get("activeInternalSquads") or []:
+            u = sq.get("uuid")
+            if u:
+                active.add(u)
+    return squads, active
+
+
+async def _send_admin_sub_squads(
+    callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool,
+) -> None:
     sub = await db.get_subscription(sub_id)
     if not sub or sub[1] != target_tg:
         await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
         return
     full_uuid = sub[2]
 
-    # Fetch squads and user info in parallel
-    squads_data, user_info = await asyncio.gather(
-        api.get_internal_squads(),
-        api.get_user_info(full_uuid),
-        return_exceptions=True
-    )
+    state = await _load_squads_state(full_uuid)
+    if state is None:
+        await callback.answer("Не удалось получить список сквадов из панели.", show_alert=True)
+        return
+    squads, active_uuids = state
 
-    squads = []
-    if not isinstance(squads_data, BaseException) and squads_data and "response" in squads_data:
-        squads = squads_data["response"].get("internalSquads") or []
-
-    active_squad_uuids = set()
-    if not isinstance(user_info, BaseException) and user_info and "response" in user_info:
-        active_squads = user_info["response"].get("activeInternalSquads") or []
-        for s in active_squads:
-            if isinstance(s, dict):
-                sq_uuid = s.get("uuid")
-                if sq_uuid:
-                    active_squad_uuids.add(sq_uuid)
-            elif isinstance(s, str):
-                active_squad_uuids.add(s)
-
-    active_names = [s.get("name") for s in squads if s.get("uuid") in active_squad_uuids]
+    active_names = [sq.get("name") or "—" for sq in squads if sq.get("uuid") in active_uuids]
     active_squad_str = ", ".join(active_names) if active_names else "Не выбран"
 
     text = (
@@ -1721,29 +1747,11 @@ async def _send_admin_sub_squads(callback: CallbackQuery, target_tg: int, sub_id
         "Выберите сквад для активации:"
     )
 
-    rows = []
-    for sq in squads:
-        sq_uuid = sq.get("uuid")
-        sq_name = sq.get("name") or "Без названия"
-        is_active = sq_uuid in active_squad_uuids
-        icon = "🟢" if is_active else "🔴"
-        # Callback format: admu:{target_tg}:s:{sub_id}:squad_set:{squad_uuid}
-        rows.append([InlineKeyboardButton(
-            text=f"{icon} {sq_name}",
-            callback_data=f"admu:{target_tg}:s:{sub_id}:squad_set:{sq_uuid}"
-        )])
-
-    # Back button to the subscription view
-    rows.append([InlineKeyboardButton(
-        text="◀️ К подписке",
-        callback_data=f"admu:{target_tg}:s:{sub_id}:open"
-    )])
-
     await safe_edit(
         callback,
         text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        reply_markup=_admin_sub_squads_keyboard(target_tg, sub_id, squads, active_uuids),
         prefer_edit=prefer_edit,
     )
 
@@ -1795,12 +1803,25 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         await callback.answer()
         return
 
-    if action == "squad_set":
-        squad_uuid = arg
-        if not squad_uuid:
-            await callback.answer("Некорректный сквад.", show_alert=True)
+    if action == "sq_s":
+        try:
+            idx = int(arg or "")
+        except ValueError:
+            await callback.answer("Некорректные данные.", show_alert=True)
             return
-        ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": [squad_uuid]})
+        state = await _load_squads_state(full_uuid)
+        if state is None:
+            await callback.answer("Не удалось получить список сквадов.", show_alert=True)
+            return
+        squads, active_uuids = state
+        if idx < 0 or idx >= len(squads):
+            await callback.answer("Сквад не найден.", show_alert=True)
+            return
+        target_uuid = squads[idx].get("uuid")
+        if not target_uuid:
+            await callback.answer("У сквада нет UUID.", show_alert=True)
+            return
+        ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": [target_uuid]})
         if ok:
             await callback.answer("Сквад успешно изменен!")
         else:
