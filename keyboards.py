@@ -127,6 +127,7 @@ def admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="♾ Без лимита по времени", callback_data=f"admu:{target_tg}:s:{sub_id}:ext_inf")],
             [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
+            [InlineKeyboardButton(text="👥 Сквады", callback_data=f"admu:{target_tg}:s:{sub_id}:squads")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
             [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
             [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],

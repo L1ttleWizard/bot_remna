@@ -986,93 +986,11 @@ async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: 
         f"<b>Действует до:</b> {html.escape(expire_str)}\n"
         f"<b>Ссылка:</b> <code>{html.escape(sub_url)}</code>"
     )
-
-    # Fetch squads and user info in parallel
-    squads_data, user_info = await asyncio.gather(
-        api.get_internal_squads(),
-        api.get_user_info(uuid),
-        return_exceptions=True
-    )
-
-    squads = []
-    if not isinstance(squads_data, BaseException) and squads_data and "response" in squads_data:
-        squads = squads_data["response"].get("internalSquads") or []
-
-    active_squad_uuids = set()
-    if not isinstance(user_info, BaseException) and user_info and "response" in user_info:
-        active_squads = user_info["response"].get("activeInternalSquads") or []
-        for s in active_squads:
-            if isinstance(s, dict):
-                sq_uuid = s.get("uuid")
-                if sq_uuid:
-                    active_squad_uuids.add(sq_uuid)
-            elif isinstance(s, str):
-                active_squad_uuids.add(s)
-
-    if squads:
-        active_names = [s.get("name") for s in squads if s.get("uuid") in active_squad_uuids]
-        active_squad_str = ", ".join(active_names) if active_names else "Не выбран"
-        text += f"\n\n👥 <b>Сквад:</b> {html.escape(active_squad_str)}"
-
-    keyboard_markup = _user_sub_menu_keyboard(sid)
-    inline_keyboard = list(keyboard_markup.inline_keyboard)
-
-    if squads:
-        squad_buttons = []
-        for sq in squads:
-            sq_uuid = sq.get("uuid")
-            sq_name = sq.get("name") or "Без названия"
-            is_active = sq_uuid in active_squad_uuids
-            icon = "🟢" if is_active else "🔴"
-            squad_buttons.append([
-                InlineKeyboardButton(
-                    text=f"{icon} {sq_name}",
-                    callback_data=f"sub:squad:{sid}:{sq_uuid}"
-                )
-            ])
-        # Insert squad buttons before the back button (the last row)
-        if len(inline_keyboard) > 0:
-            inline_keyboard = inline_keyboard[:-1] + squad_buttons + [inline_keyboard[-1]]
-        else:
-            inline_keyboard = squad_buttons
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-
     await safe_edit(
         callback, text, parse_mode="HTML",
-        reply_markup=reply_markup, prefer_edit=prefer_edit,
+        reply_markup=_user_sub_menu_keyboard(sid), prefer_edit=prefer_edit,
     )
     await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("sub:squad:"))
-async def cb_sub_squad(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer("Некорректный callback.", show_alert=True)
-        return
-    try:
-        sub_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Некорректный ID подписки.", show_alert=True)
-        return
-    squad_uuid = parts[3]
-
-    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
-    if not sub:
-        return
-
-    full_uuid = sub[2]
-    # Update active squads
-    ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": [squad_uuid]})
-    if ok:
-        await callback.answer("Сквад успешно изменен!")
-    else:
-        await callback.answer("Не удалось сменить сквад.", show_alert=True)
-
-    # Re-render sub open
-    adapted = (sub[0], sub[2], sub[3], sub[4], sub[5], sub[6], sub[8])
-    await _render_sub_open(callback, adapted, prefer_edit=True)
 
 
 @dp.callback_query(F.data.startswith("sub:open:"))
@@ -1765,6 +1683,71 @@ async def _send_admin_sub_devices(callback: CallbackQuery, target_tg: int, sub_i
     )
 
 
+async def _send_admin_sub_squads(callback: CallbackQuery, target_tg: int, sub_id: int, *, prefer_edit: bool) -> None:
+    sub = await db.get_subscription(sub_id)
+    if not sub or sub[1] != target_tg:
+        await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
+        return
+    full_uuid = sub[2]
+
+    # Fetch squads and user info in parallel
+    squads_data, user_info = await asyncio.gather(
+        api.get_internal_squads(),
+        api.get_user_info(full_uuid),
+        return_exceptions=True
+    )
+
+    squads = []
+    if not isinstance(squads_data, BaseException) and squads_data and "response" in squads_data:
+        squads = squads_data["response"].get("internalSquads") or []
+
+    active_squad_uuids = set()
+    if not isinstance(user_info, BaseException) and user_info and "response" in user_info:
+        active_squads = user_info["response"].get("activeInternalSquads") or []
+        for s in active_squads:
+            if isinstance(s, dict):
+                sq_uuid = s.get("uuid")
+                if sq_uuid:
+                    active_squad_uuids.add(sq_uuid)
+            elif isinstance(s, str):
+                active_squad_uuids.add(s)
+
+    active_names = [s.get("name") for s in squads if s.get("uuid") in active_squad_uuids]
+    active_squad_str = ", ".join(active_names) if active_names else "Не выбран"
+
+    text = (
+        f"👥 <b>Управление сквадами подписки #{sub_id}</b> · tg=<code>{target_tg}</code>\n\n"
+        f"<b>Текущий сквад:</b> {html.escape(active_squad_str)}\n\n"
+        "Выберите сквад для активации:"
+    )
+
+    rows = []
+    for sq in squads:
+        sq_uuid = sq.get("uuid")
+        sq_name = sq.get("name") or "Без названия"
+        is_active = sq_uuid in active_squad_uuids
+        icon = "🟢" if is_active else "🔴"
+        # Callback format: admu:{target_tg}:s:{sub_id}:squad_set:{squad_uuid}
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {sq_name}",
+            callback_data=f"admu:{target_tg}:s:{sub_id}:squad_set:{sq_uuid}"
+        )])
+
+    # Back button to the subscription view
+    rows.append([InlineKeyboardButton(
+        text="◀️ К подписке",
+        callback_data=f"admu:{target_tg}:s:{sub_id}:open"
+    )])
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=prefer_edit,
+    )
+
+
 async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int, action: str, arg: Optional[str]) -> None:
     sub = await db.get_subscription(sub_id)
     if not sub or sub[1] != target_tg:
@@ -1805,6 +1788,24 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
     if action == "dev":
         await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
         await callback.answer()
+        return
+
+    if action == "squads":
+        await _send_admin_sub_squads(callback, target_tg, sub_id, prefer_edit=True)
+        await callback.answer()
+        return
+
+    if action == "squad_set":
+        squad_uuid = arg
+        if not squad_uuid:
+            await callback.answer("Некорректный сквад.", show_alert=True)
+            return
+        ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": [squad_uuid]})
+        if ok:
+            await callback.answer("Сквад успешно изменен!")
+        else:
+            await callback.answer("Не удалось сменить сквад.", show_alert=True)
+        await _send_admin_sub_squads(callback, target_tg, sub_id, prefer_edit=True)
         return
 
     if action == "hw_lim":
