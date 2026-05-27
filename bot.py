@@ -73,6 +73,9 @@ from config import (
     SCHEDULER_CRON_MINUTE,
     SCHEDULER_TIMEZONE,
     SUB_DOMAIN,
+    BACKUP_TG_CHAT_ID,
+    BACKUP_CRON_HOUR,
+    BACKUP_CRON_MINUTE,
 )
 from formatters import (
     DEFAULT_HWID_DEVICE_LIMIT,
@@ -112,6 +115,7 @@ from scheduler import (
     check_expiring_subscriptions,
     check_nodes_health,
     check_cpu_load,
+    run_daily_backup,
 )
 
 
@@ -474,6 +478,19 @@ async def cmd_admin(message: Message):
         "🛠 Админская панель",
         reply_markup=main_keyboard_admin(message.from_user.id, has_account),
     )
+
+
+@dp.message(Command("make_backup"))
+async def cmd_make_backup(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    await message.answer("🔄 Запуск создания резервной копии...")
+    success = await run_daily_backup(bot, target_chat_id=message.chat.id)
+    if success:
+        await message.answer("✅ Резервная копия успешно создана и отправлена!")
+    else:
+        await message.answer("❌ Ошибка при создании резервной копии. Подробности в логах.")
 
 
 ADMIN_HELP_TEXT = (
@@ -2360,6 +2377,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="dm", description="✉️ Написать пользователю"),
     BotCommand(command="broadcast", description="📢 Массовая рассылка сообщений"),
     BotCommand(command="stats", description="📊 Аналитика и сводка"),
+    BotCommand(command="make_backup", description="📦 Создать резервную копию сейчас"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
 
@@ -2412,6 +2430,14 @@ async def main():
         minutes=1,
         args=[bot],
     )
+    if BACKUP_TG_CHAT_ID:
+        scheduler.add_job(
+            run_daily_backup,
+            "cron",
+            hour=BACKUP_CRON_HOUR,
+            minute=BACKUP_CRON_MINUTE,
+            args=[bot],
+        )
     scheduler.start()
 
     logger.info("Бот запущен...")

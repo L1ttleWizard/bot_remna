@@ -42,6 +42,18 @@ SCHEDULER_CRON_HOUR = int(os.environ.get("SCHEDULER_CRON_HOUR", "12"))
 SCHEDULER_CRON_MINUTE = int(os.environ.get("SCHEDULER_CRON_MINUTE", "0"))
 SCHEDULER_TIMEZONE = os.environ.get("TZ", "Europe/Moscow")
 
+# Настройки резервного копирования (бэкапа) в Telegram
+BACKUP_TG_CHAT_ID = os.environ.get("BACKUP_TG_CHAT_ID", "").strip() or None
+if BACKUP_TG_CHAT_ID:
+    try:
+        BACKUP_TG_CHAT_ID = int(BACKUP_TG_CHAT_ID)
+    except ValueError:
+        pass
+
+BACKUP_CRON_HOUR = int(os.environ.get("BACKUP_CRON_HOUR", "1"))
+BACKUP_CRON_MINUTE = int(os.environ.get("BACKUP_CRON_MINUTE", "0"))
+
+
 
 def _parse_admin_ids(raw: str) -> set[int]:
     out: set[int] = set()
