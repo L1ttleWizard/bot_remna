@@ -141,6 +141,30 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_notification_log_sent_at ON notification_log(sent_at)"
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS node_status_log (
+                node_uuid TEXT PRIMARY KEY,
+                node_name TEXT,
+                was_connected INTEGER NOT NULL DEFAULT 1,
+                last_checked INTEGER NOT NULL,
+                alerted_down INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cpu_load_log (
+                node_uuid TEXT PRIMARY KEY,
+                node_name TEXT,
+                first_high_ts INTEGER,
+                last_high_ts INTEGER,
+                alerted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
 
         # One-time backfill: copy legacy users.uuid → subscriptions for users
         # that don't have a corresponding subscription yet.
@@ -1095,5 +1119,106 @@ async def get_admins_profiles() -> list:
             (ROLE_ADMIN,),
         ) as cursor:
             return list(await cursor.fetchall())
+
+
+async def upsert_node_status(node_uuid: str, node_name: str, is_connected: bool, now_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT alerted_down FROM node_status_log WHERE node_uuid = ?", (node_uuid,)) as cursor:
+            row = await cursor.fetchone()
+        alerted_down = row[0] if row else 0
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO node_status_log (node_uuid, node_name, was_connected, last_checked, alerted_down)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (node_uuid, node_name, 1 if is_connected else 0, now_ts, alerted_down),
+        )
+        await db.commit()
+
+
+async def get_node_status(node_uuid: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT node_uuid, node_name, was_connected, last_checked, alerted_down FROM node_status_log WHERE node_uuid = ?",
+            (node_uuid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "node_uuid": row[0],
+                    "node_name": row[1],
+                    "was_connected": bool(row[2]),
+                    "last_checked": row[3],
+                    "alerted_down": bool(row[4]),
+                }
+            return None
+
+
+async def mark_node_alerted(node_uuid: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE node_status_log SET alerted_down = 1 WHERE node_uuid = ?",
+            (node_uuid,),
+        )
+        await db.commit()
+
+
+async def clear_node_alert(node_uuid: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE node_status_log SET alerted_down = 0 WHERE node_uuid = ?",
+            (node_uuid,),
+        )
+        await db.commit()
+
+
+async def upsert_cpu_high(node_uuid: str, node_name: str, now_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT first_high_ts, alerted FROM cpu_load_log WHERE node_uuid = ?", (node_uuid,)) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            await db.execute(
+                "UPDATE cpu_load_log SET last_high_ts = ? WHERE node_uuid = ?",
+                (now_ts, node_uuid),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO cpu_load_log (node_uuid, node_name, first_high_ts, last_high_ts, alerted) VALUES (?, ?, ?, ?, 0)",
+                (node_uuid, node_name, now_ts, now_ts),
+            )
+        await db.commit()
+
+
+async def clear_cpu_high(node_uuid: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM cpu_load_log WHERE node_uuid = ?", (node_uuid,))
+        await db.commit()
+
+
+async def get_cpu_high(node_uuid: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT node_uuid, node_name, first_high_ts, last_high_ts, alerted FROM cpu_load_log WHERE node_uuid = ?",
+            (node_uuid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "node_uuid": row[0],
+                    "node_name": row[1],
+                    "first_high_ts": row[2],
+                    "last_high_ts": row[3],
+                    "alerted": bool(row[4]),
+                }
+            return None
+
+
+async def mark_cpu_alerted(node_uuid: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE cpu_load_log SET alerted = 1 WHERE node_uuid = ?",
+            (node_uuid,),
+        )
+        await db.commit()
 
 

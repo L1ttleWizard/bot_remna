@@ -18,6 +18,10 @@ from app import (
     ADMIN_NOTIFY_DAYS_KEY,
     ADMIN_NOTIFY_ENABLED_KEY,
     ADMIN_NOTIFY_TEXT_KEY,
+    NODE_DOWN_NOTIFY_ENABLED_KEY,
+    CPU_NOTIFY_ENABLED_KEY,
+    CPU_THRESHOLD_KEY,
+    CPU_SUSTAINED_MINUTES_KEY,
     AdminNotifyStates,
     dp,
     safe_edit,
@@ -80,7 +84,49 @@ async def get_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(text="📢 Отправить тест", callback_data="admin_notify_test"),
             ],
             [
-                InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel"),
+                InlineKeyboardButton(text="◀️ Назад", callback_data="admin_notify_settings"),
+            ],
+        ]
+    )
+    return body, kb
+
+
+async def get_server_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
+    node_down_enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
+    cpu_enabled = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
+    cpu_threshold = (await db.get_setting(CPU_THRESHOLD_KEY)) or "80"
+    cpu_duration = (await db.get_setting(CPU_SUSTAINED_MINUTES_KEY)) or "5"
+
+    node_down_status = "✅ Включены" if node_down_enabled else "❌ Выключены"
+    cpu_status = "✅ Включены" if cpu_enabled else "❌ Выключены"
+
+    body = (
+        "🖥 <b>Настройка мониторинга серверов</b>\n\n"
+        f"🔴 <b>Падение серверов:</b> {node_down_status}\n"
+        "<i>Отправляет уведомление, если нода переходит в статус offline.</i>\n\n"
+        f"📊 <b>Перегрузка CPU:</b> {cpu_status}\n"
+        f"• Порог CPU: <code>&gt; {cpu_threshold}%</code>\n"
+        f"• Длительность: <code>{cpu_duration} мин.</code>\n"
+        "<i>Отправляет уведомление, если загрузка CPU превышает порог в течение указанного времени.</i>"
+    )
+
+    btn_node_down_toggle = InlineKeyboardButton(
+        text="🔴 Падение: " + ("Выключить ❌" if node_down_enabled else "Включить ✅"),
+        callback_data="admin_notify_toggle:node_down",
+    )
+    btn_cpu_toggle = InlineKeyboardButton(
+        text="📊 CPU: " + ("Выключить ❌" if cpu_enabled else "Включить ✅"),
+        callback_data="admin_notify_toggle:cpu",
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn_node_down_toggle, btn_cpu_toggle],
+            [
+                InlineKeyboardButton(text="⚙️ Настроить CPU", callback_data="admin_notify_edit_cpu"),
+            ],
+            [
+                InlineKeyboardButton(text="◀️ Назад", callback_data="admin_notify_settings"),
             ],
         ]
     )
@@ -93,7 +139,43 @@ async def cb_admin_notify_settings(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     await state.clear()
+    body = (
+        "🔔 <b>Центр уведомлений</b>\n\n"
+        "Выберите категорию настроек уведомлений:"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 Подписки", callback_data="admin_notify_subs_menu"),
+                InlineKeyboardButton(text="🖥 Серверы", callback_data="admin_notify_servers_menu"),
+            ],
+            [
+                InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel"),
+            ]
+        ]
+    )
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_notify_subs_menu")
+async def cb_admin_notify_subs_menu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
     body, kb = await get_settings_summary()
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_notify_servers_menu")
+async def cb_admin_notify_servers_menu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
+    body, kb = await get_server_settings_summary()
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
 
@@ -107,11 +189,22 @@ async def cb_admin_notify_toggle(callback: CallbackQuery):
     if target == "client":
         cur = (await db.get_setting(CLIENT_NOTIFY_ENABLED_KEY)) != "0"
         await db.set_setting(CLIENT_NOTIFY_ENABLED_KEY, "0" if cur else "1")
-    else:
+        body, kb = await get_settings_summary()
+    elif target == "admin":
         cur = (await db.get_setting(ADMIN_NOTIFY_ENABLED_KEY)) != "0"
         await db.set_setting(ADMIN_NOTIFY_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_settings_summary()
+    elif target == "node_down":
+        cur = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
+        await db.set_setting(NODE_DOWN_NOTIFY_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_server_settings_summary()
+    elif target == "cpu":
+        cur = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
+        await db.set_setting(CPU_NOTIFY_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_server_settings_summary()
+    else:
+        return
 
-    body, kb = await get_settings_summary()
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer("Настройки изменены.")
 
@@ -134,7 +227,7 @@ async def cb_admin_notify_edit_days(callback: CallbackQuery, state: FSMContext):
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_settings")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_subs_menu")],
         ]
     )
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
@@ -207,7 +300,7 @@ async def cb_admin_notify_edit_text(callback: CallbackQuery, state: FSMContext):
     
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_settings")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_subs_menu")],
         ]
     )
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
@@ -328,3 +421,105 @@ async def cb_admin_notify_test(callback: CallbackQuery):
         await callback.message.answer(f"❌ Ошибка отправки тестового админу: {e}")
 
     await callback.answer("Тестовые сообщения отправлены!")
+
+
+@dp.callback_query(F.data == "admin_notify_edit_cpu")
+async def cb_admin_notify_edit_cpu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.set_state(AdminNotifyStates.waiting_for_cpu_threshold)
+
+    body = (
+        "📊 <b>Настройка порога CPU</b>\n\n"
+        "Введите желаемый порог загрузки CPU в процентах (целое число от 1 до 100).\n"
+        "Например: <code>80</code>.\n\n"
+        "Для отмены отправьте /cancel."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_servers_menu")],
+        ]
+    )
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.message(AdminNotifyStates.waiting_for_cpu_threshold)
+async def process_cpu_threshold(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        if text == "/cancel":
+            await state.clear()
+            body, kb = await get_server_settings_summary()
+            await message.answer(body, parse_mode="HTML", reply_markup=kb)
+            return
+        await message.answer("Пожалуйста, введите число от 1 до 100 или отправьте /cancel.")
+        return
+
+    try:
+        val = int(text)
+        if not (1 <= val <= 100):
+            raise ValueError()
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Введите целое число от 1 до 100 (например: 80).")
+        return
+
+    await state.update_data(cpu_threshold=val)
+    await state.set_state(AdminNotifyStates.waiting_for_cpu_duration)
+
+    body = (
+        "⏳ <b>Настройка длительности превышения CPU</b>\n\n"
+        "Введите время в минутах, в течение которого CPU должен быть перегружен, чтобы сработал алерт (целое число от 1 до 60).\n"
+        "Например: <code>5</code>.\n\n"
+        "Для отмены отправьте /cancel."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_servers_menu")],
+        ]
+    )
+    await message.answer(body, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(AdminNotifyStates.waiting_for_cpu_duration)
+async def process_cpu_duration(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        if text == "/cancel":
+            await state.clear()
+            body, kb = await get_server_settings_summary()
+            await message.answer(body, parse_mode="HTML", reply_markup=kb)
+            return
+        await message.answer("Пожалуйста, введите число от 1 до 60 или отправьте /cancel.")
+        return
+
+    try:
+        val = int(text)
+        if not (1 <= val <= 60):
+            raise ValueError()
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Введите целое число от 1 до 60 (например: 5).")
+        return
+
+    data = await state.get_data()
+    threshold = data.get("cpu_threshold")
+
+    await db.set_setting(CPU_THRESHOLD_KEY, str(threshold))
+    await db.set_setting(CPU_SUSTAINED_MINUTES_KEY, str(val))
+
+    await state.clear()
+    body, kb = await get_server_settings_summary()
+    await message.answer(
+        f"✅ Настройки CPU успешно сохранены:\n"
+        f"• Порог CPU: <code>&gt; {threshold}%</code>\n"
+        f"• Время превышения: <code>{val} мин.</code>",
+        parse_mode="HTML"
+    )
+    await message.answer(body, parse_mode="HTML", reply_markup=kb)

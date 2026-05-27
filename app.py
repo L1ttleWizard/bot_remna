@@ -58,6 +58,8 @@ class AdminBroadcastStates(StatesGroup):
 class AdminNotifyStates(StatesGroup):
     waiting_for_days = State()
     waiting_for_text = State()
+    waiting_for_cpu_threshold = State()
+    waiting_for_cpu_duration = State()
 
 
 
@@ -71,6 +73,12 @@ CLIENT_NOTIFY_DAYS_KEY = "client_notify_days"
 ADMIN_NOTIFY_DAYS_KEY = "admin_notify_days"
 CLIENT_NOTIFY_TEXT_KEY = "client_notify_text"
 ADMIN_NOTIFY_TEXT_KEY = "admin_notify_text"
+
+# Server monitoring settings keys
+NODE_DOWN_NOTIFY_ENABLED_KEY = "node_down_notify_enabled"
+CPU_NOTIFY_ENABLED_KEY = "cpu_notify_enabled"
+CPU_THRESHOLD_KEY = "cpu_threshold"
+CPU_SUSTAINED_MINUTES_KEY = "cpu_sustained_minutes"
 
 
 
