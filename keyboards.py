@@ -44,6 +44,9 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
             InlineKeyboardButton(text="🔔 Уведомления", callback_data="admin_notify_settings"),
         ],
+        [
+            InlineKeyboardButton(text="📦 Создать бэкап", callback_data="admin_make_backup"),
+        ],
     ]
     if has_account:
         rows.append(
