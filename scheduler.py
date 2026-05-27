@@ -371,7 +371,7 @@ async def check_nodes_health(bot: Bot) -> None:
 
 
 async def check_cpu_load(bot: Bot) -> None:
-    """Периодическая проверка загрузки CPU на нодах (каждые 3 минуты)."""
+    """Периодическая проверка загрузки CPU на нодах (каждую минуту)."""
     # 1. Загрузка настроек
     enabled = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
     if not enabled:
@@ -411,24 +411,37 @@ async def check_cpu_load(bot: Bot) -> None:
         if not node_card:
             continue
 
+        sys_info = (node_card.get("system") or {}).get("info") or {}
         sys_stats = (node_card.get("system") or {}).get("stats") or {}
 
-        # Извлекаем CPU по разным возможным ключам
+        # Извлекаем CPU на основе loadAvg или по разным возможным ключам
+        load_avg = sys_stats.get("loadAvg") or []
+        cpus = sys_info.get("cpus") or 1
+
         cpu_usage = None
-        for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
-            val = sys_stats.get(key)
-            if val is not None:
-                try:
-                    f_val = float(val)
-                    # Эвристика: если значение <= 1.0 (например, 0.85 для 85%),
-                    # а порог задан как > 1.0 (например, 80), то переводим в проценты.
-                    if f_val <= 1.0 and f_val > 0.0 and threshold > 1.0:
-                        cpu_usage = f_val * 100.0
-                    else:
-                        cpu_usage = f_val
-                    break
-                except (ValueError, TypeError):
-                    pass
+        load_5m_pct = None
+        load_15m_pct = None
+
+        if isinstance(load_avg, list) and len(load_avg) >= 3:
+            load_5m_pct = (load_avg[1] / cpus) * 100.0
+            load_15m_pct = (load_avg[2] / cpus) * 100.0
+            cpu_usage = max(load_5m_pct, load_15m_pct)
+        else:
+            # Резервный поиск по старым ключам
+            for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
+                val = sys_stats.get(key)
+                if val is not None:
+                    try:
+                        f_val = float(val)
+                        # Эвристика: если значение <= 1.0 (например, 0.85 для 85%),
+                        # а порог задан как > 1.0 (например, 80), то переводим в проценты.
+                        if f_val <= 1.0 and f_val > 0.0 and threshold > 1.0:
+                            cpu_usage = f_val * 100.0
+                        else:
+                            cpu_usage = f_val
+                        break
+                    except (ValueError, TypeError):
+                        pass
 
         if cpu_usage is None:
             # CPU stats не поддерживаются или отсутствуют в ответе панели
@@ -447,11 +460,20 @@ async def check_cpu_load(bot: Bot) -> None:
                 if duration_sec >= sustained_minutes * 60:
                     if not alerted:
                         # Отправляем алерт админам
+                        if load_5m_pct is not None and load_15m_pct is not None:
+                            load_str = (
+                                f"Загрузка (5 мин): <b>{load_5m_pct:.1f}%</b>\n"
+                                f"Загрузка (15 мин): <b>{load_15m_pct:.1f}%</b>"
+                            )
+                        else:
+                            load_str = f"Загрузка CPU: <b>{cpu_usage:.1f}%</b>"
+
                         alert_text = (
                             f"⚠️ <b>Высокая загрузка CPU!</b>\n\n"
                             f"Сервер: <b>{name}</b>\n"
                             f"Адрес: <code>{address}:{port}</code>\n"
-                            f"Загрузка CPU: <b>{cpu_usage:.1f}%</b> (порог: {threshold}%)\n"
+                            f"{load_str}\n"
+                            f"Порог: {threshold}%\n"
                             f"Длительность: &gt; {sustained_minutes} мин."
                         )
                         for admin_id in admins:
@@ -466,11 +488,20 @@ async def check_cpu_load(bot: Bot) -> None:
             cpu_high = await db.get_cpu_high(uuid)
             if cpu_high and cpu_high["alerted"]:
                 # Отправляем сообщение о нормализации
+                if load_5m_pct is not None and load_15m_pct is not None:
+                    load_str = (
+                        f"Загрузка (5 мин): <b>{load_5m_pct:.1f}%</b>\n"
+                        f"Загрузка (15 мин): <b>{load_15m_pct:.1f}%</b>"
+                    )
+                else:
+                    load_str = f"Загрузка CPU: <b>{cpu_usage:.1f}%</b>"
+
                 recovery_text = (
                     f"🟢 <b>Загрузка CPU нормализовалась</b>\n\n"
                     f"Сервер: <b>{name}</b>\n"
                     f"Адрес: <code>{address}:{port}</code>\n"
-                    f"Загрузка CPU: <b>{cpu_usage:.1f}%</b> (порог: {threshold}%)"
+                    f"{load_str}\n"
+                    f"Порог: {threshold}%"
                 )
                 for admin_id in admins:
                     try:
