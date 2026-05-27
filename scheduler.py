@@ -511,3 +511,75 @@ async def check_cpu_load(bot: Bot) -> None:
                 logger.info("Sent CPU recovery for node %s (%s): %s%%", name, uuid, cpu_usage)
 
             await db.clear_cpu_high(uuid)
+
+
+async def run_daily_backup(bot: Bot, target_chat_id: int | str = None) -> bool:
+    """Создает zip-архив базы данных SQLite и файла .env, затем отправляет его в Telegram."""
+    import os
+    import zipfile
+    import html
+    from aiogram.types import FSInputFile
+    import config
+    from database import DB_PATH
+
+    chat_id = target_chat_id or config.BACKUP_TG_CHAT_ID
+    if not chat_id:
+        logger.warning("run_daily_backup: не настроен BACKUP_TG_CHAT_ID, бэкап отменен.")
+        return False
+
+    now_str = datetime.now(MSK).strftime("%d.%m.%Y_%H%M%S")
+    backup_filename = f"db_backup_{now_str}.zip"
+    
+    # В контейнерах Docker разрешена запись только в /tmp.
+    # На других хостах используем системную temp-папку или текущую директорию.
+    tmp_dir = "/tmp" if os.path.exists("/tmp") else os.environ.get("TEMP", ".")
+    backup_path = os.path.join(tmp_dir, backup_filename)
+
+    logger.info(f"Создание резервной копии в {backup_path}...")
+    try:
+        # Убедимся, что БД существует
+        if not os.path.exists(DB_PATH):
+            raise FileNotFoundError(f"Файл базы данных не найден по пути: {DB_PATH}")
+
+        with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            # Добавляем БД
+            zipf.write(DB_PATH, arcname=os.path.basename(DB_PATH))
+            # Добавляем .env, если он существует
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            if os.path.exists(env_path):
+                zipf.write(env_path, arcname=".env")
+            else:
+                # Попробуем найти в корне проекта
+                root_env = os.path.join(os.getcwd(), ".env")
+                if os.path.exists(root_env):
+                    zipf.write(root_env, arcname=".env")
+
+        logger.info(f"Архив {backup_filename} успешно создан. Отправка в Telegram (chat_id: {chat_id})...")
+        document = FSInputFile(backup_path, filename=backup_filename)
+        caption = f"📦 <b>Резервная копия бота</b>\n\n📅 Дата: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M:%S MSK')}\n📂 Файлы: {os.path.basename(DB_PATH)}, .env"
+        
+        await bot.send_document(chat_id=chat_id, document=document, caption=caption, parse_mode="HTML")
+        logger.info("Резервная копия успешно отправлена в Telegram.")
+        return True
+
+    except Exception as e:
+        logger.exception(f"Ошибка при создании или отправке бэкапа: {e}")
+        try:
+            await bot.send_message(
+                chat_id=chat_id, 
+                text=f"❌ <b>Ошибка при создании бэкапа:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as send_err:
+            logger.warning(f"Не удалось отправить уведомление об ошибке бэкапа: {send_err}")
+        return False
+
+    finally:
+        # Очищаем временный архив
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+                logger.info(f"Временный архив {backup_path} удален.")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный архив {backup_path}: {e}")
+
