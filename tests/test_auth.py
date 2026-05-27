@@ -681,3 +681,76 @@ def test_list_all_subscriptions_with_uuid(db_module):
     rows = asyncio.run(db_module.list_all_subscriptions_with_uuid())
     uuids = {r[1] for r in rows}
     assert uuids == {"x1", "x2"}
+
+
+def test_node_status_crud(db_module):
+    """Тестирование CRUD для таблицы node_status_log."""
+    asyncio.run(db_module.init_db())
+    uuid = "node-1-uuid"
+    name = "Server One"
+
+    # 1. Сначала записи нет
+    status = asyncio.run(db_module.get_node_status(uuid))
+    assert status is None
+
+    # 2. Вставляем статус (connected=True)
+    asyncio.run(db_module.upsert_node_status(uuid, name, is_connected=True, now_ts=1000))
+    status = asyncio.run(db_module.get_node_status(uuid))
+    assert status is not None
+    assert status["node_uuid"] == uuid
+    assert status["node_name"] == name
+    assert status["was_connected"] is True
+    assert status["alerted_down"] is False
+
+    # 3. Маркируем как alerted_down
+    asyncio.run(db_module.mark_node_alerted(uuid))
+    status = asyncio.run(db_module.get_node_status(uuid))
+    assert status["alerted_down"] is True
+
+    # 4. Вставляем статус (connected=False), alerted_down должен сохраниться
+    asyncio.run(db_module.upsert_node_status(uuid, name, is_connected=False, now_ts=2000))
+    status = asyncio.run(db_module.get_node_status(uuid))
+    assert status["was_connected"] is False
+    assert status["alerted_down"] is True
+
+    # 5. Очищаем алерт
+    asyncio.run(db_module.clear_node_alert(uuid))
+    status = asyncio.run(db_module.get_node_status(uuid))
+    assert status["alerted_down"] is False
+
+
+def test_cpu_load_crud(db_module):
+    """Тестирование CRUD для таблицы cpu_load_log."""
+    asyncio.run(db_module.init_db())
+    uuid = "node-2-uuid"
+    name = "Server Two"
+
+    # 1. Сначала записи нет
+    cpu_info = asyncio.run(db_module.get_cpu_high(uuid))
+    assert cpu_info is None
+
+    # 2. Вставляем перегрузку CPU
+    asyncio.run(db_module.upsert_cpu_high(uuid, name, now_ts=1000))
+    cpu_info = asyncio.run(db_module.get_cpu_high(uuid))
+    assert cpu_info is not None
+    assert cpu_info["node_uuid"] == uuid
+    assert cpu_info["node_name"] == name
+    assert cpu_info["first_high_ts"] == 1000
+    assert cpu_info["last_high_ts"] == 1000
+    assert cpu_info["alerted"] is False
+
+    # 3. Обновляем время перегрузки (last_high_ts)
+    asyncio.run(db_module.upsert_cpu_high(uuid, name, now_ts=1100))
+    cpu_info = asyncio.run(db_module.get_cpu_high(uuid))
+    assert cpu_info["first_high_ts"] == 1000
+    assert cpu_info["last_high_ts"] == 1100
+
+    # 4. Маркируем как alerted
+    asyncio.run(db_module.mark_cpu_alerted(uuid))
+    cpu_info = asyncio.run(db_module.get_cpu_high(uuid))
+    assert cpu_info["alerted"] is True
+
+    # 5. Очищаем перегрузку
+    asyncio.run(db_module.clear_cpu_high(uuid))
+    cpu_info = asyncio.run(db_module.get_cpu_high(uuid))
+    assert cpu_info is None

@@ -108,7 +108,11 @@ from keyboards import (
     subscription_user_keyboard,
     user_sub_menu_keyboard as _user_sub_menu_keyboard,
 )
-from scheduler import check_expiring_subscriptions
+from scheduler import (
+    check_expiring_subscriptions,
+    check_nodes_health,
+    check_cpu_load,
+)
 
 
 def _setup_logging() -> None:
@@ -2392,6 +2396,20 @@ async def main():
         "cron",
         hour=SCHEDULER_CRON_HOUR,
         minute=SCHEDULER_CRON_MINUTE,
+        args=[bot],
+    )
+    # Node availability check — every 2 minutes
+    scheduler.add_job(
+        check_nodes_health,
+        "interval",
+        minutes=2,
+        args=[bot],
+    )
+    # Node CPU load check — every 3 minutes
+    scheduler.add_job(
+        check_cpu_load,
+        "interval",
+        minutes=3,
         args=[bot],
     )
     scheduler.start()
