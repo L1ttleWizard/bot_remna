@@ -90,12 +90,12 @@ async def test_send_admin_sub_squads():
         assert isinstance(reply_markup_arg, InlineKeyboardMarkup)
 
         buttons = reply_markup_arg.inline_keyboard
-        squad_buttons = [btn for row in buttons for btn in row if btn.callback_data and "squad_set" in btn.callback_data]
+        squad_buttons = [btn for row in buttons for btn in row if btn.callback_data and "sq_s" in btn.callback_data]
         assert len(squad_buttons) == 2
         assert squad_buttons[0].text == "🟢 Squad Alpha"
-        assert squad_buttons[0].callback_data == "admu:12345:s:1:squad_set:squad-1"
+        assert squad_buttons[0].callback_data == "admu:12345:s:1:sq_s:0"
         assert squad_buttons[1].text == "🔴 Squad Beta"
-        assert squad_buttons[1].callback_data == "admu:12345:s:1:squad_set:squad-2"
+        assert squad_buttons[1].callback_data == "admu:12345:s:1:sq_s:1"
 
 
 @pytest.mark.asyncio
@@ -128,12 +128,14 @@ async def test_handle_admu_sub_squad_set_success():
     callback.answer = AsyncMock()
 
     mock_sub = (1, 12345, "user-uuid", "short-uuid", "username", 1700000000, "label", 12345, 1700000000)
+    mock_state = ([{"uuid": "squad-uuid-abc", "name": "Squad Alpha"}], set())
 
     with patch("bot.db.get_subscription", AsyncMock(return_value=mock_sub)), \
+         patch("bot._load_squads_state", AsyncMock(return_value=mock_state)), \
          patch("bot.api.patch_user", AsyncMock(return_value=True)) as mock_patch, \
          patch("bot._send_admin_sub_squads", AsyncMock()) as mock_send_squads:
 
-        await bot._handle_admu_sub(callback, 12345, 1, "squad_set", "squad-uuid-abc")
+        await bot._handle_admu_sub(callback, 12345, 1, "sq_s", "0")
 
         mock_patch.assert_called_once_with({"uuid": "user-uuid", "activeInternalSquads": ["squad-uuid-abc"]})
         callback.answer.assert_called_once_with("Сквад успешно изменен!")
@@ -150,12 +152,14 @@ async def test_handle_admu_sub_squad_set_failure():
     callback.answer = AsyncMock()
 
     mock_sub = (1, 12345, "user-uuid", "short-uuid", "username", 1700000000, "label", 12345, 1700000000)
+    mock_state = ([{"uuid": "squad-uuid-abc", "name": "Squad Alpha"}], set())
 
     with patch("bot.db.get_subscription", AsyncMock(return_value=mock_sub)), \
+         patch("bot._load_squads_state", AsyncMock(return_value=mock_state)), \
          patch("bot.api.patch_user", AsyncMock(return_value=False)) as mock_patch, \
          patch("bot._send_admin_sub_squads", AsyncMock()) as mock_send_squads:
 
-        await bot._handle_admu_sub(callback, 12345, 1, "squad_set", "squad-uuid-abc")
+        await bot._handle_admu_sub(callback, 12345, 1, "sq_s", "0")
 
         mock_patch.assert_called_once_with({"uuid": "user-uuid", "activeInternalSquads": ["squad-uuid-abc"]})
         callback.answer.assert_called_once_with("Не удалось сменить сквад.", show_alert=True)

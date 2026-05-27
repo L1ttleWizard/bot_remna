@@ -1717,9 +1717,12 @@ async def _load_squads_state(full_uuid: str) -> Optional[tuple[list[dict], set[s
     active: set[str] = set()
     if not isinstance(info, BaseException) and info and "response" in info:
         for sq in info["response"].get("activeInternalSquads") or []:
-            u = sq.get("uuid")
-            if u:
-                active.add(u)
+            if isinstance(sq, dict):
+                u = sq.get("uuid")
+                if u:
+                    active.add(u)
+            elif isinstance(sq, str):
+                active.add(sq)
     return squads, active
 
 
