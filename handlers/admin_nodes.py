@@ -92,6 +92,15 @@ def _node_card_keyboard(node: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def get_cores_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "ядро"
+    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "ядра"
+    else:
+        return "ядер"
+
+
 def _node_card_text(node: dict) -> str:
     name = html.escape(str(node.get("name") or "—"))
     addr = html.escape(str(node.get("address") or "—"))
@@ -126,8 +135,14 @@ def _node_card_text(node: dict) -> str:
     traffic_reset = html.escape(str(node.get("trafficResetDay") or "—"))
     # В новой схеме железо ноды лежит в node["system"]["info"] / ["stats"].
     sys_info = (node.get("system") or {}).get("info") or {}
+    sys_stats = (node.get("system") or {}).get("stats") or {}
+
     cpu = node.get("cpuModel") or sys_info.get("cpuModel")
+    cpus = sys_info.get("cpus") or 1
+    load_avg = sys_stats.get("loadAvg") or []
+
     total_ram = node.get("totalRam") or sys_info.get("memoryTotal")
+    used_ram = sys_stats.get("memoryUsed")
 
     lines = [
         f"🌐 <b>{name}</b> {f'({cc})' if cc else ''}",
@@ -155,13 +170,35 @@ def _node_card_text(node: dict) -> str:
         lines.append(f"Использовано: {html.escape(human_bytes(traffic_used))} (без лимита)")
     if node.get("trafficResetDay"):
         lines.append(f"Сброс трафика: число {traffic_reset} каждого месяца")
-    if cpu or total_ram:
+
+    if cpu or total_ram or load_avg:
         lines.append("")
         lines.append("🖥 <b>Железо</b>")
         if cpu:
-            lines.append(f"CPU: {html.escape(str(cpu))}")
+            cpu_cores = f" ({cpus} {get_cores_word(cpus)})" if cpus else ""
+            lines.append(f"  · CPU: {html.escape(str(cpu))}{cpu_cores}")
+        if load_avg and len(load_avg) >= 3:
+            load_1m_pct = (load_avg[0] / cpus) * 100.0
+            load_5m_pct = (load_avg[1] / cpus) * 100.0
+            load_15m_pct = (load_avg[2] / cpus) * 100.0
+
+            lines.append(f"  · Load Average: <code>{', '.join(f'{x:.2f}' for x in load_avg)}</code>")
+            lines.append(f"  · Загрузка (1/5/15 мин): <b>{load_1m_pct:.1f}%</b> / <b>{load_5m_pct:.1f}%</b> / <b>{load_15m_pct:.1f}%</b>")
         if total_ram:
-            lines.append(f"RAM: {html.escape(human_bytes(int(total_ram)))}")
+            try:
+                total_ram_val = int(total_ram)
+                if used_ram is not None:
+                    used_ram_val = int(used_ram)
+                    ram_pct = (used_ram_val / total_ram_val) * 100.0
+                    lines.append(
+                        f"  · RAM: <b>{html.escape(human_bytes(used_ram_val))}</b> / "
+                        f"{html.escape(human_bytes(total_ram_val))} "
+                        f"(<b>{ram_pct:.1f}%</b>)"
+                    )
+                else:
+                    lines.append(f"  · RAM: {html.escape(human_bytes(total_ram_val))}")
+            except (ValueError, TypeError):
+                lines.append(f"  · RAM: {html.escape(str(total_ram))}")
     lines.append("")
     lines.append(f"Последнее изменение статуса: {last_status_change}")
     if last_status_msg and last_status_msg != "—":

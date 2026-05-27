@@ -2405,11 +2405,11 @@ async def main():
         minutes=2,
         args=[bot],
     )
-    # Node CPU load check — every 3 minutes
+    # Node CPU load check — every 1 minute
     scheduler.add_job(
         check_cpu_load,
         "interval",
-        minutes=3,
+        minutes=1,
         args=[bot],
     )
     scheduler.start()
