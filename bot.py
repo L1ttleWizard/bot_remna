@@ -840,6 +840,20 @@ async def cb_admin_panel(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "admin_make_backup")
+async def cb_admin_make_backup(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("🔄 Запуск создания резервной копии...")
+    status_msg = await callback.message.answer("🔄 Создаю резервную копию...")
+    success = await run_daily_backup(bot, target_chat_id=callback.message.chat.id)
+    if success:
+        await status_msg.edit_text("✅ Резервная копия успешно создана и отправлена!")
+    else:
+        await status_msg.edit_text("❌ Ошибка при создании резервной копии. Подробности в логах.")
+
+
 @dp.callback_query(F.data.startswith("admin_users:"))
 async def cb_admin_users(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
