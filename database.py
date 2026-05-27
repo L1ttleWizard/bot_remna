@@ -1086,3 +1086,14 @@ async def list_expiring_and_expired_subscriptions(start_ts: int, end_ts: int) ->
         ) as cursor:
             return list(await cursor.fetchall())
 
+
+async def get_admins_profiles() -> list:
+    """Возвращает список администраторов с профилями: (tg_id, tg_username, tg_first_name, tg_last_name)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT tg_id, tg_username, tg_first_name, tg_last_name FROM users WHERE role = ?",
+            (ROLE_ADMIN,),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+

@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -15,6 +16,7 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -28,6 +30,7 @@ from app import (
     AdminDmStates,
     AdminSearchStates,
     PromoStates,
+    SUPPORT_KEY,
     api,
     bot,
     dp,
@@ -260,13 +263,67 @@ async def _show_start_menu(message: Message) -> None:
             reply_markup=main_keyboard_user(),
         )
         return
-    await message.answer(
-        "🔒 Доступ только по приглашению.\n\n"
+
+    # Fetch support/admin contacts
+    support_text = await db.get_setting(SUPPORT_KEY)
+    contacts_str = ""
+    if support_text and support_text.strip():
+        contacts_str = f"<b>Контакты поддержки:</b>\n{support_text.strip()}"
+    else:
+        admins = []
+        try:
+            admin_profiles = await db.get_admins_profiles()
+            for admin_id, admin_username, first_name, last_name in admin_profiles:
+                if admin_username:
+                    admins.append(f"@{admin_username}")
+                else:
+                    name_parts = []
+                    if first_name:
+                        name_parts.append(first_name)
+                    if last_name:
+                        name_parts.append(last_name)
+                    name = " ".join(name_parts) or f"ID: {admin_id}"
+                    admins.append(f'<a href="tg://user?id={admin_id}">{html.escape(name)}</a>')
+        except Exception as e:
+            logger.error("Failed to fetch admin contacts for start menu: %s", e)
+
+        # Fallback to ADMIN_TG_IDS from config
+        if not admins and ADMIN_TG_IDS:
+            for admin_id in ADMIN_TG_IDS:
+                admins.append(f'<a href="tg://user?id={admin_id}">Администратор</a>')
+
+        if admins:
+            contacts_str = "<b>Контакты администраторов:</b>\n" + "\n".join(f"• {a}" for a in admins)
+
+    caption = (
+        "🔒 <b>Доступ только по приглашению</b>\n\n"
         "Получите токен у администратора и активируйте его командой:\n"
         "<code>/redeem ВАШ_ТОКЕН</code>\n\n"
-        "Либо перейдите по ссылке-приглашению, которую выдал администратор.",
+        "Либо перейдите по ссылке-приглашению, которую выдал администратор."
+    )
+    if contacts_str:
+        caption += f"\n\n{contacts_str}"
+
+    # Try to send welcome photo
+    photo_path = os.path.join(os.path.dirname(__file__), "welcome.png")
+    if os.path.isfile(photo_path):
+        try:
+            photo = FSInputFile(photo_path)
+            await message.answer_photo(
+                photo=photo,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            return
+        except Exception as e:
+            logger.error("Failed to send welcome photo: %s", e)
+
+    # Fallback to text-only message
+    await message.answer(
+        caption,
         parse_mode="HTML",
     )
+
 
 
 # --- /redeem ---
