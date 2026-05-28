@@ -1080,9 +1080,13 @@ async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: 
         f"<b>Действует до:</b> {html.escape(expire_str)}\n"
         f"<b>Ссылка:</b> <code>{html.escape(sub_url)}</code>"
     )
+    
+    subs = await db.list_subscriptions(callback.from_user.id)
+    has_multiple = len(subs) > 1
+
     await safe_edit(
         callback, text, parse_mode="HTML",
-        reply_markup=_user_sub_menu_keyboard(sid), prefer_edit=prefer_edit,
+        reply_markup=_user_sub_menu_keyboard(sid, has_multiple), prefer_edit=prefer_edit,
     )
     await callback.answer()
 
