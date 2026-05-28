@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
@@ -107,8 +108,36 @@ class TgProfileMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class ClearStateOnNavigationMiddleware(BaseMiddleware):
+    """Сбрасывает состояние FSM при переходе по навигационным inline-кнопкам."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, CallbackQuery) and event.data:
+            data_str = event.data
+            is_fsm_button = (
+                (data_str.startswith("addnode:") and data_str != "addnode:start") or
+                data_str.startswith("promo:") or
+                data_str == "promo_cancel" or
+                data_str.startswith("admin_users_qp:")
+            )
+            if not is_fsm_button:
+                state: Optional[FSMContext] = data.get("state")
+                if state:
+                    current_state = await state.get_state()
+                    if current_state is not None:
+                        await state.clear()
+                        logger.info("FSM state cleared automatically on navigation click: %s", data_str)
+        return await handler(event, data)
+
+
 dp.message.middleware(TgProfileMiddleware())
 dp.callback_query.middleware(TgProfileMiddleware())
+dp.callback_query.outer_middleware(ClearStateOnNavigationMiddleware())
 
 
 # --- Общие утилиты ---

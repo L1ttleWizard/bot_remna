@@ -22,7 +22,7 @@ from aiogram.types import (
 
 import auth
 import database as db
-from app import dp, ensure_sub_belongs_to_user, safe_edit
+from app import dp, ensure_sub_belongs_to_user, safe_edit, sync_local_expire_from_panel
 from clients import CLIENT_CATALOG, PLATFORM_TITLES, connect_platform_keyboard
 from config import SUB_DOMAIN
 from formatters import format_sub_caption
@@ -49,7 +49,18 @@ async def cb_connect(callback: CallbackQuery):
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
+    
+    # Sync expire dates from panel first
     subs = await db.list_subscriptions(callback.from_user.id)
+    if subs:
+        import asyncio
+        await asyncio.gather(
+            *(sync_local_expire_from_panel(callback.from_user.id, sub[1]) for sub in subs),
+            return_exceptions=True,
+        )
+        # Refetch fresh subscriptions from DB
+        subs = await db.list_subscriptions(callback.from_user.id)
+
     if not subs:
         await safe_edit(
             callback,
