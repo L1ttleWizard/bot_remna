@@ -397,7 +397,7 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
 def _build_invite_link(bot_username: Optional[str], raw_token: str) -> Optional[str]:
     if not bot_username:
         return None
-    return f"https://t.me/{bot_username}?start={raw_token}"
+    return f"t.me/{bot_username}?start={raw_token}"
 
 
 @dp.message(Command("issue_token"))
@@ -1239,6 +1239,13 @@ async def cb_my_settings(callback: CallbackQuery):
     if not user_data:
         return
     full_uuid = user_data[1]
+    # Sync expire date before loading
+    await sync_local_expire_from_panel(callback.from_user.id, full_uuid)
+    # Refetch fresh user data
+    user_data = await db.get_user(callback.from_user.id)
+    if not user_data:
+        return
+    full_uuid = user_data[1]
     short_uuid = user_data[2]
     expire_timestamp = user_data[4]
     expire_date_str = (
@@ -1279,6 +1286,8 @@ async def cb_my_subscription(callback: CallbackQuery):
     if not user_data:
         return
     full_uuid = user_data[1]
+    # Sync expire date before loading
+    await sync_local_expire_from_panel(callback.from_user.id, full_uuid)
     text = await load_subscription_text(full_uuid)
     text += (
         "\n\nℹ️ Продление подписки доступно только администратору. "
@@ -1381,6 +1390,13 @@ async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tup
 
 
 async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
+    # Sync all subscriptions of the target user before fetching the profile info.
+    subs_to_sync = await db.list_subscriptions(target_tg)
+    if subs_to_sync:
+        await asyncio.gather(
+            *(sync_local_expire_from_panel(target_tg, s[1]) for s in subs_to_sync),
+            return_exceptions=True,
+        )
     full = await db.get_user_full(target_tg)
     if not full:
         await safe_edit(
@@ -1437,6 +1453,10 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
     rows.append([InlineKeyboardButton(
         text="➕ Привязать подписку из Remnawave",
         callback_data=f"admu:{target_tg}:link:0",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="выдать подписку вручную",
+        callback_data=f"admu:{target_tg}:sub_create_manual",
     )])
     rows.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admu:{target_tg}:del")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
@@ -2040,6 +2060,27 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
     if action == "open":
         await _send_admin_user_card(callback, target_tg, prefer_edit=True)
         await callback.answer()
+        return
+
+    if action == "sub_create_manual":
+        full = await db.get_user_full(target_tg)
+        tg_username = full[6] if full else None
+        tg_first_name = full[7] if full else None
+        
+        sub_url = await create_account_for_user(
+            tg_id=target_tg,
+            expire_days=DEFAULT_TOKEN_EXPIRE_DAYS,
+            hwid_device_limit=DEFAULT_TOKEN_HWID_LIMIT,
+            created_by=callback.from_user.id,
+            tg_username=tg_username,
+            tg_first_name=tg_first_name,
+        )
+        if sub_url:
+            await callback.answer("✅ Подписка успешно создана и привязана.")
+        else:
+            await callback.answer("❌ Не удалось создать подписку в панели.", show_alert=True)
+            
+        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
         return
 
     if action == "link":
