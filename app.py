@@ -59,6 +59,8 @@ async def custom_call(self, method, *args, **kwargs):
 
     if is_msg:
         try:
+            if res.document is not None:
+                return res
             chat_type = res.chat.type
             chat_id = res.chat.id
             message_id = res.message_id
@@ -74,6 +76,8 @@ async def custom_call(self, method, *args, **kwargs):
                 is_msg = False
             if is_msg:
                 try:
+                    if item.document is not None:
+                        continue
                     chat_type = item.chat.type
                     chat_id = item.chat.id
                     message_id = item.message_id
