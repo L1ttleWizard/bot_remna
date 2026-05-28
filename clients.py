@@ -197,7 +197,8 @@ PLATFORM_TITLES = {
 }
 
 
-def connect_platform_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+def connect_platform_keyboard(sub_id: int, has_multiple: bool = True) -> InlineKeyboardMarkup:
+    back_cb = "connect" if has_multiple else "back_main"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=PLATFORM_TITLES["ios"], callback_data=f"connect_p:{sub_id}:ios")],
@@ -205,6 +206,6 @@ def connect_platform_keyboard(sub_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=PLATFORM_TITLES["windows"], callback_data=f"connect_p:{sub_id}:windows")],
             [InlineKeyboardButton(text=PLATFORM_TITLES["macos"], callback_data=f"connect_p:{sub_id}:macos")],
             [InlineKeyboardButton(text=PLATFORM_TITLES["linux"], callback_data=f"connect_p:{sub_id}:linux")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="connect")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=back_cb)],
         ]
     )

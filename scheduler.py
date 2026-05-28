@@ -371,7 +371,7 @@ async def check_nodes_health(bot: Bot) -> None:
 
 
 async def check_cpu_load(bot: Bot) -> None:
-    """Периодическая проверка загрузки CPU на нодах (каждые 3 минуты)."""
+    """Периодическая проверка загрузки CPU на нодах (каждую минуту)."""
     # 1. Загрузка настроек
     enabled = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
     if not enabled:
@@ -411,24 +411,37 @@ async def check_cpu_load(bot: Bot) -> None:
         if not node_card:
             continue
 
+        sys_info = (node_card.get("system") or {}).get("info") or {}
         sys_stats = (node_card.get("system") or {}).get("stats") or {}
 
-        # Извлекаем CPU по разным возможным ключам
+        # Извлекаем CPU на основе loadAvg или по разным возможным ключам
+        load_avg = sys_stats.get("loadAvg") or []
+        cpus = sys_info.get("cpus") or 1
+
         cpu_usage = None
-        for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
-            val = sys_stats.get(key)
-            if val is not None:
-                try:
-                    f_val = float(val)
-                    # Эвристика: если значение <= 1.0 (например, 0.85 для 85%),
-                    # а порог задан как > 1.0 (например, 80), то переводим в проценты.
-                    if f_val <= 1.0 and f_val > 0.0 and threshold > 1.0:
-                        cpu_usage = f_val * 100.0
-                    else:
-                        cpu_usage = f_val
-                    break
-                except (ValueError, TypeError):
-                    pass
+        load_5m_pct = None
+        load_15m_pct = None
+
+        if isinstance(load_avg, list) and len(load_avg) >= 3:
+            load_5m_pct = (load_avg[1] / cpus) * 100.0
+            load_15m_pct = (load_avg[2] / cpus) * 100.0
+            cpu_usage = max(load_5m_pct, load_15m_pct)
+        else:
+            # Резервный поиск по старым ключам
+            for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
+                val = sys_stats.get(key)
+                if val is not None:
+                    try:
+                        f_val = float(val)
+                        # Эвристика: если значение <= 1.0 (например, 0.85 для 85%),
+                        # а порог задан как > 1.0 (например, 80), то переводим в проценты.
+                        if f_val <= 1.0 and f_val > 0.0 and threshold > 1.0:
+                            cpu_usage = f_val * 100.0
+                        else:
+                            cpu_usage = f_val
+                        break
+                    except (ValueError, TypeError):
+                        pass
 
         if cpu_usage is None:
             # CPU stats не поддерживаются или отсутствуют в ответе панели
@@ -447,11 +460,20 @@ async def check_cpu_load(bot: Bot) -> None:
                 if duration_sec >= sustained_minutes * 60:
                     if not alerted:
                         # Отправляем алерт админам
+                        if load_5m_pct is not None and load_15m_pct is not None:
+                            load_str = (
+                                f"Загрузка (5 мин): <b>{load_5m_pct:.1f}%</b>\n"
+                                f"Загрузка (15 мин): <b>{load_15m_pct:.1f}%</b>"
+                            )
+                        else:
+                            load_str = f"Загрузка CPU: <b>{cpu_usage:.1f}%</b>"
+
                         alert_text = (
                             f"⚠️ <b>Высокая загрузка CPU!</b>\n\n"
                             f"Сервер: <b>{name}</b>\n"
                             f"Адрес: <code>{address}:{port}</code>\n"
-                            f"Загрузка CPU: <b>{cpu_usage:.1f}%</b> (порог: {threshold}%)\n"
+                            f"{load_str}\n"
+                            f"Порог: {threshold}%\n"
                             f"Длительность: &gt; {sustained_minutes} мин."
                         )
                         for admin_id in admins:
@@ -466,11 +488,20 @@ async def check_cpu_load(bot: Bot) -> None:
             cpu_high = await db.get_cpu_high(uuid)
             if cpu_high and cpu_high["alerted"]:
                 # Отправляем сообщение о нормализации
+                if load_5m_pct is not None and load_15m_pct is not None:
+                    load_str = (
+                        f"Загрузка (5 мин): <b>{load_5m_pct:.1f}%</b>\n"
+                        f"Загрузка (15 мин): <b>{load_15m_pct:.1f}%</b>"
+                    )
+                else:
+                    load_str = f"Загрузка CPU: <b>{cpu_usage:.1f}%</b>"
+
                 recovery_text = (
                     f"🟢 <b>Загрузка CPU нормализовалась</b>\n\n"
                     f"Сервер: <b>{name}</b>\n"
                     f"Адрес: <code>{address}:{port}</code>\n"
-                    f"Загрузка CPU: <b>{cpu_usage:.1f}%</b> (порог: {threshold}%)"
+                    f"{load_str}\n"
+                    f"Порог: {threshold}%"
                 )
                 for admin_id in admins:
                     try:
@@ -480,3 +511,75 @@ async def check_cpu_load(bot: Bot) -> None:
                 logger.info("Sent CPU recovery for node %s (%s): %s%%", name, uuid, cpu_usage)
 
             await db.clear_cpu_high(uuid)
+
+
+async def run_daily_backup(bot: Bot, target_chat_id: int | str = None) -> bool:
+    """Создает zip-архив базы данных SQLite и файла .env, затем отправляет его в Telegram."""
+    import os
+    import zipfile
+    import html
+    from aiogram.types import FSInputFile
+    import config
+    from database import DB_PATH
+
+    chat_id = target_chat_id or config.BACKUP_TG_CHAT_ID
+    if not chat_id:
+        logger.warning("run_daily_backup: не настроен BACKUP_TG_CHAT_ID, бэкап отменен.")
+        return False
+
+    now_str = datetime.now(MSK).strftime("%d.%m.%Y_%H%M%S")
+    backup_filename = f"db_backup_{now_str}.zip"
+    
+    # В контейнерах Docker разрешена запись только в /tmp.
+    # На других хостах используем системную temp-папку или текущую директорию.
+    tmp_dir = "/tmp" if os.path.exists("/tmp") else os.environ.get("TEMP", ".")
+    backup_path = os.path.join(tmp_dir, backup_filename)
+
+    logger.info(f"Создание резервной копии в {backup_path}...")
+    try:
+        # Убедимся, что БД существует
+        if not os.path.exists(DB_PATH):
+            raise FileNotFoundError(f"Файл базы данных не найден по пути: {DB_PATH}")
+
+        with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            # Добавляем БД
+            zipf.write(DB_PATH, arcname=os.path.basename(DB_PATH))
+            # Добавляем .env, если он существует
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            if os.path.exists(env_path):
+                zipf.write(env_path, arcname=".env")
+            else:
+                # Попробуем найти в корне проекта
+                root_env = os.path.join(os.getcwd(), ".env")
+                if os.path.exists(root_env):
+                    zipf.write(root_env, arcname=".env")
+
+        logger.info(f"Архив {backup_filename} успешно создан. Отправка в Telegram (chat_id: {chat_id})...")
+        document = FSInputFile(backup_path, filename=backup_filename)
+        caption = f"📦 <b>Резервная копия бота</b>\n\n📅 Дата: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M:%S MSK')}\n📂 Файлы: {os.path.basename(DB_PATH)}, .env"
+        
+        await bot.send_document(chat_id=chat_id, document=document, caption=caption, parse_mode="HTML")
+        logger.info("Резервная копия успешно отправлена в Telegram.")
+        return True
+
+    except Exception as e:
+        logger.exception(f"Ошибка при создании или отправке бэкапа: {e}")
+        try:
+            await bot.send_message(
+                chat_id=chat_id, 
+                text=f"❌ <b>Ошибка при создании бэкапа:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as send_err:
+            logger.warning(f"Не удалось отправить уведомление об ошибке бэкапа: {send_err}")
+        return False
+
+    finally:
+        # Очищаем временный архив
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+                logger.info(f"Временный архив {backup_path} удален.")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный архив {backup_path}: {e}")
+

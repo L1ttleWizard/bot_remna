@@ -114,6 +114,35 @@ def test_get_node(api_instance):
     assert out == {"response": {"uuid": "abc"}}
 
 
+def test_get_node_with_system_stats(api_instance):
+    mock_payload = {
+        "response": {
+            "uuid": "abc",
+            "name": "Server 1",
+            "system": {
+                "stats": {
+                    "cpu": 45.0,
+                    "cpuUsage": 45.0,
+                },
+                "info": {
+                    "cpuModel": "Intel Xeon",
+                    "memoryTotal": 8589934592,
+                }
+            }
+        }
+    }
+
+    def on_req(method, url, kw):
+        assert method == "GET"
+        assert url.endswith("/api/nodes/abc")
+        return _FakeResp(200, json_data=mock_payload)
+
+    with _patch_session(on_req):
+        out = asyncio.run(api_instance.get_node("abc"))
+    assert out == mock_payload
+
+
+
 @pytest.mark.parametrize("action,method,url_suffix", [
     ("enable", "enable_node", "/api/nodes/abc/actions/enable"),
     ("disable", "disable_node", "/api/nodes/abc/actions/disable"),
@@ -212,3 +241,48 @@ def test_build_add_node_command_escapes_special_chars():
     # SNI с пробелами/спецсимволами должен быть в кавычках, не вызвать инъекцию.
     assert "'sni; rm -rf /'" in cmd
     assert "rm -rf /" not in cmd.split("'sni; rm -rf /'")[0]
+
+
+def test_get_cores_word():
+    from handlers.admin_nodes import get_cores_word
+    assert get_cores_word(1) == "ядро"
+    assert get_cores_word(2) == "ядра"
+    assert get_cores_word(4) == "ядра"
+    assert get_cores_word(5) == "ядер"
+    assert get_cores_word(11) == "ядер"
+    assert get_cores_word(21) == "ядро"
+
+
+def test_node_card_text_rendering():
+    from handlers.admin_nodes import _node_card_text
+    node = {
+        "name": "Test Node",
+        "address": "1.2.3.4",
+        "port": 1234,
+        "countryCode": "DE",
+        "isDisabled": False,
+        "isConnected": True,
+        "xrayUptime": 3600,
+        "usersOnline": 5,
+        "trafficUsedBytes": 1024**3,
+        "trafficLimitBytes": 10 * 1024**3,
+        "system": {
+            "info": {
+                "cpuModel": "Intel i7",
+                "cpus": 4,
+                "memoryTotal": 8 * 1024**3
+            },
+            "stats": {
+                "loadAvg": [0.4, 0.8, 1.2],
+                "memoryUsed": 2 * 1024**3
+            }
+        }
+    }
+    text = _node_card_text(node)
+    assert "Test Node" in text
+    assert "1.2.3.4:1234" in text
+    assert "Intel i7 (4 ядра)" in text
+    assert "Load Average: <code>0.40, 0.80, 1.20</code>" in text
+    assert "Загрузка (1/5/15 мин): <b>10.0%</b> / <b>20.0%</b> / <b>30.0%</b>" in text
+    assert "RAM: <b>2 ГБ</b> / 8 ГБ (<b>25.0%</b>)" in text
+

@@ -44,6 +44,9 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
             InlineKeyboardButton(text="🔔 Уведомления", callback_data="admin_notify_settings"),
         ],
+        [
+            InlineKeyboardButton(text="📦 Создать бэкап", callback_data="admin_make_backup"),
+        ],
     ]
     if has_account:
         rows.append(
@@ -105,7 +108,12 @@ def subscription_user_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+def user_sub_menu_keyboard(sub_id: int, has_multiple: bool = True) -> InlineKeyboardMarkup:
+    back_btn = (
+        InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")
+        if has_multiple
+        else InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="back_main")
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -113,7 +121,7 @@ def user_sub_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}"),
             ],
             [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
-            [InlineKeyboardButton(text="◀️ К списку подписок", callback_data="my_subs")],
+            [back_btn],
         ]
     )
 

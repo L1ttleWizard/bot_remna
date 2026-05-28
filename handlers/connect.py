@@ -22,7 +22,13 @@ from aiogram.types import (
 
 import auth
 import database as db
-from app import dp, ensure_sub_belongs_to_user, safe_edit
+from app import (
+    delete_active_bot_messages,
+    dp,
+    ensure_sub_belongs_to_user,
+    safe_edit,
+    sync_local_expire_from_panel,
+)
 from clients import CLIENT_CATALOG, PLATFORM_TITLES, connect_platform_keyboard
 from config import SUB_DOMAIN
 from formatters import format_sub_caption
@@ -37,9 +43,12 @@ async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> N
         "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
         "deep-link для импорта одной кнопкой и QR-код."
     )
+    subs = await db.list_subscriptions(callback.from_user.id)
+    has_multiple = len(subs) > 1
+
     await safe_edit(
         callback, text, parse_mode="HTML",
-        reply_markup=connect_platform_keyboard(sub_id), prefer_edit=True,
+        reply_markup=connect_platform_keyboard(sub_id, has_multiple), prefer_edit=True,
     )
     await callback.answer()
 
@@ -49,7 +58,18 @@ async def cb_connect(callback: CallbackQuery):
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
+    
+    # Sync expire dates from panel first
     subs = await db.list_subscriptions(callback.from_user.id)
+    if subs:
+        import asyncio
+        await asyncio.gather(
+            *(sync_local_expire_from_panel(callback.from_user.id, sub[1]) for sub in subs),
+            return_exceptions=True,
+        )
+        # Refetch fresh subscriptions from DB
+        subs = await db.list_subscriptions(callback.from_user.id)
+
     if not subs:
         await safe_edit(
             callback,
@@ -166,8 +186,17 @@ async def cb_connect_platform(callback: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")])
     kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await callback.message.answer(
-        "\n".join(lines),
+    tg_id = callback.from_user.id
+    # Delete the previous platform picker menu and other old messages
+    await delete_active_bot_messages(callback.bot, tg_id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await callback.bot.send_message(
+        chat_id=tg_id,
+        text="\n".join(lines),
         parse_mode="HTML",
         reply_markup=kb,
         disable_web_page_preview=True,
@@ -179,7 +208,8 @@ async def cb_connect_platform(callback: CallbackQuery):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            await callback.message.answer_photo(
+            await callback.bot.send_photo(
+                chat_id=tg_id,
                 photo=BufferedInputFile(buf.read(), filename="subscription.png"),
                 caption="QR-код подписки. Отсканируйте в выбранном клиенте.",
             )

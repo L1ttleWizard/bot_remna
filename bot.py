@@ -73,6 +73,9 @@ from config import (
     SCHEDULER_CRON_MINUTE,
     SCHEDULER_TIMEZONE,
     SUB_DOMAIN,
+    BACKUP_TG_CHAT_ID,
+    BACKUP_CRON_HOUR,
+    BACKUP_CRON_MINUTE,
 )
 from formatters import (
     DEFAULT_HWID_DEVICE_LIMIT,
@@ -112,6 +115,7 @@ from scheduler import (
     check_expiring_subscriptions,
     check_nodes_health,
     check_cpu_load,
+    run_daily_backup,
 )
 
 
@@ -339,6 +343,7 @@ async def cmd_redeem(message: Message, command: CommandObject):
         await message.answer(
             "Использование: <code>/redeem ВАШ_ТОКЕН</code>",
             parse_mode="HTML",
+            reply_markup=back_only_keyboard(),
         )
         return
     await _try_redeem_token(message, raw)
@@ -351,7 +356,8 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
     if token is None:
         await message.answer(
             "❌ Токен недействителен, уже использован или отозван.\n"
-            "Обратитесь к администратору."
+            "Обратитесь к администратору.",
+            reply_markup=back_only_keyboard(),
         )
         return
 
@@ -364,7 +370,8 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
     )
     if not sub_url:
         await message.answer(
-            "❌ Не удалось создать аккаунт в панели. Сообщите администратору."
+            "❌ Не удалось создать аккаунт в панели. Сообщите администратору.",
+            reply_markup=back_only_keyboard(),
         )
         return
 
@@ -393,7 +400,7 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
 def _build_invite_link(bot_username: Optional[str], raw_token: str) -> Optional[str]:
     if not bot_username:
         return None
-    return f"https://t.me/{bot_username}?start={raw_token}"
+    return f"t.me/{bot_username}?start={raw_token}"
 
 
 @dp.message(Command("issue_token"))
@@ -474,6 +481,19 @@ async def cmd_admin(message: Message):
         "🛠 Админская панель",
         reply_markup=main_keyboard_admin(message.from_user.id, has_account),
     )
+
+
+@dp.message(Command("make_backup"))
+async def cmd_make_backup(message: Message):
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+    await message.answer("🔄 Запуск создания резервной копии...")
+    success = await run_daily_backup(bot, target_chat_id=message.chat.id)
+    if success:
+        await message.answer("✅ Резервная копия успешно создана и отправлена!")
+    else:
+        await message.answer("❌ Ошибка при создании резервной копии. Подробности в логах.")
 
 
 ADMIN_HELP_TEXT = (
@@ -823,6 +843,20 @@ async def cb_admin_panel(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "admin_make_backup")
+async def cb_admin_make_backup(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("🔄 Запуск создания резервной копии...")
+    status_msg = await callback.message.answer("🔄 Создаю резервную копию...")
+    success = await run_daily_backup(bot, target_chat_id=callback.message.chat.id)
+    if success:
+        await status_msg.edit_text("✅ Резервная копия успешно создана и отправлена!")
+    else:
+        await status_msg.edit_text("❌ Ошибка при создании резервной копии. Подробности в логах.")
+
+
 @dp.callback_query(F.data.startswith("admin_users:"))
 async def cb_admin_users(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -843,9 +877,12 @@ async def cb_admin_users_search(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     await state.set_state(AdminSearchStates.waiting_for_query)
-    await callback.message.answer(
+    await safe_edit(
+        callback,
         "🔎 Введите подстроку для поиска: tg_id, @username, имя/фамилия или username "
         "аккаунта в Remnawave (можно частично). /cancel — отменить.",
+        parse_mode="HTML",
+        prefer_edit=True,
     )
     await callback.answer()
 
@@ -858,7 +895,7 @@ async def admin_search_capture(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text == "/cancel":
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("Отменено.", reply_markup=back_only_keyboard())
         return
     if not text:
         await message.answer("Запрос не может быть пустым. /cancel — отменить.")
@@ -932,7 +969,7 @@ async def cb_admin_issue_token(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
     )
-    await callback.message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=kb)
+    await safe_edit(callback, "\n".join(text_lines), parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer("Токен выдан")
 
 
@@ -1049,9 +1086,13 @@ async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: 
         f"<b>Действует до:</b> {html.escape(expire_str)}\n"
         f"<b>Ссылка:</b> <code>{html.escape(sub_url)}</code>"
     )
+    
+    subs = await db.list_subscriptions(callback.from_user.id)
+    has_multiple = len(subs) > 1
+
     await safe_edit(
         callback, text, parse_mode="HTML",
-        reply_markup=_user_sub_menu_keyboard(sid), prefer_edit=prefer_edit,
+        reply_markup=_user_sub_menu_keyboard(sid, has_multiple), prefer_edit=prefer_edit,
     )
     await callback.answer()
 
@@ -1208,6 +1249,13 @@ async def cb_my_settings(callback: CallbackQuery):
     if not user_data:
         return
     full_uuid = user_data[1]
+    # Sync expire date before loading
+    await sync_local_expire_from_panel(callback.from_user.id, full_uuid)
+    # Refetch fresh user data
+    user_data = await db.get_user(callback.from_user.id)
+    if not user_data:
+        return
+    full_uuid = user_data[1]
     short_uuid = user_data[2]
     expire_timestamp = user_data[4]
     expire_date_str = (
@@ -1238,7 +1286,13 @@ async def cb_my_settings(callback: CallbackQuery):
         f"🔗 **Ваша ссылка для подключения:**\n`{sub_url}`\n\n"
         "*(Скопируйте ссылку и обновите в приложении)*"
     )
-    await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_only_keyboard())
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True,
+    )
     await callback.answer()
 
 
@@ -1248,6 +1302,8 @@ async def cb_my_subscription(callback: CallbackQuery):
     if not user_data:
         return
     full_uuid = user_data[1]
+    # Sync expire date before loading
+    await sync_local_expire_from_panel(callback.from_user.id, full_uuid)
     text = await load_subscription_text(full_uuid)
     text += (
         "\n\nℹ️ Продление подписки доступно только администратору. "
@@ -1300,10 +1356,7 @@ async def cb_back_main(callback: CallbackQuery):
     else:
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
 
 
@@ -1350,6 +1403,13 @@ async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tup
 
 
 async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
+    # Sync all subscriptions of the target user before fetching the profile info.
+    subs_to_sync = await db.list_subscriptions(target_tg)
+    if subs_to_sync:
+        await asyncio.gather(
+            *(sync_local_expire_from_panel(target_tg, s[1]) for s in subs_to_sync),
+            return_exceptions=True,
+        )
     full = await db.get_user_full(target_tg)
     if not full:
         await safe_edit(
@@ -1406,6 +1466,10 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
     rows.append([InlineKeyboardButton(
         text="➕ Привязать подписку из Remnawave",
         callback_data=f"admu:{target_tg}:link:0",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="выдать подписку вручную",
+        callback_data=f"admu:{target_tg}:sub_create_manual",
     )])
     rows.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admu:{target_tg}:del")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admin_users:0")])
@@ -2011,6 +2075,27 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    if action == "sub_create_manual":
+        full = await db.get_user_full(target_tg)
+        tg_username = full[6] if full else None
+        tg_first_name = full[7] if full else None
+        
+        sub_url = await create_account_for_user(
+            tg_id=target_tg,
+            expire_days=DEFAULT_TOKEN_EXPIRE_DAYS,
+            hwid_device_limit=DEFAULT_TOKEN_HWID_LIMIT,
+            created_by=callback.from_user.id,
+            tg_username=tg_username,
+            tg_first_name=tg_first_name,
+        )
+        if sub_url:
+            await callback.answer("✅ Подписка успешно создана и привязана.")
+        else:
+            await callback.answer("❌ Не удалось создать подписку в панели.", show_alert=True)
+            
+        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
+        return
+
     if action == "link":
         try:
             page = int(arg or "0")
@@ -2140,10 +2225,12 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
         # переводим админа в FSM ожидания текста сообщения этому юзеру
         await state.set_state(AdminDmStates.waiting_for_text)
         await state.update_data(target_tg=target_tg)
-        await callback.message.answer(
+        await safe_edit(
+            callback,
             f"✉️ Введите текст сообщения для пользователя <code>{target_tg}</code>. "
             "Отправлю от вашего имени. /cancel — отменить.",
             parse_mode="HTML",
+            prefer_edit=True,
         )
         await callback.answer()
         return
@@ -2210,8 +2297,11 @@ async def cb_promo_input(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
     await state.set_state(PromoStates.waiting_for_code)
-    await callback.message.answer(
+    await safe_edit(
+        callback,
         "🎁 Введите промокод одной строкой. /cancel — отменить.",
+        parse_mode="HTML",
+        prefer_edit=True,
     )
     await callback.answer()
 
@@ -2236,26 +2326,28 @@ async def _apply_promo_to_subscription(
 ) -> None:
     sub = await db.get_subscription(sub_id)
     if not sub or sub[1] != message.from_user.id:
-        await message.answer("❌ Подписка не найдена.")
+        await message.answer("❌ Подписка не найдена.", reply_markup=back_only_keyboard())
         return
     full_uuid = sub[2]
     # Атомарно потребляем код
     status, _ = await db.redeem_promocode(code, message.from_user.id)
     if status != db.PROMO_OK:
         # Кто-то опередил между peek и redeem
-        await message.answer("❌ Не удалось активировать промокод (возможно, кто-то опередил). Попробуйте ещё раз.")
+        await message.answer("❌ Не удалось активировать промокод (возможно, кто-то опередил). Попробуйте ещё раз.", reply_markup=back_only_keyboard())
         return
     ok, _ = await api.extend_user_subscription_days(full_uuid, int(bonus_days))
     if not ok:
         await message.answer(
             "⚠️ Промокод принят, но не удалось продлить подписку в панели. "
-            "Сообщите администратору."
+            "Сообщите администратору.",
+            reply_markup=back_only_keyboard()
         )
         return
     await sync_local_expire_from_panel(message.from_user.id, full_uuid)
     await message.answer(
         f"🎉 Подписка #{sub_id} продлена на <b>{bonus_days}</b> дн.!",
         parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -2264,35 +2356,36 @@ async def promo_capture(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text == "/cancel":
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("Отменено.", reply_markup=back_only_keyboard())
         return
     if not text:
-        await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.")
+        await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.", reply_markup=back_only_keyboard())
         return
     tg_id = message.from_user.id
     status, bonus_days = await _peek_promocode(text, tg_id)
     if status == db.PROMO_NOT_FOUND:
         await state.clear()
-        await message.answer("❌ Такого промокода не существует.")
+        await message.answer("❌ Такого промокода не существует.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_REVOKED:
         await state.clear()
-        await message.answer("❌ Промокод отозван.")
+        await message.answer("❌ Промокод отозван.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_EXHAUSTED:
         await state.clear()
-        await message.answer("❌ Лимит использований промокода исчерпан.")
+        await message.answer("❌ Лимит использований промокода исчерпан.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_ALREADY_USED:
         await state.clear()
-        await message.answer("❌ Вы уже активировали этот промокод.")
+        await message.answer("❌ Вы уже активировали этот промокод.", reply_markup=back_only_keyboard())
         return
 
     subs = await db.list_subscriptions(tg_id)
     if not subs:
         await state.clear()
         await message.answer(
-            "✅ Промокод корректный, но у вас ещё нет аккаунта в панели — обратитесь к администратору."
+            "✅ Промокод корректный, но у вас ещё нет аккаунта в панели — обратитесь к администратору.",
+            reply_markup=back_only_keyboard()
         )
         return
     if len(subs) == 1:
@@ -2334,7 +2427,13 @@ async def cb_promo_pick(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "promo_cancel", PromoStates.waiting_for_sub_pick)
 async def cb_promo_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Отменено. Промокод не активирован.")
+    await safe_edit(
+        callback,
+        "Отменено. Промокод не активирован.",
+        parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True,
+    )
     await callback.answer()
 
 
@@ -2360,6 +2459,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="dm", description="✉️ Написать пользователю"),
     BotCommand(command="broadcast", description="📢 Массовая рассылка сообщений"),
     BotCommand(command="stats", description="📊 Аналитика и сводка"),
+    BotCommand(command="make_backup", description="📦 Создать резервную копию сейчас"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
 
@@ -2405,13 +2505,21 @@ async def main():
         minutes=2,
         args=[bot],
     )
-    # Node CPU load check — every 3 minutes
+    # Node CPU load check — every 1 minute
     scheduler.add_job(
         check_cpu_load,
         "interval",
-        minutes=3,
+        minutes=1,
         args=[bot],
     )
+    if BACKUP_TG_CHAT_ID:
+        scheduler.add_job(
+            run_daily_backup,
+            "cron",
+            hour=BACKUP_CRON_HOUR,
+            minute=BACKUP_CRON_MINUTE,
+            args=[bot],
+        )
     scheduler.start()
 
     logger.info("Бот запущен...")
