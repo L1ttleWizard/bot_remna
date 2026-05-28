@@ -266,3 +266,32 @@ async def test_clean_chat_bot_message_middleware():
     assert app.active_bot_messages[12345] == []
     handler.assert_called_once_with(message, data)
 
+
+@pytest.mark.asyncio
+async def test_bot_call_hook_ignores_document_messages():
+    """Verify that Bot.__call__ hook does NOT track bot-sent messages containing a document."""
+    import app
+    from aiogram import Bot
+    from aiogram.types import Message, Chat, Document
+    import datetime
+
+    app.active_bot_messages.clear()
+    
+    # Create a Message object with a document
+    chat = Chat(id=12345, type="private")
+    doc = Document(file_id="dummy_file_id", file_unique_id="dummy_uniq_id")
+    message = Message(
+        message_id=606,
+        date=datetime.datetime.now(datetime.timezone.utc),
+        chat=chat,
+        document=doc,
+    )
+
+    # Patch original_call to return our document message
+    with patch("app.original_call", AsyncMock(return_value=message)):
+        test_bot = Bot(token="123456:AAA-BBB_ccc-fakefakefakefakefakefakefa")
+        res = await test_bot.send_message(chat_id=12345, text="Here is a doc")
+        assert res.message_id == 606
+        # Should NOT be tracked because it has a document
+        assert 12345 not in app.active_bot_messages or app.active_bot_messages[12345] == []
+

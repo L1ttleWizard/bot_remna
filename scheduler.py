@@ -545,14 +545,15 @@ async def run_daily_backup(bot: Bot, target_chat_id: int | str = None) -> bool:
             # Добавляем БД
             zipf.write(DB_PATH, arcname=os.path.basename(DB_PATH))
             # Добавляем .env, если он существует
-            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-            if os.path.exists(env_path):
-                zipf.write(env_path, arcname=".env")
-            else:
-                # Попробуем найти в корне проекта
-                root_env = os.path.join(os.getcwd(), ".env")
-                if os.path.exists(root_env):
-                    zipf.write(root_env, arcname=".env")
+            env_paths = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+                os.path.join(os.getcwd(), ".env"),
+                "/opt/bot_remna/.env",
+            ]
+            for path in env_paths:
+                if os.path.exists(path):
+                    zipf.write(path, arcname=".env")
+                    break
 
         logger.info(f"Архив {backup_filename} успешно создан. Отправка в Telegram (chat_id: {chat_id})...")
         document = FSInputFile(backup_path, filename=backup_filename)
