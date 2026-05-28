@@ -37,9 +37,12 @@ async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> N
         "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
         "deep-link для импорта одной кнопкой и QR-код."
     )
+    subs = await db.list_subscriptions(callback.from_user.id)
+    has_multiple = len(subs) > 1
+
     await safe_edit(
         callback, text, parse_mode="HTML",
-        reply_markup=connect_platform_keyboard(sub_id), prefer_edit=True,
+        reply_markup=connect_platform_keyboard(sub_id, has_multiple), prefer_edit=True,
     )
     await callback.answer()
 
