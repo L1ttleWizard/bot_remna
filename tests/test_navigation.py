@@ -165,3 +165,104 @@ def test_inline_query_has_wildcard_state_filter():
     
     assert found_wildcard is True, "Inline query handler is missing StateFilter('*') filter"
 
+
+@pytest.mark.asyncio
+async def test_track_bot_message_and_delete():
+    """Verify track_bot_message registers message IDs and delete_active_bot_messages deletes them."""
+    import app
+    from aiogram.exceptions import TelegramBadRequest
+
+    tg_id = 99999
+    app.active_bot_messages.clear()
+
+    app.track_bot_message(tg_id, 101)
+    app.track_bot_message(tg_id, 102)
+    assert app.active_bot_messages[tg_id] == [101, 102]
+
+    mock_bot = AsyncMock()
+    # Mock delete_message to succeed for 101 and fail for 102 to verify error handling
+    async def mock_delete(chat_id, message_id):
+        if message_id == 102:
+            raise TelegramBadRequest(message="message to delete not found", method=None)
+        return True
+    mock_bot.delete_message = AsyncMock(side_effect=mock_delete)
+
+    await app.delete_active_bot_messages(mock_bot, tg_id)
+    assert mock_bot.delete_message.call_count == 2
+    assert app.active_bot_messages[tg_id] == []
+
+
+@pytest.mark.asyncio
+async def test_bot_call_hook_tracks_private_chat_messages():
+    """Verify that Bot.__call__ hook automatically tracks bot-sent messages in private chats."""
+    import app
+    from aiogram import Bot
+    from aiogram.types import Message, Chat
+    import datetime
+
+    app.active_bot_messages.clear()
+    
+    # Create a real/mocked Message object returned by original call
+    chat = Chat(id=12345, type="private")
+    message = Message(
+        message_id=505,
+        date=datetime.datetime.now(datetime.timezone.utc),
+        chat=chat,
+    )
+
+    # Patch original_call to return our message
+    with patch("app.original_call", AsyncMock(return_value=message)):
+        test_bot = Bot(token="123456:AAA-BBB_ccc-fakefakefakefakefakefakefa")
+        res = await test_bot.send_message(chat_id=12345, text="Hello")
+        assert res.message_id == 505
+        assert app.active_bot_messages[12345] == [505]
+
+
+@pytest.mark.asyncio
+async def test_clean_chat_user_message_middleware():
+    """Verify CleanChatUserMessageMiddleware deletes incoming user message in private chats."""
+    import app
+    from aiogram.types import Message, Chat
+
+    middleware = app.CleanChatUserMessageMiddleware()
+    handler = AsyncMock()
+
+    chat = Chat(id=12345, type="private")
+    message = MagicMock(spec=Message)
+    message.chat = chat
+    message.delete = AsyncMock()
+
+    data = {}
+    await middleware(handler, message, data)
+    
+    message.delete.assert_called_once()
+    handler.assert_called_once_with(message, data)
+
+
+@pytest.mark.asyncio
+async def test_clean_chat_bot_message_middleware():
+    """Verify CleanChatBotMessageMiddleware deletes old bot messages before handler runs."""
+    import app
+    from aiogram.types import Message, Chat
+
+    middleware = app.CleanChatBotMessageMiddleware()
+    handler = AsyncMock()
+
+    chat = Chat(id=12345, type="private")
+    message = MagicMock(spec=Message)
+    message.chat = chat
+    message.from_user = MagicMock()
+    message.from_user.id = 12345
+    message.bot = AsyncMock()
+
+    # Place a dummy tracked message to verify it gets deleted
+    app.active_bot_messages[12345] = [808]
+
+    data = {}
+    await middleware(handler, message, data)
+
+    # Message 808 should be deleted
+    message.bot.delete_message.assert_called_once_with(chat_id=12345, message_id=808)
+    assert app.active_bot_messages[12345] == []
+    handler.assert_called_once_with(message, data)
+

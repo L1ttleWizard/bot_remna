@@ -22,7 +22,13 @@ from aiogram.types import (
 
 import auth
 import database as db
-from app import dp, ensure_sub_belongs_to_user, safe_edit, sync_local_expire_from_panel
+from app import (
+    delete_active_bot_messages,
+    dp,
+    ensure_sub_belongs_to_user,
+    safe_edit,
+    sync_local_expire_from_panel,
+)
 from clients import CLIENT_CATALOG, PLATFORM_TITLES, connect_platform_keyboard
 from config import SUB_DOMAIN
 from formatters import format_sub_caption
@@ -180,8 +186,17 @@ async def cb_connect_platform(callback: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")])
     kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await callback.message.answer(
-        "\n".join(lines),
+    tg_id = callback.from_user.id
+    # Delete the previous platform picker menu and other old messages
+    await delete_active_bot_messages(callback.bot, tg_id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await callback.bot.send_message(
+        chat_id=tg_id,
+        text="\n".join(lines),
         parse_mode="HTML",
         reply_markup=kb,
         disable_web_page_preview=True,
@@ -193,7 +208,8 @@ async def cb_connect_platform(callback: CallbackQuery):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            await callback.message.answer_photo(
+            await callback.bot.send_photo(
+                chat_id=tg_id,
                 photo=BufferedInputFile(buf.read(), filename="subscription.png"),
                 caption="QR-код подписки. Отсканируйте в выбранном клиенте.",
             )

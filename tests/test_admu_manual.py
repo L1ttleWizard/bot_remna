@@ -168,12 +168,13 @@ async def test_cb_my_settings_syncs_expiration():
     with patch("bot._ensure_authorized_user", AsyncMock(return_value=mock_user)), \
          patch("bot.sync_local_expire_from_panel", AsyncMock()) as mock_sync, \
          patch("bot.db.get_user", AsyncMock(return_value=mock_user)), \
-         patch("bot.api.get_user_info", AsyncMock(return_value=mock_info)):
+         patch("bot.api.get_user_info", AsyncMock(return_value=mock_info)), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe:
 
         await bot.cb_my_settings(callback)
 
         mock_sync.assert_called_once_with(user_tg, "uuid-A")
-        callback.message.answer.assert_called_once()
+        mock_safe.assert_called_once()
         callback.answer.assert_called_once()
 
 
