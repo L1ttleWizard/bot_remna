@@ -343,6 +343,7 @@ async def cmd_redeem(message: Message, command: CommandObject):
         await message.answer(
             "Использование: <code>/redeem ВАШ_ТОКЕН</code>",
             parse_mode="HTML",
+            reply_markup=back_only_keyboard(),
         )
         return
     await _try_redeem_token(message, raw)
@@ -355,7 +356,8 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
     if token is None:
         await message.answer(
             "❌ Токен недействителен, уже использован или отозван.\n"
-            "Обратитесь к администратору."
+            "Обратитесь к администратору.",
+            reply_markup=back_only_keyboard(),
         )
         return
 
@@ -368,7 +370,8 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
     )
     if not sub_url:
         await message.answer(
-            "❌ Не удалось создать аккаунт в панели. Сообщите администратору."
+            "❌ Не удалось создать аккаунт в панели. Сообщите администратору.",
+            reply_markup=back_only_keyboard(),
         )
         return
 
@@ -874,9 +877,12 @@ async def cb_admin_users_search(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     await state.set_state(AdminSearchStates.waiting_for_query)
-    await callback.message.answer(
+    await safe_edit(
+        callback,
         "🔎 Введите подстроку для поиска: tg_id, @username, имя/фамилия или username "
         "аккаунта в Remnawave (можно частично). /cancel — отменить.",
+        parse_mode="HTML",
+        prefer_edit=True,
     )
     await callback.answer()
 
@@ -889,7 +895,7 @@ async def admin_search_capture(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text == "/cancel":
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("Отменено.", reply_markup=back_only_keyboard())
         return
     if not text:
         await message.answer("Запрос не может быть пустым. /cancel — отменить.")
@@ -963,7 +969,7 @@ async def cb_admin_issue_token(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]]
     )
-    await callback.message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=kb)
+    await safe_edit(callback, "\n".join(text_lines), parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer("Токен выдан")
 
 
@@ -1280,7 +1286,13 @@ async def cb_my_settings(callback: CallbackQuery):
         f"🔗 **Ваша ссылка для подключения:**\n`{sub_url}`\n\n"
         "*(Скопируйте ссылку и обновите в приложении)*"
     )
-    await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_only_keyboard())
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True,
+    )
     await callback.answer()
 
 
@@ -1344,10 +1356,7 @@ async def cb_back_main(callback: CallbackQuery):
     else:
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
 
 
@@ -2216,10 +2225,12 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
         # переводим админа в FSM ожидания текста сообщения этому юзеру
         await state.set_state(AdminDmStates.waiting_for_text)
         await state.update_data(target_tg=target_tg)
-        await callback.message.answer(
+        await safe_edit(
+            callback,
             f"✉️ Введите текст сообщения для пользователя <code>{target_tg}</code>. "
             "Отправлю от вашего имени. /cancel — отменить.",
             parse_mode="HTML",
+            prefer_edit=True,
         )
         await callback.answer()
         return
@@ -2286,8 +2297,11 @@ async def cb_promo_input(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
     await state.set_state(PromoStates.waiting_for_code)
-    await callback.message.answer(
+    await safe_edit(
+        callback,
         "🎁 Введите промокод одной строкой. /cancel — отменить.",
+        parse_mode="HTML",
+        prefer_edit=True,
     )
     await callback.answer()
 
@@ -2312,26 +2326,28 @@ async def _apply_promo_to_subscription(
 ) -> None:
     sub = await db.get_subscription(sub_id)
     if not sub or sub[1] != message.from_user.id:
-        await message.answer("❌ Подписка не найдена.")
+        await message.answer("❌ Подписка не найдена.", reply_markup=back_only_keyboard())
         return
     full_uuid = sub[2]
     # Атомарно потребляем код
     status, _ = await db.redeem_promocode(code, message.from_user.id)
     if status != db.PROMO_OK:
         # Кто-то опередил между peek и redeem
-        await message.answer("❌ Не удалось активировать промокод (возможно, кто-то опередил). Попробуйте ещё раз.")
+        await message.answer("❌ Не удалось активировать промокод (возможно, кто-то опередил). Попробуйте ещё раз.", reply_markup=back_only_keyboard())
         return
     ok, _ = await api.extend_user_subscription_days(full_uuid, int(bonus_days))
     if not ok:
         await message.answer(
             "⚠️ Промокод принят, но не удалось продлить подписку в панели. "
-            "Сообщите администратору."
+            "Сообщите администратору.",
+            reply_markup=back_only_keyboard()
         )
         return
     await sync_local_expire_from_panel(message.from_user.id, full_uuid)
     await message.answer(
         f"🎉 Подписка #{sub_id} продлена на <b>{bonus_days}</b> дн.!",
         parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -2340,35 +2356,36 @@ async def promo_capture(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text == "/cancel":
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("Отменено.", reply_markup=back_only_keyboard())
         return
     if not text:
-        await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.")
+        await message.answer("Промокод не может быть пустым. /cancel чтобы выйти.", reply_markup=back_only_keyboard())
         return
     tg_id = message.from_user.id
     status, bonus_days = await _peek_promocode(text, tg_id)
     if status == db.PROMO_NOT_FOUND:
         await state.clear()
-        await message.answer("❌ Такого промокода не существует.")
+        await message.answer("❌ Такого промокода не существует.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_REVOKED:
         await state.clear()
-        await message.answer("❌ Промокод отозван.")
+        await message.answer("❌ Промокод отозван.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_EXHAUSTED:
         await state.clear()
-        await message.answer("❌ Лимит использований промокода исчерпан.")
+        await message.answer("❌ Лимит использований промокода исчерпан.", reply_markup=back_only_keyboard())
         return
     if status == db.PROMO_ALREADY_USED:
         await state.clear()
-        await message.answer("❌ Вы уже активировали этот промокод.")
+        await message.answer("❌ Вы уже активировали этот промокод.", reply_markup=back_only_keyboard())
         return
 
     subs = await db.list_subscriptions(tg_id)
     if not subs:
         await state.clear()
         await message.answer(
-            "✅ Промокод корректный, но у вас ещё нет аккаунта в панели — обратитесь к администратору."
+            "✅ Промокод корректный, но у вас ещё нет аккаунта в панели — обратитесь к администратору.",
+            reply_markup=back_only_keyboard()
         )
         return
     if len(subs) == 1:
@@ -2410,7 +2427,13 @@ async def cb_promo_pick(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "promo_cancel", PromoStates.waiting_for_sub_pick)
 async def cb_promo_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Отменено. Промокод не активирован.")
+    await safe_edit(
+        callback,
+        "Отменено. Промокод не активирован.",
+        parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True,
+    )
     await callback.answer()
 
 

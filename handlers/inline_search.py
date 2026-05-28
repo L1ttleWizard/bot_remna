@@ -6,6 +6,7 @@
 """
 from datetime import datetime
 
+from aiogram.filters import StateFilter
 from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
@@ -18,7 +19,7 @@ from app import dp
 from formatters import format_tg_name
 
 
-@dp.inline_query()
+@dp.inline_query(StateFilter("*"))
 async def inline_user_search(query: InlineQuery):
     if not await auth.is_admin(query.from_user.id):
         await query.answer(

@@ -19,9 +19,72 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
+    Message,
     TelegramObject,
     User,
 )
+
+# --- active_bot_messages tracking ---
+active_bot_messages: dict[int, list[int]] = {}
+
+def track_bot_message(tg_id: int, message_id: int) -> None:
+    if tg_id not in active_bot_messages:
+        active_bot_messages[tg_id] = []
+    if message_id not in active_bot_messages[tg_id]:
+        active_bot_messages[tg_id].append(message_id)
+
+async def delete_active_bot_messages(bot: Bot, tg_id: int) -> None:
+    if tg_id not in active_bot_messages:
+        return
+    msg_ids = list(active_bot_messages[tg_id])
+    active_bot_messages[tg_id].clear()
+    for msg_id in msg_ids:
+        try:
+            await bot.delete_message(chat_id=tg_id, message_id=msg_id)
+        except TelegramBadRequest as e:
+            if "message to delete not found" in str(e).lower() or "message can't be deleted" in str(e).lower():
+                pass
+        except Exception as e:
+            logger.warning("Failed to delete bot message %s for user %s: %s", msg_id, tg_id, e)
+
+# --- Monkeypatch Bot.__call__ for message tracking ---
+original_call = Bot.__call__
+
+async def custom_call(self, method, *args, **kwargs):
+    res = await original_call(self, method, *args, **kwargs)
+    try:
+        is_msg = isinstance(res, Message)
+    except Exception:
+        is_msg = False
+
+    if is_msg:
+        try:
+            chat_type = res.chat.type
+            chat_id = res.chat.id
+            message_id = res.message_id
+            if chat_type == "private" and isinstance(chat_id, int) and isinstance(message_id, int):
+                track_bot_message(chat_id, message_id)
+        except Exception:
+            pass
+    elif isinstance(res, list):
+        for item in res:
+            try:
+                is_msg = isinstance(item, Message)
+            except Exception:
+                is_msg = False
+            if is_msg:
+                try:
+                    chat_type = item.chat.type
+                    chat_id = item.chat.id
+                    message_id = item.message_id
+                    if chat_type == "private" and isinstance(chat_id, int) and isinstance(message_id, int):
+                        track_bot_message(chat_id, message_id)
+                except Exception:
+                    pass
+    return res
+
+Bot.__call__ = custom_call
+
 
 import database as db
 from config import BOT_TOKEN, REMNAWAVE_TOKEN, REMNAWAVE_URL
@@ -135,6 +198,39 @@ class ClearStateOnNavigationMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class CleanChatUserMessageMiddleware(BaseMiddleware):
+    """Удаляет входящие сообщения пользователя в приватных чатах."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, Message) and event.chat.type == "private":
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        return await handler(event, data)
+
+
+class CleanChatBotMessageMiddleware(BaseMiddleware):
+    """Удаляет старые сообщения бота перед обработкой новой команды или ввода пользователя."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, Message) and event.chat.type == "private":
+            await delete_active_bot_messages(event.bot, event.from_user.id)
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(CleanChatUserMessageMiddleware())
+dp.message.middleware(CleanChatBotMessageMiddleware())
 dp.message.middleware(TgProfileMiddleware())
 dp.callback_query.middleware(TgProfileMiddleware())
 dp.callback_query.outer_middleware(ClearStateOnNavigationMiddleware())
@@ -149,17 +245,42 @@ async def safe_edit(
     parse_mode: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     prefer_edit: bool,
+    disable_web_page_preview: Optional[bool] = None,
 ) -> None:
     """Редактирует исходное сообщение, либо шлёт новое если редактирование не удалось."""
+    tg_id = callback.from_user.id
+    if len(active_bot_messages.get(tg_id, [])) > 1:
+        prefer_edit = False
+
     if prefer_edit:
         try:
-            await callback.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await callback.message.edit_text(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            track_bot_message(tg_id, callback.message.message_id)
             return
         except TelegramBadRequest as e:
             if "message is not modified" in str(e).lower():
+                track_bot_message(tg_id, callback.message.message_id)
                 return
             logger.info("edit_text не удался (%s), отправляем новое сообщение", e)
-    await callback.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+    await delete_active_bot_messages(callback.bot, tg_id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await callback.bot.send_message(
+        chat_id=tg_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_web_page_preview,
+    )
 
 
 async def ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
