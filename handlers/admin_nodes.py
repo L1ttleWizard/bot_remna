@@ -76,17 +76,20 @@ def _node_card_keyboard(node: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🔄 Перезапустить", callback_data=f"nodes:act:restart:{uuid}"),
             InlineKeyboardButton(
-                text="▶️ Включить" if is_disabled else "⏸ Отключить",
+                text="🔗 Включить" if is_disabled else "⏸ Отключить",
                 callback_data=f"nodes:act:{'enable' if is_disabled else 'disable'}:{uuid}",
             ),
         ],
         [
-            InlineKeyboardButton(text="🧹 Сбросить трафик", callback_data=f"nodes:act:reset_traffic:{uuid}"),
+            InlineKeyboardButton(text="🗹 Сбросить трафик", callback_data=f"nodes:act:reset_traffic:{uuid}"),
             InlineKeyboardButton(text="🗑 Удалить ноду", callback_data=f"nodes:del_confirm:{uuid}"),
         ],
         [
+            InlineKeyboardButton(text="💳 Биллинг", callback_data=f"nodes:billing:{uuid}"),
+        ],
+        [
             InlineKeyboardButton(text="🔁 Обновить", callback_data=f"nodes:card:{uuid}"),
-            InlineKeyboardButton(text="◀️ К списку", callback_data="admin_nodes"),
+            InlineKeyboardButton(text="✈️ К списку", callback_data="admin_nodes"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -199,6 +202,22 @@ def _node_card_text(node: dict) -> str:
                     lines.append(f"  · RAM: {html.escape(human_bytes(total_ram_val))}")
             except (ValueError, TypeError):
                 lines.append(f"  · RAM: {html.escape(str(total_ram))}")
+      # биллинг ноды (если привязана)
+    try:
+        from handlers.admin_billing import _find_billing_for_node, _fmt_date, _days_until
+        bn = await _find_billing_for_node(uuid)
+        if bn:
+            prov = bn.get("provider", {}).get("name") or bn.get("providerName") or "—"
+            d = _days_until(bn.get("nextBillingAt"))
+            tail = f" (через {d} дн.)" if d is not None else ""
+            text = text + (
+                f"\n\n💳 <b>Биллинг</b>\n"
+                f"  · Провайдер: <b>{html.escape(str(prov))}</b>\n"
+                f"  · Следующее списание: <b>{_fmt_date(bn.get('nextBillingAt'))}</b>{tail}"
+            )
+    except Exception as e:
+        logger.warning(f"node billing block: {e}")
+        
     lines.append("")
     lines.append(f"Последнее изменение статуса: {last_status_change}")
     if last_status_msg and last_status_msg != "—":
