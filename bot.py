@@ -42,6 +42,7 @@ from app import (
 from handlers.admin_analytics import ANALYTICS_PERIOD_DAYS, _analytics_date_range
 from handlers import (
     admin_add_node,
+    admin_billing,
     admin_dm,
     admin_nodes,
     admin_notifications,
@@ -55,6 +56,7 @@ from handlers import (
 # не выкидывали импорт как неиспользуемый.
 _REGISTERED_HANDLERS = (
     admin_add_node,
+    admin_billing,
     admin_dm,
     admin_nodes,
     admin_notifications,
