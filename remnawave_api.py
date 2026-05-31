@@ -522,3 +522,161 @@ class RemnawaveAPI:
             except Exception as e:
                 logger.error(f"restart_all_nodes: {e}")
                 return False
+
+    # =========================================================================
+    # Infra Billing
+    # =========================================================================
+
+    async def list_billing_providers(self) -> Optional[list]:
+        """GET /api/infra-billing/providers."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/providers"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data if isinstance(data, list) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_providers: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_providers: {e}")
+                return None
+
+    async def get_billing_provider(self, uuid: str) -> Optional[dict]:
+        """GET /api/infra-billing/providers/{uuid}."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"get_billing_provider: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_billing_provider: {e}")
+                return None
+
+    async def create_billing_provider(self, payload: dict) -> Optional[dict]:
+        """POST /api/infra-billing/providers."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/providers"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status in (200, 201):
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"create_billing_provider: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"create_billing_provider: {e}")
+                return None
+
+    async def delete_billing_provider(self, uuid: str) -> bool:
+        """DELETE /api/infra-billing/providers/{uuid}."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status not in (200, 204):
+                        err = await resp.text()
+                        logger.error(f"delete_billing_provider: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 204)
+            except Exception as e:
+                logger.error(f"delete_billing_provider: {e}")
+                return False
+
+    async def list_billing_nodes(self) -> Optional[list]:
+        """GET /api/infra-billing/nodes."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data if isinstance(data, list) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_nodes: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_nodes: {e}")
+                return None
+
+    async def create_billing_node(self, payload: dict) -> Optional[dict]:
+        """POST /api/infra-billing/nodes."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status in (200, 201):
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"create_billing_node: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"create_billing_node: {e}")
+                return None
+
+    async def update_billing_nodes(self, payload: dict) -> Optional[dict]:
+        """PATCH /api/infra-billing/nodes."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.patch(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"update_billing_nodes: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"update_billing_nodes: {e}")
+                return None
+
+    async def delete_billing_node(self, uuid: str) -> bool:
+        """DELETE /api/infra-billing/nodes/{uuid}."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/nodes/{uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status not in (200, 204):
+                        err = await resp.text()
+                        logger.error(f"delete_billing_node: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 204)
+            except Exception as e:
+                logger.error(f"delete_billing_node: {e}")
+                return False
+
+    async def list_billing_history(self, params: dict) -> Optional[list]:
+        """GET /api/infra-billing/history."""
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            url = f"{self.base_url}/api/infra-billing/history"
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data if isinstance(data, list) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_history: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_history: {e}")
+                return None
