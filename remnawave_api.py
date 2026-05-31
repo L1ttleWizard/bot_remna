@@ -536,8 +536,9 @@ class RemnawaveAPI:
                     if resp.status == 200:
                         data = await resp.json()
                         if isinstance(data, dict) and "response" in data:
-                            return data["response"]
-                        return data if isinstance(data, list) else None
+                            r = data["response"]
+                            return r.get("providers") if isinstance(r, dict) else r
+                        return data.get("providers") if isinstance(data, dict) else None
                     err = await resp.text()
                     logger.error(f"list_billing_providers: статус {resp.status}, ответ: {err}")
                     return None
@@ -604,8 +605,9 @@ class RemnawaveAPI:
                     if resp.status == 200:
                         data = await resp.json()
                         if isinstance(data, dict) and "response" in data:
-                            return data["response"]
-                        return data if isinstance(data, list) else None
+                            r = data["response"]
+                            return r.get("billingNodes") if isinstance(r, dict) else r
+                        return data.get("billingNodes") if isinstance(data, dict) else None
                     err = await resp.text()
                     logger.error(f"list_billing_nodes: статус {resp.status}, ответ: {err}")
                     return None
@@ -672,8 +674,9 @@ class RemnawaveAPI:
                     if resp.status == 200:
                         data = await resp.json()
                         if isinstance(data, dict) and "response" in data:
-                            return data["response"]
-                        return data if isinstance(data, list) else None
+                            r = data["response"]
+                            return r.get("records") if isinstance(r, dict) else r
+                        return data.get("records") if isinstance(data, dict) else None
                     err = await resp.text()
                     logger.error(f"list_billing_history: статус {resp.status}, ответ: {err}")
                     return None

@@ -320,7 +320,7 @@ def test_list_billing_providers(api_instance):
     def on_req(method, url, kw):
         assert method == "GET"
         assert url.endswith("/api/infra-billing/providers")
-        return _FakeResp(200, json_data={"response": [{"uuid": "p1", "name": "prov1"}]})
+        return _FakeResp(200, json_data={"response": {"providers": [{"uuid": "p1", "name": "prov1"}]}})
 
     with _patch_session(on_req):
         res = asyncio.run(api_instance.list_billing_providers())
@@ -364,7 +364,7 @@ def test_list_billing_nodes(api_instance):
     def on_req(method, url, kw):
         assert method == "GET"
         assert url.endswith("/api/infra-billing/nodes")
-        return _FakeResp(200, json_data={"response": [{"uuid": "bn1"}]})
+        return _FakeResp(200, json_data={"response": {"billingNodes": [{"uuid": "bn1"}]}})
 
     with _patch_session(on_req):
         res = asyncio.run(api_instance.list_billing_nodes())
@@ -409,7 +409,7 @@ def test_list_billing_history(api_instance):
         assert method == "GET"
         assert url.endswith("/api/infra-billing/history")
         assert kw["params"] == {"start": 0, "limit": 10}
-        return _FakeResp(200, json_data={"response": [{"uuid": "h1"}]})
+        return _FakeResp(200, json_data={"response": {"records": [{"uuid": "h1"}]}})
 
     with _patch_session(on_req):
         res = asyncio.run(api_instance.list_billing_history({"start": 0, "limit": 10}))
