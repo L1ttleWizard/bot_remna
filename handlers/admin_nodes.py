@@ -104,7 +104,8 @@ def get_cores_word(n: int) -> str:
         return "ядер"
 
 
-def _node_card_text(node: dict) -> str:
+async def _node_card_text(node: dict) -> str:
+    uuid = node.get("uuid") or ""
     name = html.escape(str(node.get("name") or "—"))
     addr = html.escape(str(node.get("address") or "—"))
     port = node.get("port") or "—"
@@ -203,21 +204,21 @@ def _node_card_text(node: dict) -> str:
             except (ValueError, TypeError):
                 lines.append(f"  · RAM: {html.escape(str(total_ram))}")
       # биллинг ноды (если привязана)
-    try:
-        from handlers.admin_billing import _find_billing_for_node, _fmt_date, _days_until
-        bn = await _find_billing_for_node(uuid)
-        if bn:
-            prov = bn.get("provider", {}).get("name") or bn.get("providerName") or "—"
-            d = _days_until(bn.get("nextBillingAt"))
-            tail = f" (через {d} дн.)" if d is not None else ""
-            text = text + (
-                f"\n\n💳 <b>Биллинг</b>\n"
-                f"  · Провайдер: <b>{html.escape(str(prov))}</b>\n"
-                f"  · Следующее списание: <b>{_fmt_date(bn.get('nextBillingAt'))}</b>{tail}"
-            )
-    except Exception as e:
-        logger.warning(f"node billing block: {e}")
-        
+    if uuid:
+        try:
+            from handlers.admin_billing import _find_billing_for_node, _fmt_date, _days_until
+            bn = await _find_billing_for_node(uuid)
+            if bn:
+                prov = bn.get("provider", {}).get("name") or bn.get("providerName") or "—"
+                d = _days_until(bn.get("nextBillingAt"))
+                tail = f" (через {d} дн.)" if d is not None else ""
+                lines.append("")
+                lines.append("💳 <b>Биллинг</b>")
+                lines.append(f"  · Провайдер: <b>{html.escape(str(prov))}</b>")
+                lines.append(f"  · Следующее списание: <b>{_fmt_date(bn.get('nextBillingAt'))}</b>{tail}")
+        except Exception as e:
+            logger.warning(f"node billing block: {e}")
+
     lines.append("")
     lines.append(f"Последнее изменение статуса: {last_status_change}")
     if last_status_msg and last_status_msg != "—":
@@ -319,7 +320,7 @@ async def cb_node_card(callback: CallbackQuery):
     await callback.answer("Загрузка…")
     await safe_edit(
         callback,
-        _node_card_text(node),
+        await _node_card_text(node),
         parse_mode="HTML",
         reply_markup=_node_card_keyboard(node),
         prefer_edit=True,
@@ -361,7 +362,7 @@ async def cb_node_action(callback: CallbackQuery):
     if node:
         await safe_edit(
             callback,
-            _node_card_text(node),
+            await _node_card_text(node),
             parse_mode="HTML",
             reply_markup=_node_card_keyboard(node),
             prefer_edit=True,

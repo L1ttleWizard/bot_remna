@@ -256,6 +256,7 @@ def test_get_cores_word():
 def test_node_card_text_rendering():
     from handlers.admin_nodes import _node_card_text
     node = {
+        "uuid": "node-uuid-123",
         "name": "Test Node",
         "address": "1.2.3.4",
         "port": 1234,
@@ -278,11 +279,40 @@ def test_node_card_text_rendering():
             }
         }
     }
-    text = _node_card_text(node)
+    with patch("handlers.admin_billing._find_billing_for_node", new_callable=AsyncMock) as mock_find:
+        mock_find.return_value = None
+        text = asyncio.run(_node_card_text(node))
     assert "Test Node" in text
     assert "1.2.3.4:1234" in text
     assert "Intel i7 (4 ядра)" in text
     assert "Load Average: <code>0.40, 0.80, 1.20</code>" in text
     assert "Загрузка (1/5/15 мин): <b>10.0%</b> / <b>20.0%</b> / <b>30.0%</b>" in text
     assert "RAM: <b>2 ГБ</b> / 8 ГБ (<b>25.0%</b>)" in text
+    assert "💳 Биллинг" not in text
+
+
+def test_node_card_text_rendering_with_billing():
+    from handlers.admin_nodes import _node_card_text
+    node = {
+        "uuid": "node-uuid-123",
+        "name": "Test Node",
+        "address": "1.2.3.4",
+        "port": 1234,
+        "countryCode": "DE",
+        "isDisabled": False,
+        "isConnected": True,
+    }
+    mock_billing = {
+        "uuid": "b-uuid",
+        "provider": {"name": "Hetzner"},
+        "nextBillingAt": "2026-06-30T00:00:00.000Z",
+    }
+    with patch("handlers.admin_billing._find_billing_for_node", new_callable=AsyncMock) as mock_find:
+        mock_find.return_value = mock_billing
+        text = asyncio.run(_node_card_text(node))
+    assert "Test Node" in text
+    assert "💳 <b>Биллинг</b>" in text
+    assert "Провайдер: <b>Hetzner</b>" in text
+    assert "Следующее списание: <b>30.06.2026</b>" in text
+
 
