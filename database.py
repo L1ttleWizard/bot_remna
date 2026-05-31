@@ -165,6 +165,22 @@ async def init_db():
             """
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS node_metrics_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_uuid TEXT NOT NULL,
+                cpu_load REAL NOT NULL,
+                ram_usage REAL NOT NULL,
+                users_online INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_metrics_history_node_uuid_ts ON node_metrics_history(node_uuid, timestamp)"
+        )
+
 
         # One-time backfill: copy legacy users.uuid → subscriptions for users
         # that don't have a corresponding subscription yet.
@@ -1218,6 +1234,44 @@ async def mark_cpu_alerted(node_uuid: str) -> None:
         await db.execute(
             "UPDATE cpu_load_log SET alerted = 1 WHERE node_uuid = ?",
             (node_uuid,),
+        )
+        await db.commit()
+
+
+async def add_node_metrics(node_uuid: str, cpu_load: float, ram_usage: float, users_online: int) -> None:
+    now_ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO node_metrics_history (node_uuid, cpu_load, ram_usage, users_online, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (node_uuid, float(cpu_load), float(ram_usage), int(users_online), now_ts),
+        )
+        await db.commit()
+
+
+async def get_node_metrics_history(node_uuid: str, hours: int = 24) -> list:
+    cutoff = int(time.time()) - (hours * 3600)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT timestamp, cpu_load, ram_usage, users_online
+            FROM node_metrics_history
+            WHERE node_uuid = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (node_uuid, cutoff),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return list(rows)
+
+
+async def cleanup_old_node_metrics(before_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM node_metrics_history WHERE timestamp < ?",
+            (int(before_ts),),
         )
         await db.commit()
 

@@ -12,6 +12,7 @@ UI:
 """
 import html
 import logging
+import asyncio
 from typing import Any
 
 from aiogram import F
@@ -21,10 +22,13 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    BufferedInputFile,
+    InputMediaPhoto,
 )
 
 import auth
 import config
+import database as db
 from app import api, dp, safe_edit
 from formatters import human_bytes
 
@@ -86,6 +90,7 @@ def _node_card_keyboard(node: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="💳 Биллинг", callback_data=f"nodes:billing:{uuid}"),
+            InlineKeyboardButton(text="📈 График нагрузки", callback_data=f"nodes:chart:{uuid}"),
         ],
         [
             InlineKeyboardButton(text="🔁 Обновить", callback_data=f"nodes:card:{uuid}"),
@@ -442,6 +447,75 @@ async def cmd_nodes(message: Message):
                 f"   юзеров online: {users} · трафик: {html.escape(human_bytes(traffic))}"
             )
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("nodes:chart:"))
+async def cb_node_chart(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+        
+    uuid = callback.data.split(":", 2)[2]
+    
+    # 1. Fetch node info to get name
+    payload = await api.get_node(uuid)
+    node = (payload or {}).get("response") if isinstance(payload, dict) else None
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+        
+    node_name = node.get("name") or "Без названия"
+    await callback.answer("Генерируем график нагрузки...")
+    
+    # 2. Get metric history for the last 24 hours
+    try:
+        metrics = await db.get_node_metrics_history(uuid, hours=24)
+        
+        # 3. Generate chart using our service
+        from services.chart_generator import generate_node_load_chart
+        loop = asyncio.get_running_loop()
+        image_bytes = await loop.run_in_executor(
+            None, generate_node_load_chart, node_name, metrics
+        )
+        
+        # 4. Create an inline keyboard to go back to the node card or refresh the chart
+        back_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Обновить график", callback_data=f"nodes:chart:{uuid}"),
+                InlineKeyboardButton(text="◀️ К ноде", callback_data=f"nodes:card:{uuid}"),
+            ]
+        ])
+        
+        # 5. Send/update the photo
+        photo_file = BufferedInputFile(image_bytes, filename=f"load_chart_{uuid}.png")
+        
+        # Check if the current message is already a photo message (to update in-place)
+        if callback.message.photo:
+            try:
+                await callback.message.edit_media(
+                    media=InputMediaPhoto(
+                        media=photo_file, 
+                        caption=f"📈 График нагрузки ноды <b>{html.escape(node_name)}</b> за последние 24 часа.", 
+                        parse_mode="HTML"
+                    ),
+                    reply_markup=back_kb
+                )
+                return
+            except Exception as e:
+                logger.info("Failed to edit media in-place: %s. Falling back to delete and send.", e)
+
+        # Otherwise, delete the original text card and send a new photo message
+        await callback.message.delete()
+        await callback.message.answer_photo(
+            photo=photo_file,
+            caption=f"📈 График нагрузки ноды <b>{html.escape(node_name)}</b> за последние 24 часа.",
+            parse_mode="HTML",
+            reply_markup=back_kb
+        )
+        
+    except Exception as e:
+        logger.exception("Ошибка при генерации графика нагрузки: %s", e)
+        await callback.message.answer(f"❌ Не удалось сгенерировать график нагрузки: {e}")
 
 
 

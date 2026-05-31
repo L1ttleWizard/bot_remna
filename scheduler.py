@@ -283,32 +283,30 @@ async def check_expiring_subscriptions(bot: Bot) -> None:
                     except Exception as e:
                         logger.warning("Failed to send admin digest to %s: %s", admin_id, e)
 
-    # 6. Очистка старых логов (старше 30 дней)
+    # 6. Очистка старых логов (старше 30 дней) и старых метрик нод (старше 7 дней)
     try:
         thirty_days_ago = now - 30 * day_sec
+        seven_days_ago = now - 7 * day_sec
         await db.cleanup_old_notifications(thirty_days_ago)
+        await db.cleanup_old_node_metrics(seven_days_ago)
     except Exception as e:
-        logger.warning("Failed to cleanup old notifications: %s", e)
+        logger.warning("Failed to cleanup old notifications/metrics: %s", e)
 
 
 async def check_nodes_health(bot: Bot) -> None:
     """Периодическая проверка доступности нод (каждые 2 минуты)."""
-    # 1. Загрузка настроек
-    enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
-    if not enabled:
-        return
-
-    # 2. Получение списка нод
+    # 1. Получение списка нод
     nodes = await api.list_nodes()
     if not nodes:
         logger.warning("check_nodes_health: не удалось получить список нод")
         return
 
-    # 3. Получение списка админов для алертов
+    # 2. Получение списка админов для алертов
     db_admins = await db.list_admins()
     admins = set(db_admins) | ADMIN_TG_IDS
 
     now_ts = int(time.time())
+    alerts_enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
 
     for node in nodes:
         uuid = node.get("uuid")
@@ -324,10 +322,61 @@ async def check_nodes_health(bot: Bot) -> None:
         address = node.get("address") or "—"
         port = node.get("port") or "—"
 
+        # --- Сбор и сохранение исторических метрик ---
+        if is_connected:
+            payload = await api.get_node(uuid)
+            node_card = (payload or {}).get("response") if isinstance(payload, dict) else None
+            
+            if node_card:
+                users_online = node_card.get("usersOnline") or 0
+                
+                # Извлекаем данные системы
+                sys_info = (node_card.get("system") or {}).get("info") or {}
+                sys_stats = (node_card.get("system") or {}).get("stats") or {}
+                
+                # Вычисление CPU load %
+                cpus = sys_info.get("cpus") or 1
+                load_avg = sys_stats.get("loadAvg") or []
+                
+                cpu_usage = 0.0
+                if isinstance(load_avg, list) and len(load_avg) >= 3:
+                    cpu_usage = (load_avg[1] / cpus) * 100.0
+                else:
+                    for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
+                        val = sys_stats.get(key)
+                        if val is not None:
+                            try:
+                                f_val = float(val)
+                                cpu_usage = f_val * 100.0 if f_val <= 1.0 and f_val > 0.0 else f_val
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                cpu_usage = max(0.0, min(100.0, cpu_usage))
+
+                # Вычисление RAM usage %
+                total_ram = node_card.get("totalRam") or sys_info.get("memoryTotal")
+                used_ram = sys_stats.get("memoryUsed")
+                ram_usage = 0.0
+                if total_ram and used_ram:
+                    try:
+                        ram_usage = (int(used_ram) / int(total_ram)) * 100.0
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+                ram_usage = max(0.0, min(100.0, ram_usage))
+
+                try:
+                    await db.add_node_metrics(uuid, cpu_usage, ram_usage, users_online)
+                except Exception as e:
+                    logger.warning("Не удалось записать метрики ноды %s: %s", name, e)
+
         status_row = await db.get_node_status(uuid)
 
         # Обновляем/вставляем статус в БД
         await db.upsert_node_status(uuid, name, is_connected, now_ts)
+
+        # Если оповещения о падении выключены, пропускаем отправку алертов
+        if not alerts_enabled:
+            continue
 
         if status_row is not None:
             was_connected = status_row["was_connected"]
