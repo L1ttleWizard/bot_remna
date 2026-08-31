@@ -109,7 +109,8 @@ def sort_hwid_devices(devices: list) -> list:
 
 
 def format_devices_html(devices: list, limit_label: str) -> str:
-    header = f"📱 <b>Устройства</b> (лимит HWID: {html.escape(limit_label)})"
+    count = len(devices) if devices else 0
+    header = f"📱 <b>Устройства</b> ({count} из {html.escape(limit_label)})"
     if not devices:
         return (
             header

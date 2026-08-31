@@ -20,6 +20,7 @@ def main_keyboard_user() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📅 Мои подписки", callback_data="my_subs")],
             [InlineKeyboardButton(text="📥 Подключить", callback_data="connect")],
             [InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_input")],
+            [InlineKeyboardButton(text="👥 Рефералы", callback_data="referrals")],
             [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
         ]
     )
@@ -46,6 +47,9 @@ def main_keyboard_admin(tg_id: int, has_account: bool) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📖 Гайд", callback_data="admin_help"),
             InlineKeyboardButton(text="🔔 Уведомления", callback_data="admin_notify_settings"),
+        ],
+        [
+            InlineKeyboardButton(text="🖥 Команды на сервер", callback_data="admin_server_cmds"),
         ],
         [
             InlineKeyboardButton(text="📦 Создать бэкап", callback_data="admin_make_backup"),

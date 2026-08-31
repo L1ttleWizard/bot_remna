@@ -161,8 +161,9 @@ async def cb_billing_providers(callback: CallbackQuery) -> None:
     else:
         for p in providers:
             text += f"• <b>{html.escape(str(p.get('name') or '—'))}</b>"
-            if p.get("billingUrl"):
-                text += f"  · <a href=\"{html.escape(str(p['billingUrl']))}\">оплата</a>"
+            prov_url = p.get("loginUrl") or p.get("billingUrl")
+            if prov_url:
+                text += f"  · <a href=\"{html.escape(str(prov_url))}\">оплата</a>"
             text += "\n"
     await safe_edit(callback, text, parse_mode="HTML",
                     reply_markup=_providers_keyboard(providers), prefer_edit=True,
@@ -191,8 +192,9 @@ async def cb_billing_provider_card(callback: CallbackQuery) -> None:
         f"🏷 <b>{html.escape(str(p.get('name') or '—'))}</b>",
         f"UUID: <code>{html.escape(uuid)}</code>",
     ]
-    if p.get("billingUrl"):
-        lines.append(f"Ссылка для оплаты: <a href=\"{html.escape(str(p['billingUrl']))}\">открыть</a>")
+    prov_url = p.get("loginUrl") or p.get("billingUrl")
+    if prov_url:
+        lines.append(f"Ссылка для оплаты: <a href=\"{html.escape(str(prov_url))}\">открыть</a>")
     await safe_edit(callback, "\n".join(lines), parse_mode="HTML",
                     reply_markup=_provider_card_keyboard(uuid), prefer_edit=True,
                     disable_web_page_preview=True)
@@ -260,6 +262,7 @@ async def msg_billing_provider_url(message: Message, state: FSMContext) -> None:
             await message.answer("⚠️ Ссылка должна начинаться с http:// или https://. Попробуйте ещё раз (или отправьте <code>-</code>):", parse_mode="HTML")
             return
         payload["billingUrl"] = url
+        payload["loginUrl"] = url
     res = await api.create_billing_provider(payload)
     await state.clear()
     if res:

@@ -4,6 +4,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union, Tuple
 
+from contextlib import asynccontextmanager
+import socket
+import ssl
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERNAL_SQUAD_NAME = "Default-Squad"
@@ -47,10 +51,29 @@ class RemnawaveAPI:
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json"
         }
+        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        self._session_obj: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session_obj is None or self._session_obj.closed:
+            conn = aiohttp.TCPConnector(ssl=self._ssl_ctx, happy_eyeballs_delay=None)
+            self._session_obj = aiohttp.ClientSession(headers=self.headers, connector=conn)
+        return self._session_obj
+
+    @asynccontextmanager
+    async def _session(self, timeout: Optional[aiohttp.ClientTimeout] = None):
+        session = await self._get_session()
+        yield session
+
+    async def close(self):
+        if self._session_obj and not self._session_obj.closed:
+            await self._session_obj.close()
 
     async def get_internal_squads(self) -> Optional[dict]:
         """GET /api/internal-squads — список internal squads."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/internal-squads"
             try:
                 async with session.get(url) as resp:
@@ -70,7 +93,7 @@ class RemnawaveAPI:
         hwid_device_limit: int = 3,
         internal_squad_name: Optional[str] = DEFAULT_INTERNAL_SQUAD_NAME,
     ) -> dict:
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             # Рассчитываем дату окончания: текущее время (UTC) + количество дней
             expire_date = datetime.utcnow() + timedelta(days=expire_days)
             # Форматируем в строку стандарта ISO 8601, которую обычно ждут API
@@ -135,10 +158,15 @@ class RemnawaveAPI:
 
     async def patch_user(self, payload: dict) -> bool:
         """PATCH /api/users — частичное обновление пользователя."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        p = payload.copy()
+        if "uuid" in p and "id" not in p:
+            resolved = await self.resolve_user(p["uuid"])
+            if resolved and "id" in resolved:
+                p["id"] = resolved["id"]
+        async with self._session() as session:
             url = f"{self.base_url}/api/users"
             try:
-                async with session.patch(url, json=payload) as resp:
+                async with session.patch(url, json=p) as resp:
                     if resp.status != 200:
                         err = await resp.text()
                         logger.error(f"patch_user: статус {resp.status}, ответ: {err}")
@@ -186,7 +214,7 @@ class RemnawaveAPI:
 
     async def get_user_usage_range(
         self,
-        user_uuid: str,
+        user_id_or_uuid: Union[str, int],
         start_date: str,
         end_date: str,
         *,
@@ -194,31 +222,52 @@ class RemnawaveAPI:
     ) -> Optional[int]:
         """Сумма трафика юзера за окно [start_date..end_date] (YYYY-MM-DD).
 
-        Использует Remnawave 2.4+ `/api/bandwidth-stats/users/{uuid}` (sparklineData),
-        с fallback на legacy `/api/bandwidth-stats/users/{uuid}/legacy`.
+        Использует Remnawave `/api/bandwidth-stats/users/{userId}` (sparklineData),
+        с fallback на legacy `/api/bandwidth-stats/users/{userId}/legacy`.
         Возвращает суммарные байты или None если эндпоинт недоступен/упал/таймаут.
         """
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = str_id if str_id.isdigit() else None
+        if not numeric_id:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = str(resolved["id"])
+
+        if not numeric_id:
+            logger.error(f"get_user_usage_range: не удалось определить numeric ID для {user_id_or_uuid}")
+            return None
+
         timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
-            base = f"{self.base_url}/api/bandwidth-stats/users/{user_uuid}"
+        async with self._session(timeout=timeout) as session:
+            base = f"{self.base_url}/api/bandwidth-stats/users/{numeric_id}"
             params = {"start": start_date, "end": end_date, "topNodesLimit": 1}
             try:
                 async with session.get(base, params=params) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        spark = (data.get("response") or {}).get("sparklineData") or []
-                        return int(sum(int(v) for v in spark))
+                        resp_obj = data.get("response") if isinstance(data, dict) else data
+                        if isinstance(resp_obj, dict):
+                            spark = resp_obj.get("sparklineData")
+                            if isinstance(spark, list) and spark:
+                                return int(sum(int(v or 0) for v in spark))
+                            if "total" in resp_obj:
+                                return int(resp_obj["total"] or 0)
+                            if "usedTrafficBytes" in resp_obj:
+                                return int(resp_obj["usedTrafficBytes"] or 0)
+                        elif isinstance(resp_obj, list):
+                            return int(sum(int((r.get("total") if isinstance(r, dict) else r) or 0) for r in resp_obj))
+                        return 0
                     if resp.status not in (404, 405):
                         logger.error(
                             "get_user_usage_range %s: статус %s",
-                            user_uuid, resp.status,
+                            user_id_or_uuid, resp.status,
                         )
                         return None
             except asyncio.TimeoutError:
-                logger.warning("get_user_usage_range %s: timeout", user_uuid)
+                logger.warning("get_user_usage_range %s: timeout", user_id_or_uuid)
                 return None
             except Exception as e:
-                logger.error("get_user_usage_range %s: %s", user_uuid, e)
+                logger.error("get_user_usage_range %s: %s", user_id_or_uuid, e)
 
             # Fallback: legacy endpoint (массив записей с total).
             try:
@@ -228,23 +277,23 @@ class RemnawaveAPI:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        rows = data.get("response") or []
+                        rows = data.get("response") if isinstance(data, dict) else data
                         if isinstance(rows, list):
-                            return int(sum(int(r.get("total") or 0) for r in rows))
+                            return int(sum(int((r.get("total") if isinstance(r, dict) else r) or 0) for r in rows))
                     else:
                         logger.error(
                             "get_user_usage_range legacy %s: статус %s",
-                            user_uuid, resp.status,
+                            user_id_or_uuid, resp.status,
                         )
             except asyncio.TimeoutError:
-                logger.warning("get_user_usage_range legacy %s: timeout", user_uuid)
+                logger.warning("get_user_usage_range legacy %s: timeout", user_id_or_uuid)
             except Exception as e:
-                logger.error("get_user_usage_range legacy %s: %s", user_uuid, e)
+                logger.error("get_user_usage_range legacy %s: %s", user_id_or_uuid, e)
         return None
 
     async def get_user_sparkline_traffic(
         self,
-        user_uuid: str,
+        user_id_or_uuid: Union[str, int],
         start_date: str,
         end_date: str,
         *,
@@ -252,32 +301,50 @@ class RemnawaveAPI:
     ) -> Optional[list[int]]:
         """Получает ежедневный трафик пользователя (список байт) за указанное окно.
         
-        Использует Remnawave 2.4+ `/api/bandwidth-stats/users/{uuid}` (sparklineData),
-        с fallback на legacy `/api/bandwidth-stats/users/{uuid}/legacy`.
+        Использует Remnawave `/api/bandwidth-stats/users/{userId}` (sparklineData),
+        с fallback на legacy `/api/bandwidth-stats/users/{userId}/legacy`.
         Возвращает список интов или None при ошибке.
         """
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = str_id if str_id.isdigit() else None
+        if not numeric_id:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = str(resolved["id"])
+
+        if not numeric_id:
+            logger.error(f"get_user_sparkline_traffic: не удалось определить numeric ID для {user_id_or_uuid}")
+            return None
+
         timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
-            base = f"{self.base_url}/api/bandwidth-stats/users/{user_uuid}"
+        async with self._session(timeout=timeout) as session:
+            base = f"{self.base_url}/api/bandwidth-stats/users/{numeric_id}"
             params = {"start": start_date, "end": end_date, "topNodesLimit": 1}
             try:
                 async with session.get(base, params=params) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        spark = (data.get("response") or {}).get("sparklineData")
-                        if isinstance(spark, list):
-                            return [int(v) for v in spark]
+                        resp_obj = data.get("response") if isinstance(data, dict) else data
+                        if isinstance(resp_obj, dict):
+                            spark = resp_obj.get("sparklineData")
+                            if isinstance(spark, list):
+                                return [int(v or 0) for v in spark]
+                            if "series" in resp_obj and isinstance(resp_obj["series"], list):
+                                return [int(v or 0) for v in resp_obj["series"]]
+                        elif isinstance(resp_obj, list):
+                            return [int((r.get("total") if isinstance(r, dict) else r) or 0) for r in resp_obj]
+                        return []
                     if resp.status not in (404, 405):
                         logger.error(
                             "get_user_sparkline_traffic %s: статус %s",
-                            user_uuid, resp.status,
+                            user_id_or_uuid, resp.status,
                         )
                         return None
             except asyncio.TimeoutError:
-                logger.warning("get_user_sparkline_traffic %s: timeout", user_uuid)
+                logger.warning("get_user_sparkline_traffic %s: timeout", user_id_or_uuid)
                 return None
             except Exception as e:
-                logger.error("get_user_sparkline_traffic %s: %s", user_uuid, e)
+                logger.error("get_user_sparkline_traffic %s: %s", user_id_or_uuid, e)
 
             # Fallback: legacy endpoint
             try:
@@ -287,18 +354,49 @@ class RemnawaveAPI:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        rows = data.get("response") or []
+                        rows = data.get("response") if isinstance(data, dict) else data
                         if isinstance(rows, list):
-                            return [int(r.get("total") or 0) for r in rows]
+                            return [int((r.get("total") if isinstance(r, dict) else r) or 0) for r in rows]
                     else:
                         logger.error(
                             "get_user_sparkline_traffic legacy %s: статус %s",
-                            user_uuid, resp.status,
+                            user_id_or_uuid, resp.status,
                         )
             except asyncio.TimeoutError:
-                logger.warning("get_user_sparkline_traffic legacy %s: timeout", user_uuid)
+                logger.warning("get_user_sparkline_traffic legacy %s: timeout", user_id_or_uuid)
             except Exception as e:
-                logger.error("get_user_sparkline_traffic legacy %s: %s", user_uuid, e)
+                logger.error("get_user_sparkline_traffic legacy %s: %s", user_id_or_uuid, e)
+        return None
+
+    async def get_nodes_bandwidth_stats(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        timeout_s: float = 5.0,
+    ) -> Optional[dict]:
+        """Получает посуточную статистику трафика по нодам за указанное окно.
+        
+        Использует эндпоинт `/api/bandwidth-stats/nodes?start=YYYY-MM-DD&end=YYYY-MM-DD`.
+        Возвращает dict с ответом от панели или None при ошибке.
+        """
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with self._session(timeout=timeout) as session:
+            url = f"{self.base_url}/api/bandwidth-stats/nodes"
+            params = {"start": start_date, "end": end_date}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") or data
+                    logger.error(
+                        "get_nodes_bandwidth_stats: статус %s",
+                        resp.status,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning("get_nodes_bandwidth_stats: timeout")
+            except Exception as e:
+                logger.error("get_nodes_bandwidth_stats: %s", e)
         return None
 
     async def set_user_expire_unlimited(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
@@ -311,18 +409,50 @@ class RemnawaveAPI:
         ok = await self.patch_user({"uuid": user_uuid, "expireAt": new_iso})
         return ok, new_iso if ok else None
 
+    async def resolve_user(self, identifier: Union[str, int]) -> Optional[dict]:
+        """POST /api/users/resolve — резолвит UUID, shortUuid или username в словарь с {id, uuid, shortUuid, username}."""
+        str_id = str(identifier).strip()
+        if not str_id:
+            return None
+        if str_id.isdigit():
+            payload = {"id": int(str_id)}
+        elif "-" in str_id and len(str_id) >= 32:
+            payload = {"uuid": str_id}
+        else:
+            payload = {"shortUuid": str_id}
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/users/resolve"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response")
+                    err = await resp.text()
+                    logger.warning(f"resolve_user не удалось для {identifier}: {resp.status} {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"resolve_user ошибка при {identifier}: {e}")
+                return None
+
     async def delete_user(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
-        """DELETE /api/users/{uuid} — удалить пользователя из панели.
-        Возвращает (ok, error_code). 404/A025 трактуется как «уже удалён» — ok=True.
-        """
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            url = f"{self.base_url}/api/users/{user_uuid}"
+        """Удаляет пользователя по UUID или numeric ID. Возвращает (успех: bool, error_msg: str | None)."""
+        str_id = str(user_uuid).strip()
+        numeric_id = str_id if str_id.isdigit() else None
+        if not numeric_id:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = str(resolved["id"])
+
+        if not numeric_id:
+            logger.error(f"delete_user: не удалось определить numeric ID для {user_uuid}")
+            return False, "user_not_found"
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/users/{numeric_id}"
             try:
                 async with session.delete(url) as resp:
-                    if resp.status == 200 or resp.status == 204:
-                        return True, None
-                    if resp.status == 404:
-                        # уже удалён
+                    if resp.status in (200, 204, 404):
                         return True, None
                     err = await resp.text()
                     logger.error(f"delete_user: статус {resp.status}, ответ: {err}")
@@ -335,7 +465,7 @@ class RemnawaveAPI:
         """GET /api/users?size=&start= — постраничный список юзеров.
         Возвращает dict вида {'response': {'total': int, 'users': [...]}} или None при ошибке.
         """
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/users"
             params = {"size": size, "start": start}
             try:
@@ -349,17 +479,28 @@ class RemnawaveAPI:
                 logger.error(f"list_users: {e}")
                 return None
 
-    async def get_user_info(self, user_id: str) -> dict:
-        """Получает информацию о пользователе. В user_id можно пробовать передавать UUID или username."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            url = f"{self.base_url}/api/users/{user_id}"
-            logger.info(f"Запрос инфо о пользователе: {url}")
-            
+    async def get_user_info(self, user_id: Union[str, int]) -> Optional[dict]:
+        """Получает информацию о пользователе по numeric ID, UUID или shortUuid."""
+        str_id = str(user_id).strip()
+        numeric_id = str_id if str_id.isdigit() else None
+        if not numeric_id:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = str(resolved["id"])
+
+        if not numeric_id:
+            logger.error(f"get_user_info: не удалось определить numeric ID для {user_id}")
+            return None
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/users/{numeric_id}"
+            logger.info(f"Запрос инфо о пользователе: {url} (origin: {user_id})")
+
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        logger.info(f"Данные получены успешно для {user_id}")
+                        logger.info(f"Данные получены успешно для {user_id} (numeric id: {numeric_id})")
                         return data
                     else:
                         err = await resp.text()
@@ -369,10 +510,23 @@ class RemnawaveAPI:
                 logger.error(f"❌ Ошибка соединения при get_user_info: {e}")
                 return None
 
-    async def get_user_hwid_devices(self, user_uuid: str) -> Optional[dict]:
-        """GET /api/hwid/devices/{userUuid} — список устройств пользователя."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            url = f"{self.base_url}/api/hwid/devices/{user_uuid}"
+    async def get_user_hwid_devices(self, user_id_or_uuid: Union[str, int]) -> Optional[dict]:
+        """GET /api/hwid/devices/{userId} — список устройств пользователя.
+        {userId} должен быть числовым ID в обновлённой панели.
+        """
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = str_id if str_id.isdigit() else None
+        if not numeric_id:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = str(resolved["id"])
+
+        if not numeric_id:
+            logger.error(f"get_user_hwid_devices: не удалось определить numeric ID для {user_id_or_uuid}")
+            return None
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/hwid/devices/{numeric_id}"
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -384,11 +538,24 @@ class RemnawaveAPI:
                 logger.error(f"get_user_hwid_devices: {e}")
                 return None
 
-    async def delete_user_hwid_device(self, user_uuid: str, hwid: str) -> bool:
-        """POST /api/hwid/devices/delete — удалить устройство по HWID."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+    async def delete_user_hwid_device(self, user_id_or_uuid: Union[str, int], hwid: str) -> bool:
+        """POST /api/hwid/devices/delete — удалить устройство по HWID.
+        Тело: {"userId": int, "hwid": str}.
+        """
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = int(str_id) if str_id.isdigit() else None
+        if numeric_id is None:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = int(resolved["id"])
+
+        if numeric_id is None:
+            logger.error(f"delete_user_hwid_device: не удалось определить numeric ID для {user_id_or_uuid}")
+            return False
+
+        async with self._session() as session:
             url = f"{self.base_url}/api/hwid/devices/delete"
-            payload = {"userUuid": user_uuid, "hwid": hwid}
+            payload = {"userId": numeric_id, "hwid": hwid}
             try:
                 async with session.post(url, json=payload) as resp:
                     if resp.status != 200:
@@ -405,7 +572,7 @@ class RemnawaveAPI:
 
     async def list_nodes(self) -> Optional[list]:
         """GET /api/nodes — все ноды панели. Возвращает список dict'ов или None."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes"
             try:
                 async with session.get(url) as resp:
@@ -423,7 +590,7 @@ class RemnawaveAPI:
 
     async def get_node(self, uuid: str) -> Optional[dict]:
         """GET /api/nodes/{uuid} — карточка одной ноды."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes/{uuid}"
             try:
                 async with session.get(url) as resp:
@@ -438,7 +605,7 @@ class RemnawaveAPI:
 
     async def create_node(self, payload: dict) -> Optional[dict]:
         """POST /api/nodes — создать ноду. payload: name/address/port/configProfileUuid и т.д."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes"
             try:
                 async with session.post(url, json=payload) as resp:
@@ -456,7 +623,7 @@ class RemnawaveAPI:
 
     async def update_node(self, payload: dict) -> Optional[dict]:
         """PATCH /api/nodes — обновить ноду (uuid передаётся в payload)."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes"
             try:
                 async with session.patch(url, json=payload) as resp:
@@ -471,7 +638,7 @@ class RemnawaveAPI:
 
     async def delete_node(self, uuid: str) -> bool:
         """DELETE /api/nodes/{uuid}."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes/{uuid}"
             try:
                 async with session.delete(url) as resp:
@@ -485,7 +652,7 @@ class RemnawaveAPI:
 
     async def _node_action(self, uuid: str, action: str) -> bool:
         """POST /api/nodes/{uuid}/actions/{action} — общий метод для enable/disable/restart/reset-traffic."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes/{uuid}/actions/{action}"
             try:
                 async with session.post(url) as resp:
@@ -511,7 +678,7 @@ class RemnawaveAPI:
 
     async def restart_all_nodes(self) -> bool:
         """POST /api/nodes/actions/restart-all."""
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        async with self._session() as session:
             url = f"{self.base_url}/api/nodes/actions/restart-all"
             try:
                 async with session.post(url, json={}) as resp:
@@ -522,3 +689,164 @@ class RemnawaveAPI:
             except Exception as e:
                 logger.error(f"restart_all_nodes: {e}")
                 return False
+
+    # =========================================================================
+    # Infra Billing
+    # =========================================================================
+
+    async def list_billing_providers(self) -> Optional[list]:
+        """GET /api/infra-billing/providers."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/providers"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            r = data["response"]
+                            return r.get("providers") if isinstance(r, dict) else r
+                        return data.get("providers") if isinstance(data, dict) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_providers: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_providers: {e}")
+                return None
+
+    async def get_billing_provider(self, uuid: str) -> Optional[dict]:
+        """GET /api/infra-billing/providers/{uuid}."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"get_billing_provider: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_billing_provider: {e}")
+                return None
+
+    async def create_billing_provider(self, payload: dict) -> Optional[dict]:
+        """POST /api/infra-billing/providers."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/providers"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status in (200, 201):
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"create_billing_provider: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"create_billing_provider: {e}")
+                return None
+
+    async def delete_billing_provider(self, uuid: str) -> bool:
+        """DELETE /api/infra-billing/providers/{uuid}."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status not in (200, 204):
+                        err = await resp.text()
+                        logger.error(f"delete_billing_provider: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 204)
+            except Exception as e:
+                logger.error(f"delete_billing_provider: {e}")
+                return False
+
+    async def list_billing_nodes(self) -> Optional[list]:
+        """GET /api/infra-billing/nodes."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            r = data["response"]
+                            return r.get("billingNodes") if isinstance(r, dict) else r
+                        return data.get("billingNodes") if isinstance(data, dict) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_nodes: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_nodes: {e}")
+                return None
+
+    async def create_billing_node(self, payload: dict) -> Optional[dict]:
+        """POST /api/infra-billing/nodes."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status in (200, 201):
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"create_billing_node: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"create_billing_node: {e}")
+                return None
+
+    async def update_billing_nodes(self, payload: dict) -> Optional[dict]:
+        """PATCH /api/infra-billing/nodes."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/nodes"
+            try:
+                async with session.patch(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            return data["response"]
+                        return data
+                    err = await resp.text()
+                    logger.error(f"update_billing_nodes: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"update_billing_nodes: {e}")
+                return None
+
+    async def delete_billing_node(self, uuid: str) -> bool:
+        """DELETE /api/infra-billing/nodes/{uuid}."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/nodes/{uuid}"
+            try:
+                async with session.delete(url) as resp:
+                    if resp.status not in (200, 204):
+                        err = await resp.text()
+                        logger.error(f"delete_billing_node: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 204)
+            except Exception as e:
+                logger.error(f"delete_billing_node: {e}")
+                return False
+
+    async def list_billing_history(self, params: dict) -> Optional[list]:
+        """GET /api/infra-billing/history."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/infra-billing/history"
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "response" in data:
+                            r = data["response"]
+                            return r.get("records") if isinstance(r, dict) else r
+                        return data.get("records") if isinstance(data, dict) else None
+                    err = await resp.text()
+                    logger.error(f"list_billing_history: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"list_billing_history: {e}")
+                return None

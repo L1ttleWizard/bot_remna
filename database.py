@@ -165,6 +165,37 @@ async def init_db():
             """
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS node_metrics_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_uuid TEXT NOT NULL,
+                cpu_load REAL NOT NULL,
+                ram_usage REAL NOT NULL,
+                users_online INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_metrics_history_node_uuid_ts ON node_metrics_history(node_uuid, timestamp)"
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referee_id INTEGER UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)"
+        )
+
 
         # One-time backfill: copy legacy users.uuid → subscriptions for users
         # that don't have a corresponding subscription yet.
@@ -1220,5 +1251,95 @@ async def mark_cpu_alerted(node_uuid: str) -> None:
             (node_uuid,),
         )
         await db.commit()
+
+
+async def add_node_metrics(node_uuid: str, cpu_load: float, ram_usage: float, users_online: int) -> None:
+    now_ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO node_metrics_history (node_uuid, cpu_load, ram_usage, users_online, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (node_uuid, float(cpu_load), float(ram_usage), int(users_online), now_ts),
+        )
+        await db.commit()
+
+
+async def get_node_metrics_history(node_uuid: str, hours: int = 24) -> list:
+    cutoff = int(time.time()) - (hours * 3600)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT timestamp, cpu_load, ram_usage, users_online
+            FROM node_metrics_history
+            WHERE node_uuid = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (node_uuid, cutoff),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return list(rows)
+
+
+async def cleanup_old_node_metrics(before_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM node_metrics_history WHERE timestamp < ?",
+            (int(before_ts),),
+        )
+        await db.commit()
+
+
+async def add_referral_relation(referrer_id: int, referee_id: int) -> bool:
+    """Saves a referral link between two Telegram IDs. Returns True if saved, False if already exists."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """
+                INSERT INTO referrals (referrer_id, referee_id, status, created_at)
+                VALUES (?, ?, 'pending', ?)
+                """,
+                (int(referrer_id), int(referee_id), now),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def get_referral_by_referee(referee_id: int) -> Optional[tuple]:
+    """Checks if a user was referred by someone. Returns row or None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, referrer_id, referee_id, status, created_at FROM referrals WHERE referee_id = ?",
+            (int(referee_id),),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def mark_referral_rewarded(referee_id: int) -> None:
+    """Updates status to 'rewarded' when referee activates subscription."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE referrals SET status = 'rewarded' WHERE referee_id = ?",
+            (int(referee_id),),
+        )
+        await db.commit()
+
+
+async def get_referral_stats(referrer_id: int) -> tuple[int, int]:
+    """Returns (total_referred, active_rewarded)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN status = 'rewarded' THEN 1 ELSE 0 END) FROM referrals WHERE referrer_id = ?",
+            (int(referrer_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return (int(row[0] or 0), int(row[1] or 0))
+            return (0, 0)
+
 
 

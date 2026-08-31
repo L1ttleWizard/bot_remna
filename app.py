@@ -130,6 +130,10 @@ class AdminNotifyStates(StatesGroup):
     waiting_for_cpu_duration = State()
 
 
+class AdminServerCmdStates(StatesGroup):
+    waiting_for_command = State()
+
+
 
 
 # --- Settings KV keys ---
@@ -147,6 +151,12 @@ NODE_DOWN_NOTIFY_ENABLED_KEY = "node_down_notify_enabled"
 CPU_NOTIFY_ENABLED_KEY = "cpu_notify_enabled"
 CPU_THRESHOLD_KEY = "cpu_threshold"
 CPU_SUSTAINED_MINUTES_KEY = "cpu_sustained_minutes"
+
+# Referral monitoring settings keys
+REFERRAL_NOTIFY_ENABLED_KEY = "referral_notify_enabled"
+
+# Auto-restart settings keys
+NODE_AUTORESTART_ENABLED_KEY = "node_autorestart_enabled"
 
 
 
@@ -212,10 +222,20 @@ class CleanChatUserMessageMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         if isinstance(event, Message) and event.chat.type == "private":
-            try:
-                await event.delete()
-            except Exception:
-                pass
+            state: Optional[FSMContext] = data.get("state")
+            should_delete = True
+            if state:
+                try:
+                    current_state = await state.get_state()
+                    if current_state == "AdminBroadcastStates:waiting_for_message":
+                        should_delete = False
+                except Exception:
+                    pass
+            if should_delete:
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
         return await handler(event, data)
 
 
@@ -233,6 +253,20 @@ class CleanChatBotMessageMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class DebugUpdateMiddleware(BaseMiddleware):
+    """Логирует все входящие обновления (Update) для отладки."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        logger.info("INCOMING UPDATE: %s", event)
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(DebugUpdateMiddleware())
 dp.message.outer_middleware(CleanChatUserMessageMiddleware())
 dp.message.middleware(CleanChatBotMessageMiddleware())
 dp.message.middleware(TgProfileMiddleware())

@@ -12,6 +12,7 @@ UI:
 """
 import html
 import logging
+import asyncio
 from typing import Any
 
 from aiogram import F
@@ -21,10 +22,13 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    BufferedInputFile,
+    InputMediaPhoto,
 )
 
 import auth
 import config
+import database as db
 from app import api, dp, safe_edit
 from formatters import human_bytes
 
@@ -63,9 +67,12 @@ def _nodes_list_keyboard(nodes: list[dict]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="➕ Добавить ноду", callback_data="addnode:start")])
     rows.append([
         InlineKeyboardButton(text="🔄 Перезапустить все", callback_data="nodes:restart_all_confirm"),
-        InlineKeyboardButton(text="🔁 Обновить", callback_data="admin_nodes"),
+        InlineKeyboardButton(text="⚡ Speedtest всех", callback_data="nodes:speedtest_all"),
     ])
-    rows.append([InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")])
+    rows.append([
+        InlineKeyboardButton(text="🔁 Обновить", callback_data="admin_nodes"),
+        InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -86,9 +93,13 @@ def _node_card_keyboard(node: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="💳 Биллинг", callback_data=f"nodes:billing:{uuid}"),
+            InlineKeyboardButton(text="📈 График нагрузки", callback_data=f"nodes:chart:{uuid}"),
         ],
         [
+            InlineKeyboardButton(text="⚡ Speedtest", callback_data=f"nodes:speedtest:{uuid}"),
             InlineKeyboardButton(text="🔁 Обновить", callback_data=f"nodes:card:{uuid}"),
+        ],
+        [
             InlineKeyboardButton(text="✈️ К списку", callback_data="admin_nodes"),
         ],
     ]
@@ -104,7 +115,8 @@ def get_cores_word(n: int) -> str:
         return "ядер"
 
 
-def _node_card_text(node: dict) -> str:
+async def _node_card_text(node: dict) -> str:
+    uuid = node.get("uuid") or ""
     name = html.escape(str(node.get("name") or "—"))
     addr = html.escape(str(node.get("address") or "—"))
     port = node.get("port") or "—"
@@ -203,21 +215,21 @@ def _node_card_text(node: dict) -> str:
             except (ValueError, TypeError):
                 lines.append(f"  · RAM: {html.escape(str(total_ram))}")
       # биллинг ноды (если привязана)
-    try:
-        from handlers.admin_billing import _find_billing_for_node, _fmt_date, _days_until
-        bn = await _find_billing_for_node(uuid)
-        if bn:
-            prov = bn.get("provider", {}).get("name") or bn.get("providerName") or "—"
-            d = _days_until(bn.get("nextBillingAt"))
-            tail = f" (через {d} дн.)" if d is not None else ""
-            text = text + (
-                f"\n\n💳 <b>Биллинг</b>\n"
-                f"  · Провайдер: <b>{html.escape(str(prov))}</b>\n"
-                f"  · Следующее списание: <b>{_fmt_date(bn.get('nextBillingAt'))}</b>{tail}"
-            )
-    except Exception as e:
-        logger.warning(f"node billing block: {e}")
-        
+    if uuid:
+        try:
+            from handlers.admin_billing import _find_billing_for_node, _fmt_date, _days_until
+            bn = await _find_billing_for_node(uuid)
+            if bn:
+                prov = bn.get("provider", {}).get("name") or bn.get("providerName") or "—"
+                d = _days_until(bn.get("nextBillingAt"))
+                tail = f" (через {d} дн.)" if d is not None else ""
+                lines.append("")
+                lines.append("💳 <b>Биллинг</b>")
+                lines.append(f"  · Провайдер: <b>{html.escape(str(prov))}</b>")
+                lines.append(f"  · Следующее списание: <b>{_fmt_date(bn.get('nextBillingAt'))}</b>{tail}")
+        except Exception as e:
+            logger.warning(f"node billing block: {e}")
+
     lines.append("")
     lines.append(f"Последнее изменение статуса: {last_status_change}")
     if last_status_msg and last_status_msg != "—":
@@ -319,7 +331,7 @@ async def cb_node_card(callback: CallbackQuery):
     await callback.answer("Загрузка…")
     await safe_edit(
         callback,
-        _node_card_text(node),
+        await _node_card_text(node),
         parse_mode="HTML",
         reply_markup=_node_card_keyboard(node),
         prefer_edit=True,
@@ -361,7 +373,7 @@ async def cb_node_action(callback: CallbackQuery):
     if node:
         await safe_edit(
             callback,
-            _node_card_text(node),
+            await _node_card_text(node),
             parse_mode="HTML",
             reply_markup=_node_card_keyboard(node),
             prefer_edit=True,
@@ -441,6 +453,293 @@ async def cmd_nodes(message: Message):
                 f"   юзеров online: {users} · трафик: {html.escape(human_bytes(traffic))}"
             )
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("nodes:chart:"))
+async def cb_node_chart(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+        
+    uuid = callback.data.split(":", 2)[2]
+    
+    # 1. Fetch node info to get name
+    payload = await api.get_node(uuid)
+    node = (payload or {}).get("response") if isinstance(payload, dict) else None
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+        
+    node_name = node.get("name") or "Без названия"
+    await callback.answer("Генерируем график нагрузки...")
+    
+    # 2. Get metric history for the last 24 hours
+    try:
+        metrics = await db.get_node_metrics_history(uuid, hours=24)
+        
+        # 3. Generate chart using our service
+        from services.chart_generator import generate_node_load_chart
+        loop = asyncio.get_running_loop()
+        image_bytes = await loop.run_in_executor(
+            None, generate_node_load_chart, node_name, metrics
+        )
+        
+        # 4. Create an inline keyboard to go back to the node card or refresh the chart
+        back_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Обновить график", callback_data=f"nodes:chart:{uuid}"),
+                InlineKeyboardButton(text="◀️ К ноде", callback_data=f"nodes:card:{uuid}"),
+            ]
+        ])
+        
+        # 5. Send/update the photo
+        photo_file = BufferedInputFile(image_bytes, filename=f"load_chart_{uuid}.png")
+        
+        # Check if the current message is already a photo message (to update in-place)
+        if callback.message.photo:
+            try:
+                await callback.message.edit_media(
+                    media=InputMediaPhoto(
+                        media=photo_file, 
+                        caption=f"📈 График нагрузки ноды <b>{html.escape(node_name)}</b> за последние 24 часа.", 
+                        parse_mode="HTML"
+                    ),
+                    reply_markup=back_kb
+                )
+                return
+            except Exception as e:
+                logger.info("Failed to edit media in-place: %s. Falling back to delete and send.", e)
+
+        # Otherwise, delete the original text card and send a new photo message
+        await callback.message.delete()
+        await callback.message.answer_photo(
+            photo=photo_file,
+            caption=f"📈 График нагрузки ноды <b>{html.escape(node_name)}</b> за последние 24 часа.",
+            parse_mode="HTML",
+            reply_markup=back_kb
+        )
+        
+    except Exception as e:
+        logger.exception("Ошибка при генерации графика нагрузки: %s", e)
+        await callback.message.answer(f"❌ Не удалось сгенерировать график нагрузки: {e}")
+
+
+async def _execute_node_speedtest(node: dict) -> tuple[bool, str, str, str, str]:
+    """
+    Выполняет замер скорости на ноде через SSH с помощью встроенного python-скрипта.
+    Возвращает (success, download, upload, ping, error_msg).
+    """
+    name = node.get("name") or "Без названия"
+    address = node.get("address")
+    if not address:
+        return False, "—", "—", "—", "У ноды нет IP-адреса."
+        
+    cmd = (
+        'echo "aW1wb3J0IHVybGxpYi5yZXF1ZXN0LCB0aW1lLCBzc2wKZGVmIHRlc3Rfc3BlZWQoKToKICAgIHRyeToKICAgICAgICBzc2wuX2NyZWF0ZV9kZWZhdWx0X2h0dHBzX2NvbnRleHQgPSBzc2wuX2NyZWF0ZV91bnZlcmlmaWVkX2NvbnRleHQKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwogICAgb3BlbmVyID0gdXJsbGliLnJlcXVlc3QuYnVpbGRfb3BlbmVyKCkKICAgIG9wZW5lci5hZGRoZWFkZXJzID0gWygnVXNlci1BZ2VudCcsICdNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYnKV0KICAgIHVybGxpYi5yZXF1ZXN0Lmluc3RhbGxfb3BlbmVyKG9wZW5lcikKICAgIHBpbmdzID0gW10KICAgIGZvciBfIGluIHJhbmdlKDMpOgogICAgICAgIHQwID0gdGltZS50aW1lKCkKICAgICAgICB0cnk6CiAgICAgICAgICAgIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4oJ2h0dHBzOi8vc3BlZWQuY2xvdWRmbGFyZS5jb20vY2RuLWNnaS90cmFjZScsIHRpbWVvdXQ9MikKICAgICAgICAgICAgcGluZ3MuYXBwZW5kKCh0aW1lLnRpbWUoKSAtIHQwKSAqIDEwMDApCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgcGFzcwogICAgcGluZyA9IHN1bShwaW5ncykgLyBsZW4ocGluZ3MpIGlmIHBpbmdzIGVsc2UgOTk5LjAKICAgIHQwID0gdGltZS50aW1lKCkKICAgIHRyeToKICAgICAgICB1cmxsaWIucmVxdWVzdC51cmxyZXRyaWV2ZSgnaHR0cHM6Ly9zcGVlZC5jbG91ZGZsYXJlLmNvbS9fX2Rvd24/Ynl0ZXM9MTA0ODU3NjAnLCAnL2Rldi9udWxsJykKICAgICAgICBkdCA9IHRpbWUudGltZSgpIC0gdDAKICAgICAgICBkb3dubG9hZCA9ICgxMCAqIDgpIC8gZHQKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgZG93bmxvYWQgPSAwLjAKICAgIHQwID0gdGltZS50aW1lKCkKICAgIHRyeToKICAgICAgICBkYXRhID0gYicwJyAqIDUyNDI4ODAKICAgICAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KCdodHRwczovL3NwZWVkLmNsb3VkZmxhcmUuY29tL19fdXAnLCBkYXRhPWRhdGEsIG1ldGhvZD0nUE9TVCcpCiAgICAgICAgdXJsbGliLnJlcXVlc3QudXJsb3BlbihyZXEpCiAgICAgICAgZHQgPSB0aW1lLnRpbWUoKSAtIHQwCiAgICAgICAgdXBsb2FkID0gKDUgKiA4KSAvIGR0CiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHVwbG9hZCA9IDAuMAogICAgcHJpbnQoJ1Bpbmc6JywgZid7aW50KHBpbmcpfSBtcycpCiAgICBwcmludCgnRG93bmxvYWQ6JywgZid7ZG93bmxvYWQ6LjJmfSBNYml0L3MnKQogICAgcHJpbnQoJ1VwbG9hZDonLCBmJ3t1cGxvYWQ6LjJmfSBNYml0L3MnKQp0ZXN0X3NwZWVkKCk=" | base64 -d > /tmp/speedtest_cf.py && python3 /tmp/speedtest_cf.py'
+    )
+    
+    ssh_cmd = [
+        "ssh",
+        "-i", "/run/secrets/master_ssh_key",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        f"root@{address}",
+        cmd
+    ]
+    
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=35)
+        stdout = stdout_bytes.decode("utf-8", errors="ignore").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="ignore").strip()
+        
+        if proc.returncode != 0:
+            err = stderr or "SSH connection error / Auth failed"
+            return False, "—", "—", "—", err
+            
+        ping_val = "—"
+        download_val = "—"
+        upload_val = "—"
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Ping:"):
+                ping_val = line.split(":", 1)[1].strip()
+            elif line.startswith("Download:"):
+                download_val = line.split(":", 1)[1].strip()
+            elif line.startswith("Upload:"):
+                upload_val = line.split(":", 1)[1].strip()
+                
+        return True, download_val, upload_val, ping_val, ""
+    except asyncio.TimeoutError:
+        return False, "—", "—", "—", "Превышено время ожидания (timeout)"
+    except Exception as e:
+        return False, "—", "—", "—", str(e)
+
+
+@dp.callback_query(F.data.startswith("nodes:speedtest:"))
+async def cb_node_speedtest(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+
+    uuid = callback.data.split(":", 2)[2]
+    
+    # 1. Fetch node info to get name & address
+    payload = await api.get_node(uuid)
+    node = (payload or {}).get("response") if isinstance(payload, dict) else None
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+        
+    node_name = node.get("name") or "Без названия"
+    node_address = node.get("address") or ""
+    
+    if not node_address:
+        await callback.answer("У ноды нет IP-адреса.", show_alert=True)
+        return
+
+    await callback.answer("Запуск замера скорости...")
+    
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К ноде", callback_data=f"nodes:card:{uuid}")]
+    ])
+    await safe_edit(
+        callback,
+        f"⏳ <b>{html.escape(node_name)}</b> (<code>{node_address}</code>)\n\n"
+        f"<i>Выполняется замер скорости... Это может занять около 15 секунд.</i>",
+        parse_mode="HTML",
+        reply_markup=back_kb,
+        prefer_edit=True
+    )
+
+    try:
+        ok, dl, ul, png, err = await _execute_node_speedtest(node)
+        
+        if not ok:
+            logger.error("Speedtest failed for node %s: %s", node_name, err)
+            await safe_edit(
+                callback,
+                f"❌ <b>Замер скорости на ноде {html.escape(node_name)} провалился.</b>\n\n"
+                f"<code>{html.escape(err)}</code>",
+                parse_mode="HTML",
+                reply_markup=back_kb,
+                prefer_edit=True
+            )
+            return
+
+        updated_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔁 Повторить замер", callback_data=f"nodes:speedtest:{uuid}"),
+                InlineKeyboardButton(text="◀️ К ноде", callback_data=f"nodes:card:{uuid}"),
+            ]
+        ])
+        
+        result_text = (
+            f"⚡ <b>Результаты Speedtest для {html.escape(node_name)}</b>\n"
+            f"<code>{node_address}</code>\n\n"
+            f"• <b>Ping:</b> {html.escape(png)}\n"
+            f"• <b>Download:</b> {html.escape(dl)}\n"
+            f"• <b>Upload:</b> {html.escape(ul)}"
+        )
+        
+        await safe_edit(
+            callback,
+            result_text,
+            parse_mode="HTML",
+            reply_markup=updated_kb,
+            prefer_edit=True
+        )
+
+    except Exception as e:
+        logger.exception("Unexpected error in cb_node_speedtest")
+        await safe_edit(
+            callback,
+            f"❌ <b>Произошла ошибка при выполнении замера скорости:</b>\n"
+            f"<code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+            reply_markup=back_kb,
+            prefer_edit=True
+        )
+
+
+@dp.callback_query(F.data == "nodes:speedtest_all")
+async def cb_nodes_speedtest_all(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администраторов.", show_alert=True)
+        return
+
+    nodes = await api.list_nodes()
+    if nodes is None:
+        nodes = []
+
+    active_nodes = [n for n in nodes if not n.get("isDisabled")]
+    if not active_nodes:
+        await callback.answer("Нет активных нод для замера скорости.", show_alert=True)
+        return
+
+    await callback.answer("Запускаю общий замер скорости...")
+    
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к списку нод", callback_data="admin_nodes")]
+    ])
+    
+    await safe_edit(
+        callback,
+        "⏳ <b>Запуск замера скорости на всех активных нодах одновременно...</b>\n\n"
+        f"Активных серверов: {len(active_nodes)}\n"
+        "<i>Это может занять до 30 секунд.</i>",
+        parse_mode="HTML",
+        reply_markup=back_kb,
+        prefer_edit=True
+    )
+
+    try:
+        tasks = [_execute_node_speedtest(n) for n in active_nodes]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        lines = ["⚡ <b>Результаты Speedtest всех нод:</b>\n"]
+        
+        for n, res in zip(active_nodes, results):
+            name = n.get("name") or "Без названия"
+            if isinstance(res, Exception):
+                lines.append(f"🔴 <b>{html.escape(name)}</b>: ошибка <code>{html.escape(str(res)[:50])}</code>")
+            else:
+                ok, dl, ul, png, err = res
+                if ok:
+                    lines.append(f"🟢 <b>{html.escape(name)}</b>:\n   ⬇️ {html.escape(dl)} | ⬆️ {html.escape(ul)} (ping: {html.escape(png)})")
+                else:
+                    lines.append(f"🔴 <b>{html.escape(name)}</b>: <code>{html.escape(err[:50])}</code>")
+                    
+        updated_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔁 Повторить общий замер", callback_data="nodes:speedtest_all"),
+                InlineKeyboardButton(text="◀️ Назад к списку нод", callback_data="admin_nodes"),
+            ]
+        ])
+        
+        await safe_edit(
+            callback,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=updated_kb,
+            prefer_edit=True
+        )
+    except Exception as e:
+        logger.exception("Unexpected error in cb_nodes_speedtest_all")
+        await safe_edit(
+            callback,
+            f"❌ <b>Произошла ошибка при общем замере скорости:</b>\n"
+            f"<code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+            reply_markup=back_kb,
+            prefer_edit=True
+        )
+
 
 
 

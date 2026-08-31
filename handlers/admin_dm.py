@@ -156,8 +156,15 @@ async def process_broadcast_message(message: Message, state: FSMContext):
             success_count += 1
             # Защита от лимитов (30 сообщений в секунду)
             await asyncio.sleep(0.05)
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.exception(f"Error broadcasting message to user {tg_id}")
             failed_count += 1
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     elapsed = time.time() - start_time
     await status_msg.answer(

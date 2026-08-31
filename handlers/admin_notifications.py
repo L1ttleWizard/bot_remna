@@ -22,6 +22,7 @@ from app import (
     CPU_NOTIFY_ENABLED_KEY,
     CPU_THRESHOLD_KEY,
     CPU_SUSTAINED_MINUTES_KEY,
+    REFERRAL_NOTIFY_ENABLED_KEY,
     AdminNotifyStates,
     dp,
     safe_edit,
@@ -133,6 +134,33 @@ async def get_server_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
     return body, kb
 
 
+async def get_referral_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
+    ref_enabled = (await db.get_setting(REFERRAL_NOTIFY_ENABLED_KEY)) != "0"
+    ref_status = "✅ Включены" if ref_enabled else "❌ Выключены"
+    
+    body = (
+        "👥 <b>Настройка реферальных уведомлений</b>\n\n"
+        "Оповещения для администраторов в чате:\n"
+        "• При переходе нового пользователя по реферальной ссылке\n"
+        "• При активации первой подписки приглашенным пользователем (+7 дней инвайтеру)\n\n"
+        f"Текущий статус: <b>{ref_status}</b>"
+    )
+    
+    btn_toggle = InlineKeyboardButton(
+        text="👥 Уведомления: " + ("Выключить ❌" if ref_enabled else "Включить ✅"),
+        callback_data="admin_notify_toggle:referral",
+    )
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn_toggle],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_notify_settings")],
+        ]
+    )
+    return body, kb
+
+
+
 @dp.callback_query(F.data == "admin_notify_settings")
 async def cb_admin_notify_settings(callback: CallbackQuery, state: FSMContext):
     if not await auth.is_admin(callback.from_user.id):
@@ -148,6 +176,9 @@ async def cb_admin_notify_settings(callback: CallbackQuery, state: FSMContext):
             [
                 InlineKeyboardButton(text="📅 Подписки", callback_data="admin_notify_subs_menu"),
                 InlineKeyboardButton(text="🖥 Серверы", callback_data="admin_notify_servers_menu"),
+            ],
+            [
+                InlineKeyboardButton(text="👥 Рефералы", callback_data="admin_notify_referrals_menu"),
             ],
             [
                 InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel"),
@@ -180,6 +211,18 @@ async def cb_admin_notify_servers_menu(callback: CallbackQuery, state: FSMContex
     await callback.answer()
 
 
+@dp.callback_query(F.data == "admin_notify_referrals_menu")
+async def cb_admin_notify_referrals_menu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
+    body, kb = await get_referral_settings_summary()
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+
 @dp.callback_query(F.data.startswith("admin_notify_toggle:"))
 async def cb_admin_notify_toggle(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -202,6 +245,10 @@ async def cb_admin_notify_toggle(callback: CallbackQuery):
         cur = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
         await db.set_setting(CPU_NOTIFY_ENABLED_KEY, "0" if cur else "1")
         body, kb = await get_server_settings_summary()
+    elif target == "referral":
+        cur = (await db.get_setting(REFERRAL_NOTIFY_ENABLED_KEY)) != "0"
+        await db.set_setting(REFERRAL_NOTIFY_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_referral_settings_summary()
     else:
         return
 

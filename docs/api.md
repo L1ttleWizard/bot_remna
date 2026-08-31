@@ -1,0 +1,27 @@
+# API Contracts & Remnawave Integration
+
+## Overview
+
+The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave backend 2026+, user identification has been migrated to numeric IDs (`userId` / `id`), while preserving UUIDs as secondary metadata.
+
+## Remnawave Endpoints
+
+### 1. User Management
+- `GET /api/users`: Fetches paginated user list. Returns `{"response": [...]}` or `{"response": {"users": [...], "total": ...}}`.
+- `GET /api/users/{userId}`: Gets full user profile by numeric ID.
+- `POST /api/users/resolve`: Resolves identifier `{uuid: "..."}` or `{shortUuid: "..."}` to `{id, uuid, shortUuid, username}`.
+- `POST /api/users`: Creates a new user with `username`, `expireAt`, `status`, `hwidDeviceLimit`, and optional `activeInternalSquads`.
+- `PATCH /api/users`: Updates user attributes (e.g. `expireAt`, `hwidDeviceLimit`, `activeInternalSquads`). Requires `id` or `uuid`.
+- `DELETE /api/users/{userId}`: Deletes user by numeric ID.
+
+### 2. HWID Device Management
+- `GET /api/hwid/devices/{userId}`: Lists active HWID devices for a user.
+- `POST /api/hwid/devices/delete`: Deletes a device by payload `{"userId": int, "hwid": str}`.
+
+### 3. Bandwidth Statistics
+- `GET /api/bandwidth-stats/users/{userId}`: Returns user traffic history with params `start`, `end`, `topNodesLimit`.
+- `GET /api/bandwidth-stats/nodes`: Returns aggregate traffic series across all nodes.
+
+### 4. Nodes & Squads
+- `GET /api/nodes`: Lists all nodes and their status (`isConnected`, `isDisabled`, `address`, `name`).
+- `GET /api/internal-squads`: Lists internal squads (profiles) available in the panel.

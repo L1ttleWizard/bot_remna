@@ -256,6 +256,7 @@ def test_get_cores_word():
 def test_node_card_text_rendering():
     from handlers.admin_nodes import _node_card_text
     node = {
+        "uuid": "node-uuid-123",
         "name": "Test Node",
         "address": "1.2.3.4",
         "port": 1234,
@@ -278,11 +279,141 @@ def test_node_card_text_rendering():
             }
         }
     }
-    text = _node_card_text(node)
+    with patch("handlers.admin_billing._find_billing_for_node", new_callable=AsyncMock) as mock_find:
+        mock_find.return_value = None
+        text = asyncio.run(_node_card_text(node))
     assert "Test Node" in text
     assert "1.2.3.4:1234" in text
     assert "Intel i7 (4 ядра)" in text
     assert "Load Average: <code>0.40, 0.80, 1.20</code>" in text
     assert "Загрузка (1/5/15 мин): <b>10.0%</b> / <b>20.0%</b> / <b>30.0%</b>" in text
     assert "RAM: <b>2 ГБ</b> / 8 ГБ (<b>25.0%</b>)" in text
+    assert "💳 Биллинг" not in text
+
+
+def test_node_card_text_rendering_with_billing():
+    from handlers.admin_nodes import _node_card_text
+    node = {
+        "uuid": "node-uuid-123",
+        "name": "Test Node",
+        "address": "1.2.3.4",
+        "port": 1234,
+        "countryCode": "DE",
+        "isDisabled": False,
+        "isConnected": True,
+    }
+    mock_billing = {
+        "uuid": "b-uuid",
+        "provider": {"name": "Hetzner"},
+        "nextBillingAt": "2026-06-30T00:00:00.000Z",
+    }
+    with patch("handlers.admin_billing._find_billing_for_node", new_callable=AsyncMock) as mock_find:
+        mock_find.return_value = mock_billing
+        text = asyncio.run(_node_card_text(node))
+    assert "Test Node" in text
+    assert "💳 <b>Биллинг</b>" in text
+    assert "Провайдер: <b>Hetzner</b>" in text
+    assert "Следующее списание: <b>30.06.2026</b>" in text
+
+
+def test_list_billing_providers(api_instance):
+    def on_req(method, url, kw):
+        assert method == "GET"
+        assert url.endswith("/api/infra-billing/providers")
+        return _FakeResp(200, json_data={"response": {"providers": [{"uuid": "p1", "name": "prov1"}]}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.list_billing_providers())
+    assert res == [{"uuid": "p1", "name": "prov1"}]
+
+
+def test_get_billing_provider(api_instance):
+    def on_req(method, url, kw):
+        assert method == "GET"
+        assert url.endswith("/api/infra-billing/providers/prov-uuid")
+        return _FakeResp(200, json_data={"response": {"uuid": "prov-uuid", "name": "prov1"}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.get_billing_provider("prov-uuid"))
+    assert res == {"uuid": "prov-uuid", "name": "prov1"}
+
+
+def test_create_billing_provider(api_instance):
+    def on_req(method, url, kw):
+        assert method == "POST"
+        assert url.endswith("/api/infra-billing/providers")
+        return _FakeResp(201, json_data={"response": {"uuid": "new-prov"}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.create_billing_provider({"name": "new"}))
+    assert res == {"uuid": "new-prov"}
+
+
+def test_delete_billing_provider(api_instance):
+    def on_req(method, url, kw):
+        assert method == "DELETE"
+        assert url.endswith("/api/infra-billing/providers/p-uuid")
+        return _FakeResp(204)
+
+    with _patch_session(on_req):
+        ok = asyncio.run(api_instance.delete_billing_provider("p-uuid"))
+    assert ok is True
+
+
+def test_list_billing_nodes(api_instance):
+    def on_req(method, url, kw):
+        assert method == "GET"
+        assert url.endswith("/api/infra-billing/nodes")
+        return _FakeResp(200, json_data={"response": {"billingNodes": [{"uuid": "bn1"}]}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.list_billing_nodes())
+    assert res == [{"uuid": "bn1"}]
+
+
+def test_create_billing_node(api_instance):
+    def on_req(method, url, kw):
+        assert method == "POST"
+        assert url.endswith("/api/infra-billing/nodes")
+        return _FakeResp(201, json_data={"response": {"uuid": "new-bn"}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.create_billing_node({"nodeUuid": "node1"}))
+    assert res == {"uuid": "new-bn"}
+
+
+def test_update_billing_nodes(api_instance):
+    def on_req(method, url, kw):
+        assert method == "PATCH"
+        assert url.endswith("/api/infra-billing/nodes")
+        return _FakeResp(200, json_data={"response": {"ok": True}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.update_billing_nodes({"uuids": ["bn1"]}))
+    assert res == {"ok": True}
+
+
+def test_delete_billing_node(api_instance):
+    def on_req(method, url, kw):
+        assert method == "DELETE"
+        assert url.endswith("/api/infra-billing/nodes/bn-uuid")
+        return _FakeResp(204)
+
+    with _patch_session(on_req):
+        ok = asyncio.run(api_instance.delete_billing_node("bn-uuid"))
+    assert ok is True
+
+
+def test_list_billing_history(api_instance):
+    def on_req(method, url, kw):
+        assert method == "GET"
+        assert url.endswith("/api/infra-billing/history")
+        assert kw["params"] == {"start": 0, "limit": 10}
+        return _FakeResp(200, json_data={"response": {"records": [{"uuid": "h1"}]}})
+
+    with _patch_session(on_req):
+        res = asyncio.run(api_instance.list_billing_history({"start": 0, "limit": 10}))
+    assert res == [{"uuid": "h1"}]
+
+
 

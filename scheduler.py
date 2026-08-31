@@ -1,5 +1,6 @@
 import logging
 import time
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
@@ -14,6 +15,7 @@ from app import (
     ADMIN_NOTIFY_ENABLED_KEY,
     ADMIN_NOTIFY_TEXT_KEY,
     NODE_DOWN_NOTIFY_ENABLED_KEY,
+    NODE_AUTORESTART_ENABLED_KEY,
     CPU_NOTIFY_ENABLED_KEY,
     CPU_THRESHOLD_KEY,
     CPU_SUSTAINED_MINUTES_KEY,
@@ -283,32 +285,125 @@ async def check_expiring_subscriptions(bot: Bot) -> None:
                     except Exception as e:
                         logger.warning("Failed to send admin digest to %s: %s", admin_id, e)
 
-    # 6. Очистка старых логов (старше 30 дней)
+    # 6. Очистка старых логов (старше 30 дней) и старых метрик нод (старше 7 дней)
     try:
         thirty_days_ago = now - 30 * day_sec
+        seven_days_ago = now - 7 * day_sec
         await db.cleanup_old_notifications(thirty_days_ago)
+        await db.cleanup_old_node_metrics(seven_days_ago)
     except Exception as e:
-        logger.warning("Failed to cleanup old notifications: %s", e)
+        logger.warning("Failed to cleanup old notifications/metrics: %s", e)
+
+
+# ---------------------------------------------------------------------------
+#  SSH helpers for remote node management
+# ---------------------------------------------------------------------------
+
+async def ssh_execute_on_node(address: str, command: str, timeout: int = 30) -> tuple[bool, str]:
+    """SSH into root@address using the mounted CA-signed key and run *command*.
+
+    Returns (success, output_or_error_text).
+    """
+    # Prepend TERM=xterm to avoid "Error opening terminal: unknown"
+    # on non-interactive SSH sessions.
+    wrapped_command = f"export TERM=xterm; {command}"
+    ssh_cmd = [
+        "ssh",
+        "-i", "/run/secrets/master_ssh_key",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        f"root@{address}",
+        wrapped_command,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        stdout = stdout_bytes.decode("utf-8", errors="ignore").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="ignore").strip()
+
+        if proc.returncode != 0:
+            err = stderr or stdout or "SSH command returned non-zero exit code"
+            return False, err
+        return True, stdout or "(пустой вывод)"
+    except asyncio.TimeoutError:
+        return False, "Превышено время ожидания (timeout)"
+    except Exception as e:
+        return False, str(e)
+
+
+async def _attempt_autorestart(
+    bot: "Bot", admins: set[int], node_name: str, address: str
+) -> None:
+    """Background task: try to SSH-restart remnanode and report to admins."""
+    import html as _html
+
+    # Notify admins that we're attempting a restart
+    status_text = (
+        f"⏳ <b>Попытка авторестарта remnanode</b>\n\n"
+        f"Сервер: <b>{_html.escape(node_name)}</b>\n"
+        f"Адрес: <code>{_html.escape(address)}</code>\n\n"
+        f"<i>Подключаюсь по SSH...</i>"
+    )
+    for admin_id in admins:
+        try:
+            await bot.send_message(chat_id=admin_id, text=status_text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("autorestart notify send failed for %s: %s", admin_id, e)
+
+    # Execute restart + grab tail of logs
+    ok, output = await ssh_execute_on_node(
+        address,
+        "docker restart remnanode && sleep 10 && docker logs --tail 20 remnanode 2>&1",
+        timeout=45,
+    )
+
+    if ok:
+        # Trim output to fit Telegram message limit
+        trimmed = output[:3500]
+        if len(output) > 3500:
+            trimmed += "\n…(обрезано)"
+        result_text = (
+            f"✅ <b>Авторестарт remnanode выполнен</b>\n\n"
+            f"Сервер: <b>{_html.escape(node_name)}</b>\n\n"
+            f"📋 Последние строки лога:\n"
+            f"<pre>{_html.escape(trimmed)}</pre>"
+        )
+    else:
+        result_text = (
+            f"❌ <b>Не удалось выполнить авторестарт</b>\n\n"
+            f"Сервер: <b>{_html.escape(node_name)}</b>\n"
+            f"Адрес: <code>{_html.escape(address)}</code>\n\n"
+            f"Ошибка:\n<code>{_html.escape(output[:1000])}</code>"
+        )
+
+    for admin_id in admins:
+        try:
+            await bot.send_message(chat_id=admin_id, text=result_text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("autorestart result send failed for %s: %s", admin_id, e)
 
 
 async def check_nodes_health(bot: Bot) -> None:
     """Периодическая проверка доступности нод (каждые 2 минуты)."""
-    # 1. Загрузка настроек
-    enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
-    if not enabled:
-        return
-
-    # 2. Получение списка нод
+    # 1. Получение списка нод
     nodes = await api.list_nodes()
     if not nodes:
         logger.warning("check_nodes_health: не удалось получить список нод")
         return
 
-    # 3. Получение списка админов для алертов
+    # 2. Получение списка админов для алертов
     db_admins = await db.list_admins()
     admins = set(db_admins) | ADMIN_TG_IDS
 
     now_ts = int(time.time())
+    alerts_enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
 
     for node in nodes:
         uuid = node.get("uuid")
@@ -324,10 +419,61 @@ async def check_nodes_health(bot: Bot) -> None:
         address = node.get("address") or "—"
         port = node.get("port") or "—"
 
+        # --- Сбор и сохранение исторических метрик ---
+        if is_connected:
+            payload = await api.get_node(uuid)
+            node_card = (payload or {}).get("response") if isinstance(payload, dict) else None
+            
+            if node_card:
+                users_online = node_card.get("usersOnline") or 0
+                
+                # Извлекаем данные системы
+                sys_info = (node_card.get("system") or {}).get("info") or {}
+                sys_stats = (node_card.get("system") or {}).get("stats") or {}
+                
+                # Вычисление CPU load %
+                cpus = sys_info.get("cpus") or 1
+                load_avg = sys_stats.get("loadAvg") or []
+                
+                cpu_usage = 0.0
+                if isinstance(load_avg, list) and len(load_avg) >= 3:
+                    cpu_usage = (load_avg[1] / cpus) * 100.0
+                else:
+                    for key in ("cpu", "cpuUsage", "cpu_usage", "cpuPercent"):
+                        val = sys_stats.get(key)
+                        if val is not None:
+                            try:
+                                f_val = float(val)
+                                cpu_usage = f_val * 100.0 if f_val <= 1.0 and f_val > 0.0 else f_val
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                cpu_usage = max(0.0, min(100.0, cpu_usage))
+
+                # Вычисление RAM usage %
+                total_ram = node_card.get("totalRam") or sys_info.get("memoryTotal")
+                used_ram = sys_stats.get("memoryUsed")
+                ram_usage = 0.0
+                if total_ram and used_ram:
+                    try:
+                        ram_usage = (int(used_ram) / int(total_ram)) * 100.0
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+                ram_usage = max(0.0, min(100.0, ram_usage))
+
+                try:
+                    await db.add_node_metrics(uuid, cpu_usage, ram_usage, users_online)
+                except Exception as e:
+                    logger.warning("Не удалось записать метрики ноды %s: %s", name, e)
+
         status_row = await db.get_node_status(uuid)
 
         # Обновляем/вставляем статус в БД
         await db.upsert_node_status(uuid, name, is_connected, now_ts)
+
+        # Если оповещения о падении выключены, пропускаем отправку алертов
+        if not alerts_enabled:
+            continue
 
         if status_row is not None:
             was_connected = status_row["was_connected"]
@@ -350,6 +496,13 @@ async def check_nodes_health(bot: Bot) -> None:
                             logger.warning("Failed to send node down alert to %s: %s", admin_id, e)
                     await db.mark_node_alerted(uuid)
                     logger.info("Sent node down alert for node %s (%s)", name, uuid)
+
+                    # --- Авторестарт через SSH ---
+                    autorestart_on = (await db.get_setting(NODE_AUTORESTART_ENABLED_KEY)) == "1"
+                    if autorestart_on and address and address != "—":
+                        asyncio.create_task(
+                            _attempt_autorestart(bot, admins, name, address)
+                        )
 
             # Переход: Был оффлайн -> Стал онлайн
             elif not was_connected and is_connected:
