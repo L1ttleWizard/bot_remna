@@ -1,5 +1,6 @@
 import logging
 import time
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
@@ -14,6 +15,7 @@ from app import (
     ADMIN_NOTIFY_ENABLED_KEY,
     ADMIN_NOTIFY_TEXT_KEY,
     NODE_DOWN_NOTIFY_ENABLED_KEY,
+    NODE_AUTORESTART_ENABLED_KEY,
     CPU_NOTIFY_ENABLED_KEY,
     CPU_THRESHOLD_KEY,
     CPU_SUSTAINED_MINUTES_KEY,
@@ -293,6 +295,101 @@ async def check_expiring_subscriptions(bot: Bot) -> None:
         logger.warning("Failed to cleanup old notifications/metrics: %s", e)
 
 
+# ---------------------------------------------------------------------------
+#  SSH helpers for remote node management
+# ---------------------------------------------------------------------------
+
+async def ssh_execute_on_node(address: str, command: str, timeout: int = 30) -> tuple[bool, str]:
+    """SSH into root@address using the mounted CA-signed key and run *command*.
+
+    Returns (success, output_or_error_text).
+    """
+    # Prepend TERM=xterm to avoid "Error opening terminal: unknown"
+    # on non-interactive SSH sessions.
+    wrapped_command = f"export TERM=xterm; {command}"
+    ssh_cmd = [
+        "ssh",
+        "-i", "/run/secrets/master_ssh_key",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        f"root@{address}",
+        wrapped_command,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        stdout = stdout_bytes.decode("utf-8", errors="ignore").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="ignore").strip()
+
+        if proc.returncode != 0:
+            err = stderr or stdout or "SSH command returned non-zero exit code"
+            return False, err
+        return True, stdout or "(пустой вывод)"
+    except asyncio.TimeoutError:
+        return False, "Превышено время ожидания (timeout)"
+    except Exception as e:
+        return False, str(e)
+
+
+async def _attempt_autorestart(
+    bot: "Bot", admins: set[int], node_name: str, address: str
+) -> None:
+    """Background task: try to SSH-restart remnanode and report to admins."""
+    import html as _html
+
+    # Notify admins that we're attempting a restart
+    status_text = (
+        f"⏳ <b>Попытка авторестарта remnanode</b>\n\n"
+        f"Сервер: <b>{_html.escape(node_name)}</b>\n"
+        f"Адрес: <code>{_html.escape(address)}</code>\n\n"
+        f"<i>Подключаюсь по SSH...</i>"
+    )
+    for admin_id in admins:
+        try:
+            await bot.send_message(chat_id=admin_id, text=status_text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("autorestart notify send failed for %s: %s", admin_id, e)
+
+    # Execute restart + grab tail of logs
+    ok, output = await ssh_execute_on_node(
+        address,
+        "docker restart remnanode && sleep 10 && docker logs --tail 20 remnanode 2>&1",
+        timeout=45,
+    )
+
+    if ok:
+        # Trim output to fit Telegram message limit
+        trimmed = output[:3500]
+        if len(output) > 3500:
+            trimmed += "\n…(обрезано)"
+        result_text = (
+            f"✅ <b>Авторестарт remnanode выполнен</b>\n\n"
+            f"Сервер: <b>{_html.escape(node_name)}</b>\n\n"
+            f"📋 Последние строки лога:\n"
+            f"<pre>{_html.escape(trimmed)}</pre>"
+        )
+    else:
+        result_text = (
+            f"❌ <b>Не удалось выполнить авторестарт</b>\n\n"
+            f"Сервер: <b>{_html.escape(node_name)}</b>\n"
+            f"Адрес: <code>{_html.escape(address)}</code>\n\n"
+            f"Ошибка:\n<code>{_html.escape(output[:1000])}</code>"
+        )
+
+    for admin_id in admins:
+        try:
+            await bot.send_message(chat_id=admin_id, text=result_text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("autorestart result send failed for %s: %s", admin_id, e)
+
+
 async def check_nodes_health(bot: Bot) -> None:
     """Периодическая проверка доступности нод (каждые 2 минуты)."""
     # 1. Получение списка нод
@@ -399,6 +496,13 @@ async def check_nodes_health(bot: Bot) -> None:
                             logger.warning("Failed to send node down alert to %s: %s", admin_id, e)
                     await db.mark_node_alerted(uuid)
                     logger.info("Sent node down alert for node %s (%s)", name, uuid)
+
+                    # --- Авторестарт через SSH ---
+                    autorestart_on = (await db.get_setting(NODE_AUTORESTART_ENABLED_KEY)) == "1"
+                    if autorestart_on and address and address != "—":
+                        asyncio.create_task(
+                            _attempt_autorestart(bot, admins, name, address)
+                        )
 
             # Переход: Был оффлайн -> Стал онлайн
             elif not was_connected and is_connected:

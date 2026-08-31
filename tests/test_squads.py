@@ -138,7 +138,31 @@ async def test_handle_admu_sub_squad_set_success():
         await bot._handle_admu_sub(callback, 12345, 1, "sq_s", "0")
 
         mock_patch.assert_called_once_with({"uuid": "user-uuid", "activeInternalSquads": ["squad-uuid-abc"]})
-        callback.answer.assert_called_once_with("Сквад успешно изменен!")
+        callback.answer.assert_called_once_with("Сквад успешно подключен!")
+        mock_send_squads.assert_called_once_with(callback, 12345, 1, prefer_edit=True)
+
+
+@pytest.mark.asyncio
+async def test_handle_admu_sub_squad_toggle_off():
+    import bot
+
+    callback = MagicMock()
+    callback.from_user.id = 999  # admin
+    callback.message = AsyncMock()
+    callback.answer = AsyncMock()
+
+    mock_sub = (1, 12345, "user-uuid", "short-uuid", "username", 1700000000, "label", 12345, 1700000000)
+    mock_state = ([{"uuid": "squad-uuid-abc", "name": "Squad Alpha"}], {"squad-uuid-abc"})
+
+    with patch("bot.db.get_subscription", AsyncMock(return_value=mock_sub)), \
+         patch("bot._load_squads_state", AsyncMock(return_value=mock_state)), \
+         patch("bot.api.patch_user", AsyncMock(return_value=True)) as mock_patch, \
+         patch("bot._send_admin_sub_squads", AsyncMock()) as mock_send_squads:
+
+        await bot._handle_admu_sub(callback, 12345, 1, "sq_s", "0")
+
+        mock_patch.assert_called_once_with({"uuid": "user-uuid", "activeInternalSquads": []})
+        callback.answer.assert_called_once_with("Сквад успешно отключен!")
         mock_send_squads.assert_called_once_with(callback, 12345, 1, prefer_edit=True)
 
 
@@ -162,5 +186,5 @@ async def test_handle_admu_sub_squad_set_failure():
         await bot._handle_admu_sub(callback, 12345, 1, "sq_s", "0")
 
         mock_patch.assert_called_once_with({"uuid": "user-uuid", "activeInternalSquads": ["squad-uuid-abc"]})
-        callback.answer.assert_called_once_with("Не удалось сменить сквад.", show_alert=True)
+        callback.answer.assert_called_once_with("Не удалось изменить список сквадов.", show_alert=True)
         mock_send_squads.assert_called_once_with(callback, 12345, 1, prefer_edit=True)

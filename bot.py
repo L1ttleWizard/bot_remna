@@ -29,8 +29,10 @@ from app import (
     AdminBroadcastStates,
     AdminDmStates,
     AdminSearchStates,
+    AdminServerCmdStates,
     PromoStates,
     SUPPORT_KEY,
+    NODE_AUTORESTART_ENABLED_KEY,
     api,
     bot,
     dp,
@@ -38,6 +40,7 @@ from app import (
     ensure_sub_belongs_to_user,
     safe_edit,
     sync_local_expire_from_panel,
+    REFERRAL_NOTIFY_ENABLED_KEY,
 )
 from handlers.admin_analytics import ANALYTICS_PERIOD_DAYS, _analytics_date_range
 from handlers import (
@@ -118,6 +121,7 @@ from scheduler import (
     check_nodes_health,
     check_cpu_load,
     run_daily_backup,
+    ssh_execute_on_node,
 )
 
 
@@ -141,6 +145,19 @@ logger = logging.getLogger(__name__)
 
 # --- Views ---
 
+def _extract_devices(hw_raw: Optional[dict]) -> list:
+    if not hw_raw or not isinstance(hw_raw, dict):
+        return []
+    raw = hw_raw.get("response") if "response" in hw_raw else hw_raw
+    if isinstance(raw, dict):
+        devs = raw.get("devices")
+        if isinstance(devs, list):
+            return sort_hwid_devices(devs)
+    elif isinstance(raw, list):
+        return sort_hwid_devices(raw)
+    return []
+
+
 async def load_devices_text(full_uuid: str) -> tuple[str, list, bool]:
     info = await api.get_user_info(full_uuid)
     hw_raw = await api.get_user_hwid_devices(full_uuid)
@@ -149,9 +166,7 @@ async def load_devices_text(full_uuid: str) -> tuple[str, list, bool]:
     if info and "response" in info:
         limit_label = hwid_limit_caption(info["response"])
         show_limits = not is_hwid_unlimited(info["response"])
-    devices: list = []
-    if hw_raw and "response" in hw_raw:
-        devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+    devices = _extract_devices(hw_raw)
     return format_devices_html(devices, limit_label), devices, show_limits
 
 
@@ -238,6 +253,24 @@ async def create_account_for_user(
     return sub_url
 
 
+async def notify_admins_referral(text: str):
+    notify_enabled = (await db.get_setting(REFERRAL_NOTIFY_ENABLED_KEY)) != "0"
+    if not notify_enabled:
+        return
+    db_admins = await db.list_admins()
+    from config import ADMIN_TG_IDS
+    admins = set(db_admins) | ADMIN_TG_IDS
+    for admin_id in admins:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error("Failed to send referral alert to admin %s: %s", admin_id, e)
+
+
 # --- /start ---
 
 @dp.message(CommandStart(deep_link=True))
@@ -246,6 +279,69 @@ async def cmd_start_with_payload(message: Message, command: CommandObject):
     if not payload:
         await _show_start_menu(message)
         return
+
+    if payload.startswith("ref_"):
+        tg_id = message.from_user.id
+        try:
+            referrer_id = int(payload.split("_")[1])
+        except (IndexError, ValueError):
+            await _show_start_menu(message)
+            return
+
+        if referrer_id == tg_id:
+            await message.answer("Вы не можете пригласить сами себя!")
+            await _show_start_menu(message)
+            return
+
+        # Check if user already has an active subscription/account
+        user_data = await db.get_user(tg_id)
+        if user_data and user_data[1]:
+            # User already has a subscription, referral is not applicable
+            await _show_start_menu(message)
+            return
+
+        # Upsert profile so the user exists in db
+        await db.upsert_tg_profile(
+            tg_id,
+            tg_username=message.from_user.username,
+            tg_first_name=message.from_user.first_name,
+            tg_last_name=message.from_user.last_name,
+        )
+
+        # Check if already referred
+        existing = await db.get_referral_by_referee(tg_id)
+        if not existing:
+            success = await db.add_referral_relation(referrer_id, tg_id)
+            if success:
+                logger.info("Recorded referral: user %s referred by %s", tg_id, referrer_id)
+                referee_username = message.from_user.username
+                referee_display = f"@{referee_username}" if referee_username else html.escape(message.from_user.first_name or "Пользователь")
+                
+                referrer_info = await db.get_user_full(referrer_id)
+                if referrer_info:
+                    ref_username = referrer_info[6]
+                    ref_first_name = referrer_info[7]
+                    referrer_display = f"@{ref_username}" if ref_username else html.escape(ref_first_name or "Пользователь")
+                else:
+                    referrer_display = f"ID: {referrer_id}"
+
+                admin_msg = (
+                    "📢 <b>Реферальная система: новый переход</b>\n\n"
+                    f"Новый пользователь: {referee_display} (ID: <code>{tg_id}</code>)\n"
+                    f"Пригласитель: {referrer_display} (ID: <code>{referrer_id}</code>)"
+                )
+                await notify_admins_referral(admin_msg)
+
+        await message.answer(
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "Вы перешли по реферальной ссылке. "
+            "После того, как вы активируете свою первую подписку, "
+            "пригласивший вас пользователь получит бонусные дни!",
+            parse_mode="HTML"
+        )
+        await _show_start_menu(message)
+        return
+
     await _try_redeem_token(message, payload)
 
 
@@ -383,6 +479,46 @@ async def _try_redeem_token(message: Message, raw_token: str) -> None:
         logger.warning("Token race for tg_id=%s, hash=%s", tg_id, token.token_hash[:12])
 
     sub_count = await db.count_subscriptions(tg_id)
+    if consumed and sub_count == 1:
+        ref = await db.get_referral_by_referee(tg_id)
+        if ref and ref[3] == "pending":
+            referrer_id = ref[1]
+            referrer_data = await db.get_user(referrer_id)
+            if referrer_data and referrer_data[1]:
+                referrer_uuid = referrer_data[1]
+                ok, _ = await api.extend_user_subscription_days(referrer_uuid, 7)
+                if ok:
+                    await sync_local_expire_from_panel(referrer_id, referrer_uuid)
+                    await db.mark_referral_rewarded(tg_id)
+                    referee_username = message.from_user.username
+                    if referee_username:
+                        referee_display = f"@{referee_username}"
+                    else:
+                        referee_display = html.escape(message.from_user.first_name or "Пользователь")
+                    try:
+                        await bot.send_message(
+                            chat_id=referrer_id,
+                            text=f"🎉 {referee_display} активировал подписку! Вам начислено <b>+7 дней</b> подписки!",
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.error("Failed to send referral reward notification to %s: %s", referrer_id, e)
+
+                    # Notify admins
+                    referrer_info = await db.get_user_full(referrer_id)
+                    if referrer_info:
+                        ref_username = referrer_info[6]
+                        ref_first_name = referrer_info[7]
+                        referrer_display = f"@{ref_username}" if ref_username else html.escape(ref_first_name or "Пользователь")
+                    else:
+                        referrer_display = f"ID: {referrer_id}"
+
+                    admin_reward_msg = (
+                        "🎉 <b>Реферальная система: активация подписки</b>\n\n"
+                        f"Пользователь: {referee_display} (ID: <code>{tg_id}</code>) успешно активировал подписку!\n"
+                        f"Пригласителю: {referrer_display} (ID: <code>{referrer_id}</code>) начислено <b>+7 дней</b> подписки."
+                    )
+                    await notify_admins_referral(admin_reward_msg)
     head = (
         "✅ Доступ активирован!"
         if sub_count <= 1
@@ -859,6 +995,225 @@ async def cb_admin_make_backup(callback: CallbackQuery):
         await status_msg.edit_text("❌ Ошибка при создании резервной копии. Подробности в логах.")
 
 
+# ---------- 🖥 Команды на сервер ----------
+
+@dp.callback_query(F.data == "admin_server_cmds")
+async def cb_admin_server_cmds(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer()
+    await safe_edit(
+        callback,
+        "🖥 <b>Команды на сервер</b>\n\n"
+        "Управление серверами через SSH.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Авторестарт remnanode", callback_data="admin_srv:autorestart")],
+            [InlineKeyboardButton(text="💻 Кастомные команды", callback_data="admin_srv:custom")],
+            [InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")],
+        ]),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data == "admin_srv:autorestart")
+async def cb_admin_srv_autorestart(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer()
+    enabled = (await db.get_setting(NODE_AUTORESTART_ENABLED_KEY)) == "1"
+    status_icon = "🟢" if enabled else "🔴"
+    status_word = "Включён" if enabled else "Выключен"
+    toggle_text = "🔴 Выключить" if enabled else "🟢 Включить"
+
+    await safe_edit(
+        callback,
+        f"⚡ <b>Авторестарт remnanode</b>\n\n"
+        f"При обнаружении падения ноды бот автоматически\n"
+        f"подключается по SSH и выполняет:\n"
+        f"<code>docker restart remnanode</code>\n\n"
+        f"Статус: {status_icon} <b>{status_word}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="admin_srv:toggle_ar")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_server_cmds")],
+        ]),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data == "admin_srv:toggle_ar")
+async def cb_toggle_autorestart(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    current = (await db.get_setting(NODE_AUTORESTART_ENABLED_KEY)) == "1"
+    new_val = "0" if current else "1"
+    await db.set_setting(NODE_AUTORESTART_ENABLED_KEY, new_val)
+    status = "включён ✅" if new_val == "1" else "выключен 🔴"
+    await callback.answer(f"Авторестарт {status}", show_alert=True)
+    # Re-render the autorestart screen
+    await cb_admin_srv_autorestart(callback)
+
+
+@dp.callback_query(F.data == "admin_srv:custom")
+async def cb_admin_srv_custom(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("Загрузка списка серверов…")
+    nodes = await api.list_nodes()
+    if not nodes:
+        await safe_edit(
+            callback,
+            "💻 <b>Кастомные команды</b>\n\n"
+            "<i>Нет доступных серверов.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_server_cmds")],
+            ]),
+            prefer_edit=True,
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for n in nodes:
+        uuid = n.get("uuid") or ""
+        if not uuid:
+            continue
+        name = str(n.get("name") or "—")[:24]
+        is_connected = bool(n.get("isConnected"))
+        is_disabled = bool(n.get("isDisabled"))
+        if is_disabled:
+            icon = "⏸"
+        elif is_connected:
+            icon = "🟢"
+        else:
+            icon = "🔴"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {name}",
+            callback_data=f"admin_srv:pick:{uuid}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_server_cmds")])
+
+    await safe_edit(
+        callback,
+        "💻 <b>Кастомные команды</b>\n\n"
+        "Выбери сервер, на котором выполнить команду:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_srv:pick:"))
+async def cb_admin_srv_pick(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    uuid = callback.data.split(":", 2)[2]
+    # Fetch node info
+    payload = await api.get_node(uuid)
+    node = (payload or {}).get("response") if isinstance(payload, dict) else None
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+
+    name = node.get("name") or "Без названия"
+    address = node.get("address") or ""
+    if not address:
+        await callback.answer("У ноды нет IP-адреса.", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.set_state(AdminServerCmdStates.waiting_for_command)
+    await state.update_data(srv_uuid=uuid, srv_name=name, srv_address=address)
+
+    await safe_edit(
+        callback,
+        f"💻 Сервер: <b>{html.escape(name)}</b> (<code>{html.escape(address)}</code>)\n\n"
+        f"Введите команду для выполнения на сервере.\n"
+        f"Команда будет выполнена от <b>root</b> через SSH.\n\n"
+        f"/cancel — отменить",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_srv:custom")],
+        ]),
+        prefer_edit=True,
+    )
+
+
+@dp.message(AdminServerCmdStates.waiting_for_command)
+async def admin_srv_execute_command(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    command_text = (message.text or "").strip()
+    if command_text == "/cancel":
+        await state.clear()
+        await message.answer(
+            "❌ Отменено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К выбору сервера", callback_data="admin_srv:custom")],
+            ]),
+        )
+        return
+
+    if not command_text:
+        await message.answer("Введите непустую команду.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    srv_uuid = data.get("srv_uuid", "")
+    srv_name = data.get("srv_name", "—")
+    srv_address = data.get("srv_address", "")
+
+    if not srv_address:
+        await message.answer("❌ Адрес сервера не найден. Попробуйте заново.")
+        return
+
+    # Send status message
+    status_msg = await message.answer(
+        f"⏳ Выполняю команду на <b>{html.escape(srv_name)}</b>…\n\n"
+        f"<code>{html.escape(command_text[:200])}</code>",
+        parse_mode="HTML",
+    )
+
+    # Execute via SSH
+    ok, output = await ssh_execute_on_node(srv_address, command_text, timeout=30)
+
+    result_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Новая команда", callback_data=f"admin_srv:pick:{srv_uuid}")],
+        [InlineKeyboardButton(text="◀️ К выбору сервера", callback_data="admin_srv:custom")],
+    ])
+
+    if ok:
+        trimmed = output[:3800]
+        if len(output) > 3800:
+            trimmed += "\n…(обрезано)"
+        result_text = (
+            f"✅ Команда выполнена на <b>{html.escape(srv_name)}</b>\n\n"
+            f"📤 Вывод:\n"
+            f"<pre>{html.escape(trimmed)}</pre>"
+        )
+    else:
+        result_text = (
+            f"❌ Ошибка на <b>{html.escape(srv_name)}</b> "
+            f"(<code>{html.escape(srv_address)}</code>)\n\n"
+            f"<pre>{html.escape(output[:2000])}</pre>"
+        )
+
+    try:
+        await status_msg.edit_text(result_text, parse_mode="HTML", reply_markup=result_kb)
+    except TelegramBadRequest:
+        await message.answer(result_text, parse_mode="HTML", reply_markup=result_kb)
+
+
 @dp.callback_query(F.data.startswith("admin_users:"))
 async def cb_admin_users(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -909,6 +1264,22 @@ async def admin_search_capture(message: Message, state: FSMContext):
     await _send_admin_users_list(fake_cb, page=0, prefer_edit=False, query=text)
 
 
+@dp.message(F.text & ~F.text.startswith("/"))
+async def admin_search_shortcut(message: Message, state: FSMContext):
+    if not await auth.is_admin(message.from_user.id):
+        return
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    await state.set_state(AdminSearchStates.waiting_for_query)
+    await state.update_data(search_query=text)
+    fake_cb = await _make_pseudo_callback(message)
+    await _send_admin_users_list(fake_cb, page=0, prefer_edit=False, query=text)
+
+
 @dp.callback_query(F.data.startswith("admin_users_qp:"), AdminSearchStates.waiting_for_query)
 async def cb_admin_users_search_page(callback: CallbackQuery, state: FSMContext):
     if not await auth.is_admin(callback.from_user.id):
@@ -935,6 +1306,7 @@ async def _make_pseudo_callback(message: Message):
         def __init__(self, msg: Message):
             self.message = msg
             self.from_user = msg.from_user
+            self.bot = msg.bot
 
         async def answer(self, *args, **kwargs):
             return None
@@ -1133,13 +1505,15 @@ async def cb_sub_info(callback: CallbackQuery):
     end_7_d = end_dt.strftime("%Y-%m-%d")
     
     start_d, end_d = _analytics_date_range()
-    info_res, period_res, spark_res = await asyncio.gather(
+    info_res, hw_res, period_res, spark_res = await asyncio.gather(
         api.get_user_info(full_uuid),
+        api.get_user_hwid_devices(full_uuid),
         api.get_user_usage_range(full_uuid, start_d, end_d),
         api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
         return_exceptions=True,
     )
     info = info_res if not isinstance(info_res, BaseException) else None
+    hw_raw = hw_res if not isinstance(hw_res, BaseException) else None
     period_30 = period_res if not isinstance(period_res, BaseException) else None
     spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
     
@@ -1148,7 +1522,7 @@ async def cb_sub_info(callback: CallbackQuery):
     traffic_lines = ""
     last_online_line = ""
     period_30_line = ""
-    hwid_count = 0
+    hwid_count = len(_extract_devices(hw_raw)) if hw_raw else 0
     if info and "response" in info:
         api_data = info["response"]
         panel_status = api_data.get("status", "ACTIVE")
@@ -1156,7 +1530,6 @@ async def cb_sub_info(callback: CallbackQuery):
             status_text = f"Неактивна ❌ ({panel_status})"
         limit_text = hwid_limit_caption(api_data)
         traffic_lines = "\n\n" + traffic_summary_markdown(api_data)
-        hwid_count = len((api_data.get("hwidDevices") or []))
         last_iso = api_data.get("lastOnlineAt") or ""
         if last_iso:
             last_online_line = f"\n**Последний онлайн:** `{format_expire_display(last_iso)}`"
@@ -1226,9 +1599,7 @@ async def cb_sub_device_remove(callback: CallbackQuery):
         return
     full_uuid = sub[2]
     hw_raw = await api.get_user_hwid_devices(full_uuid)
-    devices: list = []
-    if hw_raw and "response" in hw_raw:
-        devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+    devices = _extract_devices(hw_raw)
     if device_idx < 0 or device_idx >= len(devices):
         await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
         return
@@ -1359,6 +1730,42 @@ async def cb_back_main(callback: CallbackQuery):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
     await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "referrals")
+async def cb_referrals(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    
+    # Check if authorized
+    if not await auth.is_authorized(tg_id) and not await auth.is_admin(tg_id):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+
+    total, rewarded = await db.get_referral_stats(tg_id)
+    
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{tg_id}"
+    
+    text = (
+        "👥 <b>Реферальная программа</b>\n\n"
+        "Приглашайте друзей и получайте бонусные дни!\n"
+        "Когда приглашенный вами пользователь активирует свою первую подписку, "
+        "вы получите <b>+7 дней</b> к своей подписке!\n\n"
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• Всего приглашено: {total}\n"
+        f"• Активировали подписку: {rewarded}"
+    )
+    
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True
+    )
     await callback.answer()
 
 
@@ -1514,8 +1921,15 @@ async def _send_admin_link_picker(
         )
         return
     resp = panel_page["response"]
-    total = int(resp.get("total") or 0)
-    panel_users = resp.get("users") or []
+    if isinstance(resp, list):
+        panel_users = resp
+        total = len(resp)
+    elif isinstance(resp, dict):
+        total = int(resp.get("total") or len(resp.get("users") or []))
+        panel_users = resp.get("users") or []
+    else:
+        panel_users = []
+        total = 0
 
     rows: list[list[InlineKeyboardButton]] = []
     lines = [
@@ -1732,13 +2146,15 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
 
     # Аналитика: статус / трафик / онлайн / HWID + sparkline — параллельно.
     start_d, end_d = _analytics_date_range()
-    info_res, period_res, spark_res = await asyncio.gather(
+    info_res, hw_res, period_res, spark_res = await asyncio.gather(
         api.get_user_info(full_uuid),
+        api.get_user_hwid_devices(full_uuid),
         api.get_user_usage_range(full_uuid, start_d, end_d),
         api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
         return_exceptions=True,
     )
     info = info_res if not isinstance(info_res, BaseException) else None
+    hw_raw = hw_res if not isinstance(hw_res, BaseException) else None
     period_30 = period_res if not isinstance(period_res, BaseException) else None
     spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
     stats_block = ""
@@ -1755,7 +2171,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         last_iso = ad.get("lastOnlineAt") or ""
         last_h = format_expire_display(last_iso) if last_iso else "—"
         hwid_lim = hwid_limit_caption(ad)
-        hwid_count = len((ad.get("hwidDevices") or []))
+        hwid_count = len(_extract_devices(hw_raw)) if hw_raw else 0
         period_30_txt = (
             human_bytes(int(period_30)) if period_30 is not None else "—"
         )
@@ -1951,11 +2367,17 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         if not target_uuid:
             await callback.answer("У сквада нет UUID.", show_alert=True)
             return
-        ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": [target_uuid]})
-        if ok:
-            await callback.answer("Сквад успешно изменен!")
+        if target_uuid in active_uuids:
+            active_uuids.remove(target_uuid)
+            msg = "Сквад успешно отключен!"
         else:
-            await callback.answer("Не удалось сменить сквад.", show_alert=True)
+            active_uuids.add(target_uuid)
+            msg = "Сквад успешно подключен!"
+        ok = await api.patch_user({"uuid": full_uuid, "activeInternalSquads": list(active_uuids)})
+        if ok:
+            await callback.answer(msg)
+        else:
+            await callback.answer("Не удалось изменить список сквадов.", show_alert=True)
         await _send_admin_sub_squads(callback, target_tg, sub_id, prefer_edit=True)
         return
 
@@ -2002,9 +2424,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
             await callback.answer("Некорректные данные.", show_alert=True)
             return
         hw_raw = await api.get_user_hwid_devices(full_uuid)
-        devices: list = []
-        if hw_raw and "response" in hw_raw:
-            devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+        devices = _extract_devices(hw_raw)
         if idx < 0 or idx >= len(devices):
             await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
             return
@@ -2199,9 +2619,7 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Некорректные данные.", show_alert=True)
             return
         hw_raw = await api.get_user_hwid_devices(full_uuid)
-        devices: list = []
-        if hw_raw and "response" in hw_raw:
-            devices = sort_hwid_devices(hw_raw["response"].get("devices") or [])
+        devices = _extract_devices(hw_raw)
         if idx < 0 or idx >= len(devices):
             await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
             return

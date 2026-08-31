@@ -119,3 +119,140 @@ def generate_node_load_chart(node_name: str, metrics_history: list) -> bytes:
     buf.seek(0)
     plt.close(fig)
     return buf.getvalue()
+
+
+def _format_bytes_y_axis(x, pos):
+    if x >= 1024**4:
+        return f"{x/(1024**4):.1f} ТБ"
+    if x >= 1024**3:
+        return f"{x/(1024**3):.1f} ГБ"
+    if x >= 1024**2:
+        return f"{x/(1024**2):.1f} МБ"
+    if x >= 1024:
+        return f"{x/1024:.1f} КБ"
+    return f"{int(x)} Б"
+
+
+def generate_total_traffic_chart(categories: list[str], sparkline_data: list[int]) -> bytes:
+    """
+    Генерирует график общего суточного трафика нод за указанные даты в темном киберпанк стиле.
+    """
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor='#121214')
+    ax.set_facecolor('#18181C')
+
+    # Convert categories (YYYY-MM-DD) to datetimes
+    dates = [datetime.strptime(cat, "%Y-%m-%d") for cat in categories]
+    traffic_vals = [int(v) for v in sparkline_data]
+
+    # Plot total traffic
+    ax.plot(dates, traffic_vals, label='Общий трафик нод', color='#00F0FF', linewidth=2.5, alpha=0.95)
+    ax.fill_between(dates, traffic_vals, color='#00F0FF', alpha=0.1)
+
+    # Title & Labels
+    ax.set_title("График общего трафика серверов за период", color='#FFFFFF', fontsize=14, weight='bold', pad=15)
+    ax.set_ylabel("Потребление трафика", color='#E5E5EA', fontsize=10, labelpad=10)
+    ax.grid(True, color='#2C2C30', linestyle='--', linewidth=0.5)
+
+    # Format Axes
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    formatter = mdates.DateFormatter('%d.%m')
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    
+    # Custom format for Y axis bytes
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_format_bytes_y_axis))
+
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right', color='#8E8E93', fontsize=9)
+    plt.setp(ax.get_yticklabels(), color='#8E8E93', fontsize=9)
+
+    # Legend
+    legend = ax.legend(loc='upper left', frameon=True, facecolor='#18181C', edgecolor='#2C2C30')
+    for text in legend.get_texts():
+        text.set_color('#E5E5EA')
+
+    # Clean borders
+    for spine in ('top', 'bottom', 'left', 'right'):
+        ax.spines[spine].set_color('#2C2C30')
+        ax.spines[spine].set_linewidth(0.8)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, facecolor='#121214')
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def generate_nodes_traffic_comparison_chart(categories: list[str], series: list[dict]) -> bytes:
+    """
+    Генерирует график сравнения трафика по нодам (line chart) в темном неоновом стиле с контрастными цветами.
+    """
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor='#121214')
+    ax.set_facecolor('#18181C')
+
+    dates = [datetime.strptime(cat, "%Y-%m-%d") for cat in categories]
+    
+    # Сортируем серии по суммарному трафику (чтобы легенда была упорядоченной)
+    sorted_series = sorted(series, key=lambda s: sum(int(x) for x in s.get('data') or []), reverse=True)
+
+    # Высококонтрастная неоновая палитра
+    contrast_palette = [
+        '#00F0FF',  # Неоновый Голубой (Cyan)
+        '#FF007F',  # Неоновый Розовый (Magenta)
+        '#39FF14',  # Неоновый Зеленый (Lime)
+        '#FFCC00',  # Неоновый Желтый
+        '#FF5E00',  # Яркий Оранжевый
+        '#BF00FF',  # Яркий Фиолетовый
+        '#FF0000',  # Ярко-красный
+        '#FFFFFF',  # Белый
+    ]
+
+    for idx, s in enumerate(sorted_series):
+        data = [int(v) for v in (s.get('data') or [])]
+        # Выравниваем длину данных по оси X
+        if len(data) < len(dates):
+            data += [0] * (len(dates) - len(data))
+        data = data[:len(dates)]
+        
+        label = s.get('name') or f"Нода #{idx+1}"
+        color = contrast_palette[idx % len(contrast_palette)]
+        
+        # Строим линию для каждой ноды без заливки
+        ax.plot(dates, data, label=label, color=color, linewidth=2.0, alpha=0.95)
+
+    # Title & Labels
+    ax.set_title("Сравнение распределения трафика по серверам", color='#FFFFFF', fontsize=14, weight='bold', pad=15)
+    ax.set_ylabel("Потребление трафика", color='#E5E5EA', fontsize=10, labelpad=10)
+    ax.grid(True, color='#2C2C30', linestyle='--', linewidth=0.5)
+
+    # Format Axes
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    formatter = mdates.DateFormatter('%d.%m')
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    
+    # Custom format for Y axis bytes
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_format_bytes_y_axis))
+
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right', color='#8E8E93', fontsize=9)
+    plt.setp(ax.get_yticklabels(), color='#8E8E93', fontsize=9)
+
+    # Legend
+    legend = ax.legend(loc='upper left', frameon=True, facecolor='#18181C', edgecolor='#2C2C30')
+    for text in legend.get_texts():
+        text.set_color('#E5E5EA')
+
+    # Clean borders
+    for spine in ('top', 'bottom', 'left', 'right'):
+        ax.spines[spine].set_color('#2C2C30')
+        ax.spines[spine].set_linewidth(0.8)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, facecolor='#121214')
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
+
