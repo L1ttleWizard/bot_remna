@@ -13,6 +13,8 @@ REMNAWAVE_API_URL=https://your-panel-domain.com
 REMNAWAVE_API_TOKEN=your_api_jwt_token
 DATABASE_PATH=bot_database.db
 SUB_DOMAIN=sub.your-domain.com
+DEFAULT_TRIAL_EXPIRE_DAYS=5
+DEFAULT_TRIAL_HWID_LIMIT=3
 ```
 
 ## Running with Docker Compose

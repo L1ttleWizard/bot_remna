@@ -124,6 +124,7 @@ from keyboards import (
     user_sub_sessions_keyboard as _user_sub_sessions_keyboard,
     welcome_trial_keyboard,
     trial_success_keyboard,
+    format_days_ru,
 )
 from scheduler import (
     check_expiring_subscriptions,
@@ -430,7 +431,7 @@ async def _show_start_menu(message: Message) -> None:
         caption = (
             f"👋 <b>Добро пожаловать, {html.escape(message.from_user.first_name or 'друг')}!</b>\n\n"
             f"🚀 <b>Попробуйте наш быстрый и надёжный VPN бесплатно!</b>\n\n"
-            f"🎁 Мы дарим вам тестовый доступ на <b>{trial_days} дня</b> (до {trial_hwid} устройств).\n"
+            f"🎁 Мы дарим вам тестовый доступ на <b>{format_days_ru(trial_days)}</b> (до {trial_hwid} устройств).\n"
             f"Без скрытых условий — нажмите кнопку ниже, чтобы мгновенно начать пользоваться."
         )
         if contacts_str:
@@ -572,7 +573,7 @@ async def _issue_trial_for_user(event, tg_user, *, prefer_edit: bool = False) ->
     expire_str = expire_dt.strftime("%d.%m.%Y %H:%M")
 
     success_text = (
-        f"🎉 <b>Тестовый доступ на {trial_days} дня активирован!</b>\n\n"
+        f"🎉 <b>Тестовый доступ на {format_days_ru(trial_days)} активирован!</b>\n\n"
         f"📅 Доступ действует до: <b>{expire_str}</b>\n"
         f"📱 Лимит устройств: <b>{trial_hwid}</b>\n\n"
         "Нажмите <b>«📥 Подключить»</b> ниже, чтобы выбрать ваше устройство "
@@ -1973,7 +1974,7 @@ async def cb_back_main(callback: CallbackQuery):
             text = (
                 f"👋 <b>Добро пожаловать, {html.escape(callback.from_user.first_name or 'друг')}!</b>\n\n"
                 f"🚀 <b>Попробуйте наш быстрый и надёжный VPN бесплатно!</b>\n\n"
-                f"🎁 Мы дарим вам тестовый доступ на <b>{trial_days} дня</b> (до {trial_hwid} устройств).\n"
+                f"🎁 Мы дарим вам тестовый доступ на <b>{format_days_ru(trial_days)}</b> (до {trial_hwid} устройств).\n"
                 f"Без скрытых условий — нажмите кнопку ниже, чтобы мгновенно начать пользоваться."
             )
             kb = welcome_trial_keyboard(trial_days=trial_days)

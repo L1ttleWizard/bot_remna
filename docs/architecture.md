@@ -39,12 +39,12 @@ sequenceDiagram
     participant DB as SQLite DB
     participant API as Remnawave API
 
-    User->>Bot: /start or tap "🎁 Получить тест на 3 дня"
+    User->>Bot: /start or tap "🎁 Получить тест на 5 дней"
     Bot->>DB: has_claimed_trial(tg_id) / count_subscriptions(tg_id)
     alt Already claimed / has active subscription
         Bot-->>User: ⚠️ Пробный период уже использован
     else Eligible for Trial
-        Bot->>API: create_user(username, expire_days=3, hwid_limit=3)
+        Bot->>API: create_user(username, expire_days=5, hwid_limit=3)
         API-->>Bot: subscriptionUrl, uuid, shortUuid
         Bot->>DB: add_user / record_trial_claim(tg_id)
         opt Pending Referral

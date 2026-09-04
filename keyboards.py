@@ -13,10 +13,23 @@ def back_only_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def welcome_trial_keyboard(trial_days: int = 3) -> InlineKeyboardMarkup:
+def format_days_ru(days: int) -> str:
+    """Склонение слова 'день' в зависимости от числа."""
+    if 11 <= (days % 100) <= 14:
+        return f"{days} дней"
+    rem = days % 10
+    if rem == 1:
+        return f"{days} день"
+    elif 2 <= rem <= 4:
+        return f"{days} дня"
+    return f"{days} дней"
+
+
+def welcome_trial_keyboard(trial_days: int = 5) -> InlineKeyboardMarkup:
+    days_str = format_days_ru(trial_days)
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"🎁 Получить тест на {trial_days} дня", callback_data="trial_claim")],
+            [InlineKeyboardButton(text=f"🎁 Получить тест на {days_str}", callback_data="trial_claim")],
             [
                 InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt"),
                 InlineKeyboardButton(text="❓ Поддержка", callback_data="support"),
