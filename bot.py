@@ -1954,8 +1954,28 @@ async def cb_back_main(callback: CallbackQuery):
             "Это бот для управления вашим VPN/Proxy.\nВыберите нужное действие ниже:"
         )
     else:
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
+        trial_days = DEFAULT_TRIAL_EXPIRE_DAYS
+        trial_hwid = DEFAULT_TRIAL_HWID_LIMIT
+        already_claimed = await db.has_claimed_trial(tg_id)
+        if not already_claimed and TRIAL_ENABLED_DEFAULT:
+            text = (
+                f"👋 <b>Добро пожаловать, {html.escape(callback.from_user.first_name or 'друг')}!</b>\n\n"
+                f"🚀 <b>Попробуйте наш быстрый и надёжный VPN бесплатно!</b>\n\n"
+                f"🎁 Мы дарим вам тестовый доступ на <b>{trial_days} дня</b> (до {trial_hwid} устройств).\n"
+                f"Без скрытых условий — нажмите кнопку ниже, чтобы мгновенно начать пользоваться."
+            )
+            kb = welcome_trial_keyboard(trial_days=trial_days)
+        else:
+            text = (
+                "🔒 <b>Доступ по приглашению</b>\n\n"
+                "Получите токен у администратора и активируйте его командой:\n"
+                "<code>/redeem ВАШ_ТОКЕН</code>\n\n"
+                "Либо перейдите по ссылке-приглашению, которую выдал администратор."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt")],
+                [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
+            ])
     await safe_edit(callback, text, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
 

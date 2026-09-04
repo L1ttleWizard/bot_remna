@@ -66,27 +66,48 @@ async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> N
 
 @dp.callback_query(F.data == "connect")
 async def cb_connect(callback: CallbackQuery):
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
+    tg_id = callback.from_user.id
 
     # Sync expire dates from panel first
-    subs = await db.list_subscriptions(callback.from_user.id)
+    subs = await db.list_subscriptions(tg_id)
     if subs:
         import asyncio
         await asyncio.gather(
-            *(sync_local_expire_from_panel(callback.from_user.id, sub[1]) for sub in subs),
+            *(sync_local_expire_from_panel(tg_id, sub[1]) for sub in subs),
             return_exceptions=True,
         )
         # Refetch fresh subscriptions from DB
-        subs = await db.list_subscriptions(callback.from_user.id)
+        subs = await db.list_subscriptions(tg_id)
 
     if not subs:
+        from config import DEFAULT_TRIAL_EXPIRE_DAYS, TRIAL_ENABLED_DEFAULT
+        already_claimed = await db.has_claimed_trial(tg_id)
+        if not already_claimed and TRIAL_ENABLED_DEFAULT:
+            text = (
+                "📥 <b>У вас пока нет активных подписок.</b>\n\n"
+                f"Вы можете получить бесплатный тестовый доступ на {DEFAULT_TRIAL_EXPIRE_DAYS} дня "
+                "или активировать токен доступа:"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"🎁 Получить тест на {DEFAULT_TRIAL_EXPIRE_DAYS} дня", callback_data="trial_claim")],
+                [InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
+            ])
+        else:
+            text = (
+                "📥 <b>У вас пока нет активных подписок.</b>\n\n"
+                "Активируйте токен доступа через <code>/redeem</code>."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
+            ])
+
         await safe_edit(
             callback,
-            "📥 У вас пока нет активных подписок. Активируйте токен через /redeem.",
+            text,
             parse_mode="HTML",
-            reply_markup=back_only_keyboard(),
+            reply_markup=kb,
             prefer_edit=True,
         )
         await callback.answer()
@@ -133,9 +154,6 @@ async def cb_sub_connect(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("connect_p:"))
 async def cb_connect_platform(callback: CallbackQuery):
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Некорректные данные.", show_alert=True)
@@ -173,9 +191,6 @@ async def cb_connect_platform(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("connect_client:"))
 async def cb_connect_client(callback: CallbackQuery):
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     parts = callback.data.split(":")
     if len(parts) != 4:
         await callback.answer("Некорректные данные.", show_alert=True)
@@ -216,9 +231,6 @@ async def cb_connect_client(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("connect_alt:"))
 async def cb_connect_alt(callback: CallbackQuery):
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Некорректные данные.", show_alert=True)
@@ -256,9 +268,6 @@ async def cb_connect_alt(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("connect_qr:"))
 async def cb_connect_qr(callback: CallbackQuery):
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     parts = callback.data.split(":")
     try:
         sub_id = int(parts[1])

@@ -16,9 +16,6 @@ from keyboards import back_only_keyboard
 
 @dp.callback_query(F.data == "support")
 async def cb_support(callback: CallbackQuery):
-    if not (await auth.is_authorized(callback.from_user.id) or await auth.is_admin(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     text = await db.get_setting(SUPPORT_KEY)
     body = (
         f"❓ <b>Поддержка</b>\n\n{text}"

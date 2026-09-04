@@ -9,6 +9,9 @@ services:
       network: host
     image: bot-remna:latest
     container_name: bot-remna
+    network_mode: host
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
     init: true
     restart: unless-stopped
     env_file:
