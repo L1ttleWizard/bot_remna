@@ -78,7 +78,7 @@ DEFAULT_TOKEN_HWID_LIMIT = int(os.environ.get("DEFAULT_TOKEN_HWID_LIMIT", "3"))
 
 # Параметры для автоматического пробного периода (Trial)
 DEFAULT_TRIAL_EXPIRE_DAYS = int(os.environ.get("DEFAULT_TRIAL_EXPIRE_DAYS", "3"))
-DEFAULT_TRIAL_HWID_LIMIT = int(os.environ.get("DEFAULT_TRIAL_HWID_LIMIT", "2"))
+DEFAULT_TRIAL_HWID_LIMIT = int(os.environ.get("DEFAULT_TRIAL_HWID_LIMIT", "3"))
 TRIAL_ENABLED_DEFAULT = os.environ.get("TRIAL_ENABLED", "1") == "1"
 
 

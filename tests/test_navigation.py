@@ -295,3 +295,68 @@ async def test_bot_call_hook_ignores_document_messages():
         # Should NOT be tracked because it has a document
         assert 12345 not in app.active_bot_messages or app.active_bot_messages[12345] == []
 
+
+def test_connect_keyboards_and_formatters():
+    """Verify client card formatters, keyboards, and alternative selector."""
+    import clients
+
+    client = clients.CLIENT_CATALOG["ios"][0]  # Happ
+    sub_url = "https://sub.test/123"
+
+    card = clients.format_connect_client_card("ios", client, sub_url, is_primary=True)
+    assert "1. Скачайте приложение:" in card
+    assert "2. Добавьте подписку:" in card
+    assert "3. Включите VPN:" in card
+    assert "https://sub.test/123" in card
+
+    kb = clients.connect_client_keyboard(1, "ios", client, sub_url, is_primary=True)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    button_texts = [b.text for b in buttons]
+    assert any("Скачать" in t for t in button_texts)
+    assert any("Скопировать импорт" in t for t in button_texts)
+    assert any("Скопировать ссылку" in t for t in button_texts)
+    assert any("QR-код" in t for t in button_texts)
+    assert any("Другие приложения" in t for t in button_texts)
+
+    alt_kb = clients.connect_alt_keyboard(1, "ios")
+    alt_buttons = [btn for row in alt_kb.inline_keyboard for btn in row]
+    alt_texts = [b.text for b in alt_buttons]
+    assert any("V2Box" in t for t in alt_texts)
+    assert any("Streisand" in t for t in alt_texts)
+    assert any("Назад к Happ" in t for t in alt_texts)
+
+
+@pytest.mark.asyncio
+async def test_connect_platform_and_alt_handlers():
+    """Verify connect_platform and connect_alt callback handlers."""
+    from handlers import connect
+    from aiogram.types import CallbackQuery
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.from_user = MagicMock()
+    callback.from_user.id = 12345
+    callback.data = "connect_p:1:ios"
+    callback.answer = AsyncMock()
+
+    mock_sub = (1, "uuid-1", "short-1", "user-1", 1700000000, "label-1", 1700000000)
+
+    with patch("handlers.connect.auth.is_authorized", AsyncMock(return_value=True)), \
+         patch("handlers.connect.auth.is_admin", AsyncMock(return_value=False)), \
+         patch("handlers.connect.ensure_sub_belongs_to_user", AsyncMock(return_value=mock_sub)), \
+         patch("handlers.connect.safe_edit", AsyncMock()) as mock_safe_edit:
+
+        await connect.cb_connect_platform(callback)
+        mock_safe_edit.assert_called_once()
+        args, kwargs = mock_safe_edit.call_args
+        assert "iOS" in args[1]
+        assert "Happ" in args[1]
+
+        # Test connect_alt
+        callback.data = "connect_alt:1:ios"
+        mock_safe_edit.reset_mock()
+        await connect.cb_connect_alt(callback)
+        mock_safe_edit.assert_called_once()
+        args, kwargs = mock_safe_edit.call_args
+        assert "Другие приложения" in args[1]
+
+

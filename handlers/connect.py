@@ -3,10 +3,12 @@
 Поддерживает:
 - `connect` — точка входа из главного меню (если подписок >1, picker).
 - `connect_s:<sub_id>` — выбор конкретной подписки в picker.
-- `sub:conn:<sub_id>` — вход из меню конкретной подписки.
-- `connect_p:<sub_id>:<platform>` — рендер платформы с клиентами + QR + кнопка copy_text.
+- `sub:conn:<sub_id>` / `connect_platforms:<sub_id>` — вход/возврат в меню выбора платформы.
+- `connect_p:<sub_id>:<platform>` — рендер рекомендуемого клиента для платформы.
+- `connect_client:<sub_id>:<platform>:<idx>` — рендер выбранного альтернативного клиента.
+- `connect_alt:<sub_id>:<platform>` — список альтернативных клиентов для платформы.
+- `connect_qr:<sub_id>` — показ чистого QR-кода подписки.
 """
-import html
 import io
 import logging
 
@@ -15,7 +17,6 @@ from aiogram import F
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -29,7 +30,15 @@ from app import (
     safe_edit,
     sync_local_expire_from_panel,
 )
-from clients import CLIENT_CATALOG, PLATFORM_TITLES, connect_platform_keyboard
+from clients import (
+    CLIENT_CATALOG,
+    PLATFORM_TITLES,
+    connect_alt_keyboard,
+    connect_client_keyboard,
+    connect_platform_keyboard,
+    format_connect_client_card,
+    format_qr_caption,
+)
 from config import SUB_DOMAIN
 from formatters import format_sub_caption
 from keyboards import back_only_keyboard
@@ -39,16 +48,18 @@ logger = logging.getLogger(__name__)
 
 async def _show_connect_platform_menu(callback: CallbackQuery, sub_id: int) -> None:
     text = (
-        f"📥 <b>Подключение подписки #{sub_id}</b>\n\n"
-        "Выберите платформу — пришлю инструкцию, ссылки на клиенты, "
-        "deep-link для импорта одной кнопкой и QR-код."
+        f"📥 <b>Подключение к VPN</b> (Подписка #{sub_id})\n\n"
+        "Выберите устройство, на котором планируете использовать VPN:"
     )
     subs = await db.list_subscriptions(callback.from_user.id)
     has_multiple = len(subs) > 1
 
     await safe_edit(
-        callback, text, parse_mode="HTML",
-        reply_markup=connect_platform_keyboard(sub_id, has_multiple), prefer_edit=True,
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=connect_platform_keyboard(sub_id, has_multiple),
+        prefer_edit=True,
     )
     await callback.answer()
 
@@ -58,7 +69,7 @@ async def cb_connect(callback: CallbackQuery):
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
-    
+
     # Sync expire dates from panel first
     subs = await db.list_subscriptions(callback.from_user.id)
     if subs:
@@ -80,9 +91,11 @@ async def cb_connect(callback: CallbackQuery):
         )
         await callback.answer()
         return
+
     if len(subs) == 1:
         await _show_connect_platform_menu(callback, subs[0][0])
         return
+
     rows = []
     for sub in subs:
         cap = format_sub_caption(sub)[:60]
@@ -108,8 +121,10 @@ async def cb_connect_pick_sub(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("sub:conn:"))
+@dp.callback_query(F.data.startswith("connect_platforms:"))
 async def cb_sub_connect(callback: CallbackQuery):
-    sub_id = int(callback.data.split(":", 2)[2])
+    parts = callback.data.split(":")
+    sub_id = int(parts[-1])
     sub = await ensure_sub_belongs_to_user(callback, sub_id)
     if not sub:
         return
@@ -141,79 +156,157 @@ async def cb_connect_platform(callback: CallbackQuery):
     short_uuid = sub[3]
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else ""
 
-    title = PLATFORM_TITLES[platform]
-    clients = CLIENT_CATALOG[platform]
-    lines = [f"<b>{title}</b>", ""]
+    primary_client = CLIENT_CATALOG[platform][0]
+    text = format_connect_client_card(platform, primary_client, sub_url, is_primary=True)
+    kb = connect_client_keyboard(sub_id, platform, primary_client, sub_url, is_primary=True)
 
-    if sub_url:
-        lines.append("Ваша ссылка-подписка:")
-        lines.append(f"<code>{html.escape(sub_url)}</code>")
-        lines.append("")
-    else:
-        lines.append(
-            "<i>У вас пока нет аккаунта в панели — ссылка появится после активации токена.</i>\n"
-        )
-
-    copy_buttons: list[list[InlineKeyboardButton]] = []
-    for c in clients:
-        lines.append(f"<b>• {html.escape(c['name'])}</b>")
-        for label, url in c["stores"]:
-            lines.append(f"  · <a href=\"{html.escape(url)}\">{html.escape(label)}</a>")
-        if sub_url and c.get("deeplink_template"):
-            deep = c["deeplink_template"].replace("{sub}", sub_url)
-            # `<code>...</code>` long-press копируется во всех клиентах Telegram.
-            lines.append(f"  · Импорт-ссылка: <code>{html.escape(deep)}</code>")
-            # Дополнительно — кнопка copy_text (Bot API 7.10+) для тапа в один клик.
-            copy_buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"📋 Скопировать импорт {c['name']}",
-                        copy_text=CopyTextButton(text=deep),
-                    )
-                ]
-            )
-        lines.append("")
-
-    lines.append(
-        "📌 <b>Как использовать импорт-ссылку</b>:\n"
-        "1) Тапните на кнопку «📋 Скопировать импорт …» ниже — ссылка попадёт в буфер обмена.\n"
-        "2) Откройте установленный клиент — он автоматически предложит добавить подписку, "
-        "либо вручную: «Добавить подписку» / «Add subscription» / «+» → вставьте.\n"
-        "📷 QR-код подписки — следующим сообщением (если есть аккаунт)."
-    )
-
-    kb_rows: list[list[InlineKeyboardButton]] = list(copy_buttons)
-    kb_rows.append([InlineKeyboardButton(text="◀️ К платформам", callback_data=f"sub:conn:{sub_id}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    tg_id = callback.from_user.id
-    # Delete the previous platform picker menu and other old messages
-    await delete_active_bot_messages(callback.bot, tg_id)
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    await callback.bot.send_message(
-        chat_id=tg_id,
-        text="\n".join(lines),
+    await safe_edit(
+        callback,
+        text,
         parse_mode="HTML",
         reply_markup=kb,
+        prefer_edit=True,
         disable_web_page_preview=True,
     )
+    await callback.answer()
 
-    if sub_url:
+
+@dp.callback_query(F.data.startswith("connect_client:"))
+async def cb_connect_client(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    try:
+        sub_id = int(parts[1])
+        platform = parts[2]
+        client_idx = int(parts[3])
+    except ValueError:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+
+    if platform not in CLIENT_CATALOG or client_idx >= len(CLIENT_CATALOG[platform]):
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+
+    sub = await ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    short_uuid = sub[3]
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else ""
+
+    client = CLIENT_CATALOG[platform][client_idx]
+    is_primary = client_idx == 0
+    text = format_connect_client_card(platform, client, sub_url, is_primary=is_primary)
+    kb = connect_client_keyboard(sub_id, platform, client, sub_url, is_primary=is_primary)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+        prefer_edit=True,
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("connect_alt:"))
+async def cb_connect_alt(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    try:
+        sub_id = int(parts[1])
+    except ValueError:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    platform = parts[2]
+    if platform not in CLIENT_CATALOG:
+        await callback.answer("Неизвестная платформа.", show_alert=True)
+        return
+
+    sub = await ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+
+    platform_title = PLATFORM_TITLES.get(platform, platform)
+    text = (
+        f"📱 <b>Другие приложения для {platform_title}</b>\n\n"
+        "Выберите приложение из списка ниже:"
+    )
+    kb = connect_alt_keyboard(sub_id, platform)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+        prefer_edit=True,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("connect_qr:"))
+async def cb_connect_qr(callback: CallbackQuery):
+    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
+        await callback.answer("Доступ только по приглашению.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    try:
+        sub_id = int(parts[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+
+    sub = await ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    short_uuid = sub[3]
+    sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else ""
+
+    if not sub_url:
+        await callback.answer("Ссылка на подписку отсутствует.", show_alert=True)
+        return
+
+    tg_id = callback.from_user.id
+    try:
+        img = qrcode.make(sub_url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К выбору платформы", callback_data=f"connect_platforms:{sub_id}")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+            ]
+        )
+
+        await delete_active_bot_messages(callback.bot, tg_id)
         try:
-            img = qrcode.make(sub_url)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            buf.seek(0)
-            await callback.bot.send_photo(
-                chat_id=tg_id,
-                photo=BufferedInputFile(buf.read(), filename="subscription.png"),
-                caption="QR-код подписки. Отсканируйте в выбранном клиенте.",
-            )
-        except Exception as exc:
-            logger.warning("QR generation failed: %s", exc)
+            await callback.message.delete()
+        except Exception:
+            pass
+
+        await callback.bot.send_photo(
+            chat_id=tg_id,
+            photo=BufferedInputFile(buf.read(), filename="subscription.png"),
+            caption=format_qr_caption(sub_url),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+    except Exception as exc:
+        logger.error("QR generation failed: %s", exc)
+        await callback.answer("Не удалось сгенерировать QR-код.", show_alert=True)
+        return
 
     await callback.answer()
+
