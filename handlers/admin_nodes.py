@@ -29,6 +29,7 @@ from aiogram.types import (
 import auth
 import config
 import database as db
+import keyboards as kb
 from app import api, dp, safe_edit
 from formatters import human_bytes
 
@@ -88,12 +89,20 @@ def _node_card_keyboard(node: dict) -> InlineKeyboardMarkup:
             ),
         ],
         [
-            InlineKeyboardButton(text="🗹 Сбросить трафик", callback_data=f"nodes:act:reset_traffic:{uuid}"),
-            InlineKeyboardButton(text="🗑 Удалить ноду", callback_data=f"nodes:del_confirm:{uuid}"),
+            InlineKeyboardButton(text="🖥 Метрики", callback_data=f"nodes:metrics:{uuid}"),
+            InlineKeyboardButton(text="👥 Онлайн", callback_data=f"nodes:conn:{uuid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🌍 Гео-тест", callback_data=f"nodes:geocheck:{uuid}"),
+            InlineKeyboardButton(text="👥 Топ юзеров", callback_data=f"nodes:bw_users:{uuid}"),
         ],
         [
             InlineKeyboardButton(text="💳 Биллинг", callback_data=f"nodes:billing:{uuid}"),
             InlineKeyboardButton(text="📈 График нагрузки", callback_data=f"nodes:chart:{uuid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🗹 Сбросить трафик", callback_data=f"nodes:act:reset_traffic:{uuid}"),
+            InlineKeyboardButton(text="🗑 Удалить ноду", callback_data=f"nodes:del_confirm:{uuid}"),
         ],
         [
             InlineKeyboardButton(text="⚡ Speedtest", callback_data=f"nodes:speedtest:{uuid}"),
@@ -739,6 +748,186 @@ async def cb_nodes_speedtest_all(callback: CallbackQuery):
             reply_markup=back_kb,
             prefer_edit=True
         )
+
+
+@dp.callback_query(F.data.startswith("nodes:metrics:"))
+async def cb_nodes_metrics(callback: CallbackQuery) -> None:
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+    uuid = callback.data.split(":", 2)[2]
+    node = await api.get_node(uuid)
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+
+    node_data = node.get("response") if isinstance(node, dict) and "response" in node else node
+    name = html.escape(str(node_data.get("name") or "—"))
+    flag = html.escape(str(node_data.get("countryCode") or ""))
+
+    metrics_list = await api.get_system_nodes_metrics()
+    target_metric = None
+    if metrics_list:
+        for m in metrics_list:
+            if m.get("nodeUuid") == uuid:
+                target_metric = m
+                break
+
+    lines = [f"🖥 <b>Метрики ноды {name} ({flag}):</b>\n"]
+    if target_metric:
+        users_online = target_metric.get("usersOnline", 0)
+        lines.append(f"👥 <b>Пользователей онлайн:</b> <code>{users_online}</code>")
+        lines.append(f"🏢 <b>Провайдер:</b> <code>{html.escape(str(target_metric.get('providerName') or '—'))}</code>\n")
+        
+        inbounds = target_metric.get("inboundsStats") or []
+        if inbounds:
+            lines.append("📥 <b>Трафик инбаундов:</b>")
+            for ib in inbounds:
+                tag = html.escape(str(ib.get("tag") or "—"))
+                up = html.escape(str(ib.get("upload") or "0"))
+                dl = html.escape(str(ib.get("download") or "0"))
+                lines.append(f"  · <code>{tag}</code>: ↑ {up} | ↓ {dl}")
+
+        outbounds = target_metric.get("outboundsStats") or []
+        if outbounds:
+            lines.append("\n📤 <b>Трафик аутбаундов:</b>")
+            for ob in outbounds:
+                tag = html.escape(str(ob.get("tag") or "—"))
+                up = html.escape(str(ob.get("upload") or "0"))
+                dl = html.escape(str(ob.get("download") or "0"))
+                lines.append(f"  · <code>{tag}</code>: ↑ {up} | ↓ {dl}")
+    else:
+        lines.append("<i>Метрики в реальном времени пока недоступны для этой ноды.</i>")
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb.node_metrics_keyboard(uuid),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("nodes:conn:"))
+async def cb_nodes_conn(callback: CallbackQuery) -> None:
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+    uuid = callback.data.split(":", 2)[2]
+    node = await api.get_node(uuid)
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+
+    node_data = node.get("response") if isinstance(node, dict) and "response" in node else node
+    name = html.escape(str(node_data.get("name") or "—"))
+
+    await callback.answer("Сканирую активные подключения...")
+    res = await api.get_node_connections(uuid)
+
+    lines = [f"👥 <b>Активные подключения на ноде {name}:</b>\n"]
+    if res and isinstance(res, dict):
+        users = res.get("users") or res.get("connections") or []
+        if users:
+            for idx, u in enumerate(users[:25], 1):
+                uname = html.escape(str(u.get("username") or u.get("userId") or "—"))
+                ip = html.escape(str(u.get("ip") or u.get("clientIp") or "—"))
+                conn_count = u.get("connectionsCount") or u.get("count") or 1
+                lines.append(f"<b>{idx}.</b> <code>{uname}</code> — <code>{ip}</code> ({conn_count} conn)")
+        else:
+            lines.append("<i>На данный момент активных подключений не зафиксировано.</i>")
+    else:
+        lines.append("<i>На данный момент активных подключений не зафиксировано.</i>")
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb.node_sessions_keyboard(uuid),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("nodes:geocheck:"))
+async def cb_nodes_geocheck(callback: CallbackQuery) -> None:
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+    uuid = callback.data.split(":", 2)[2]
+    node = await api.get_node(uuid)
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+    node_data = node.get("response") if isinstance(node, dict) and "response" in node else node
+    name = html.escape(str(node_data.get("name") or "—"))
+
+    await callback.answer("Запускаю гео-проверку ноды...")
+    res = await api.node_geocheck(uuid)
+    lines = [f"🌍 <b>Гео-проверка ноды {name}:</b>\n"]
+    if res and isinstance(res, dict):
+        ip = html.escape(str(res.get("ip") or res.get("query") or "—"))
+        country = html.escape(str(res.get("country") or res.get("countryCode") or "—"))
+        city = html.escape(str(res.get("city") or "—"))
+        isp = html.escape(str(res.get("isp") or res.get("org") or "—"))
+        as_name = html.escape(str(res.get("as") or "—"))
+        lines.append(f"• <b>IP:</b> <code>{ip}</code>")
+        lines.append(f"• <b>Локация:</b> <b>{country}</b>, {city}")
+        lines.append(f"• <b>Провайдер / AS:</b> {isp} ({as_name})")
+    else:
+        lines.append("<i>Гео-проверка завершилась без ответа или сервис гео-проверки недоступен.</i>")
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb.node_geocheck_keyboard(uuid),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("nodes:bw_users:"))
+async def cb_nodes_bw_users(callback: CallbackQuery) -> None:
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+    from datetime import datetime, timedelta, timezone
+    uuid = callback.data.split(":", 2)[2]
+    node = await api.get_node(uuid)
+    if not node:
+        await callback.answer("Нода не найдена.", show_alert=True)
+        return
+    node_data = node.get("response") if isinstance(node, dict) and "response" in node else node
+    name = html.escape(str(node_data.get("name") or "—"))
+
+    end_dt = datetime.now(timezone.utc).date()
+    start_dt = end_dt - timedelta(days=7)
+    start_d = start_dt.strftime("%Y-%m-%d")
+    end_d = end_dt.strftime("%Y-%m-%d")
+
+    await callback.answer("Загружаю статистику...")
+    bw_data = await api.get_node_bandwidth_users(uuid, start_d, end_d, top_limit=10)
+    lines = [f"👥 <b>Топ пользователей на ноде {name}</b> (за 7 дней):\n"]
+    if bw_data and isinstance(bw_data, dict):
+        top_users = bw_data.get("topUsers") or []
+        if top_users:
+            for idx, u in enumerate(top_users, 1):
+                uname = html.escape(str(u.get("username") or u.get("userId") or "—"))
+                tot = int(u.get("total") or 0)
+                lines.append(f"<b>{idx}.</b> <code>{uname}</code> — <b>{html.escape(human_bytes(tot))}</b>")
+        else:
+            lines.append("<i>Данных по использованию за этот период нет.</i>")
+    else:
+        lines.append("<i>Данные по пользователям ноды недоступны.</i>")
+
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb.node_bw_users_keyboard(uuid),
+        prefer_edit=True,
+    )
+
+
 
 
 

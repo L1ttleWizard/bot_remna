@@ -196,6 +196,15 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)"
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trial_claims (
+                tg_id INTEGER PRIMARY KEY,
+                claimed_at INTEGER NOT NULL
+            )
+            """
+        )
+
 
         # One-time backfill: copy legacy users.uuid → subscriptions for users
         # that don't have a corresponding subscription yet.
@@ -1340,6 +1349,28 @@ async def get_referral_stats(referrer_id: int) -> tuple[int, int]:
             if row:
                 return (int(row[0] or 0), int(row[1] or 0))
             return (0, 0)
+
+
+async def has_claimed_trial(tg_id: int) -> bool:
+    """Проверяет, активировал ли пользователь уже пробный период."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM trial_claims WHERE tg_id = ?",
+            (int(tg_id),),
+        ) as cursor:
+            return (await cursor.fetchone()) is not None
+
+
+async def record_trial_claim(tg_id: int) -> None:
+    """Фиксирует выдачу пробного периода для tg_id."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO trial_claims (tg_id, claimed_at) VALUES (?, ?)",
+            (int(tg_id), now),
+        )
+        await db.commit()
+
 
 
 

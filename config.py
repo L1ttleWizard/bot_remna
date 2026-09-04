@@ -76,6 +76,11 @@ ADMIN_TG_IDS: set[int] = _parse_admin_ids(os.environ.get("ADMIN_TG_IDS", ""))
 DEFAULT_TOKEN_EXPIRE_DAYS = int(os.environ.get("DEFAULT_TOKEN_EXPIRE_DAYS", "30"))
 DEFAULT_TOKEN_HWID_LIMIT = int(os.environ.get("DEFAULT_TOKEN_HWID_LIMIT", "3"))
 
+# Параметры для автоматического пробного периода (Trial)
+DEFAULT_TRIAL_EXPIRE_DAYS = int(os.environ.get("DEFAULT_TRIAL_EXPIRE_DAYS", "3"))
+DEFAULT_TRIAL_HWID_LIMIT = int(os.environ.get("DEFAULT_TRIAL_HWID_LIMIT", "2"))
+TRIAL_ENABLED_DEFAULT = os.environ.get("TRIAL_ENABLED", "1") == "1"
+
 
 # === Master node SSH (для добавления новых нод через ansible) ===
 # Если задано MASTER_SSH_HOST — кнопка «➕ Добавить ноду» в админ-панели

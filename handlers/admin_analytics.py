@@ -19,8 +19,9 @@ from aiogram.types import (
 
 import auth
 import database as db
+import keyboards as kb
 from app import api, dp, safe_edit
-from formatters import human_bytes
+from formatters import human_bytes, format_expire_display
 
 logger = logging.getLogger(__name__)
 
@@ -39,21 +40,36 @@ def _analytics_date_range(days: int = ANALYTICS_PERIOD_DAYS) -> tuple[str, str]:
 
 def _stats_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📀 Статистика нод", callback_data="admin_stats:nodes_menu")],
-        [InlineKeyboardButton(text="📅 Подписки & БД", callback_data="admin_stats:db_menu")],
         [
-            InlineKeyboardButton(text="📈 Топ по трафику", callback_data="admin_stats:traffic"),
-            InlineKeyboardButton(text="⏰ Срок действия", callback_data="admin_stats:expiring"),
+            InlineKeyboardButton(text="📋 Дайджест", callback_data="admin_stats:digest_menu"),
+            InlineKeyboardButton(text="🏆 Итоги (Recap)", callback_data="admin_stats:recap"),
         ],
         [
+            InlineKeyboardButton(text="📈 Трафик системы", callback_data="admin_stats:bandwidth"),
+            InlineKeyboardButton(text="📀 Ноды", callback_data="admin_stats:nodes_menu"),
+        ],
+        [
+            InlineKeyboardButton(text="📱 Запросы & SRR", callback_data="admin_stats:srr"),
+            InlineKeyboardButton(text="📱 Топ устройств", callback_data="admin_stats:top_hwid"),
+        ],
+        [
+            InlineKeyboardButton(text="📅 Подписки & БД", callback_data="admin_stats:db_menu"),
+            InlineKeyboardButton(text="📈 Топ по трафику", callback_data="admin_stats:traffic"),
+        ],
+        [
+            InlineKeyboardButton(text="⏰ Срок действия", callback_data="admin_stats:expiring"),
             InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_stats:promos"),
+        ],
+        [
             InlineKeyboardButton(text="🔑 Токены", callback_data="admin_stats:tokens"),
+            InlineKeyboardButton(text="🩺 Здоровье системы", callback_data="admin_stats:health"),
         ],
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats"),
             InlineKeyboardButton(text="🛠 В админ-панель", callback_data="admin_panel"),
         ],
     ])
+
 
 
 def _nodes_stats_keyboard() -> InlineKeyboardMarkup:
@@ -547,6 +563,356 @@ async def cb_admin_stats(callback: CallbackQuery):
         await _send_admin_stats_summary(callback, prefer_edit=True)
 
 
+async def _send_admin_stats_digest(callback: CallbackQuery, period: str = "7d", *, prefer_edit: bool = True) -> None:
+    now = datetime.now(timezone.utc)
+    if period == "24h":
+        start_dt = now - timedelta(days=1)
+        period_label = "24 часа"
+    elif period == "30d":
+        start_dt = now - timedelta(days=30)
+        period_label = "30 дней"
+    else:
+        start_dt = now - timedelta(days=7)
+        period_label = "7 дней"
+
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    digest = await api.get_system_digest(start_iso, end_iso)
+    if not digest:
+        text = "❌ <b>Не удалось получить дайджест от сервера.</b>"
+    else:
+        users = digest.get("users") or {}
+        traffic = digest.get("traffic") or {}
+        hwid = digest.get("hwidDevices") or {}
+
+        created_users = users.get("createdCount", 0)
+        expired_users = users.get("expiredCount", 0)
+        total_traffic_bytes = int(traffic.get("totalBytes") or 0)
+        new_users_traffic_bytes = int(traffic.get("byUsersCreatedInRangeBytes") or 0)
+        created_hwid = hwid.get("createdCount", 0)
+
+        text = (
+            f"📋 <b>Сводный дайджест системы ({period_label})</b>\n\n"
+            f"👥 <b>Пользователи:</b>\n"
+            f"  · Создано новых: <b>+{created_users}</b>\n"
+            f"  · Истекло подписок: <b>{expired_users}</b>\n\n"
+            f"📦 <b>Трафик:</b>\n"
+            f"  · Общий объём: <b>{html.escape(human_bytes(total_traffic_bytes))}</b>\n"
+            f"  · Трафик новых юзеров: <b>{html.escape(human_bytes(new_users_traffic_bytes))}</b>\n\n"
+            f"📱 <b>Устройства:</b>\n"
+            f"  · Добавлено HWID: <b>+{created_hwid}</b>"
+        )
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_stats_digest_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_health(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    health = await api.get_system_health()
+    if not health:
+        text = "❌ <b>Не удалось получить состояние сервисов от сервера.</b>"
+    else:
+        metrics = health.get("runtimeMetrics") or []
+        lines = ["🩺 <b>Состояние сервисов Remnawave:</b>\n"]
+        for m in metrics:
+            inst_type = html.escape(str(m.get("instanceType") or "core"))
+            uptime_s = int(m.get("uptime") or 0)
+            hours = uptime_s // 3600
+            mins = (uptime_s % 3600) // 60
+            rss_mb = round(int(m.get("rss") or 0) / (1024 * 1024), 1)
+            heap_mb = round(int(m.get("heapUsed") or 0) / (1024 * 1024), 1)
+            heap_tot_mb = round(int(m.get("heapTotal") or 0) / (1024 * 1024), 1)
+            ev_delay = round(float(m.get("eventLoopDelayMs") or 0), 2)
+            lines.append(
+                f"🟢 <b>Компонент <code>{inst_type}</code></b> (PID: {m.get('pid')}):\n"
+                f"  · Uptime: <b>{hours}ч {mins}м</b>\n"
+                f"  · RAM (RSS): <b>{rss_mb} MB</b> (Heap: {heap_mb}/{heap_tot_mb} MB)\n"
+                f"  · Event Loop Delay: <b>{ev_delay} ms</b>\n"
+            )
+        text = "\n".join(lines)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_recap(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    recap = await api.get_system_recap()
+    if not recap:
+        text = "❌ <b>Не удалось получить итоги от сервера.</b>"
+    else:
+        this_m = recap.get("thisMonth") or {}
+        tot = recap.get("total") or {}
+        ver = html.escape(str(recap.get("version") or "3.4.3"))
+        init_date = recap.get("initDate") or ""
+        init_h = format_expire_display(init_date) if init_date else "—"
+
+        m_users = this_m.get("users", 0)
+        m_traffic = int(this_m.get("traffic") or 0)
+
+        tot_users = tot.get("users", 0)
+        tot_nodes = tot.get("nodes", 0)
+        tot_traffic = int(tot.get("traffic") or 0)
+        tot_ram = int(tot.get("nodesRam") or 0)
+        tot_cores = tot.get("nodesCpuCores", 0)
+        tot_countries = tot.get("distinctCountries", 0)
+
+        text = (
+            "🏆 <b>Итоги и сводка сервиса (Recap)</b>\n\n"
+            "📅 <b>Текущий месяц:</b>\n"
+            f"  · Новых пользователей: <b>+{m_users}</b>\n"
+            f"  · Трафик за месяц: <b>{html.escape(human_bytes(m_traffic))}</b>\n\n"
+            "🌐 <b>За всё время работы:</b>\n"
+            f"  · Всего пользователей: <b>{tot_users}</b>\n"
+            f"  · Всего трафика: <b>{html.escape(human_bytes(tot_traffic))}</b>\n"
+            f"  · Серверов в кластере: <b>{tot_nodes}</b> в <b>{tot_countries}</b> странах\n"
+            f"  · Мощность кластера: <b>{tot_cores} CPU cores</b> · <b>{html.escape(human_bytes(tot_ram))} RAM</b>\n\n"
+            f"⏱ <b>Дата запуска:</b> {html.escape(init_h)} (v{ver})"
+        )
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_bandwidth(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    bw = await api.get_system_bandwidth()
+    if not bw:
+        text = "❌ <b>Не удалось получить статистику трафика от сервера.</b>"
+    else:
+        d2 = bw.get("bandwidthLastTwoDays") or {}
+        d7 = bw.get("bandwidthLastSevenDays") or {}
+        d30 = bw.get("bandwidthLast30Days") or {}
+        c_month = bw.get("bandwidthCalendarMonth") or {}
+        c_year = bw.get("bandwidthCurrentYear") or {}
+
+        def _fmt_row(item: dict) -> str:
+            cur = html.escape(str(item.get("current") or "0"))
+            prev = html.escape(str(item.get("previous") or "0"))
+            diff = html.escape(str(item.get("difference") or "0"))
+            sign = "+" if not diff.startswith("-") and diff != "0" else ""
+            return f"<b>{cur}</b> (пред.: {prev} · <i>{sign}{diff}</i>)"
+
+        text = (
+            "📈 <b>Агрегированный трафик системы</b>\n\n"
+            f"• <b>За 2 дня:</b> {_fmt_row(d2)}\n"
+            f"• <b>За 7 дней:</b> {_fmt_row(d7)}\n"
+            f"• <b>За 30 дней:</b> {_fmt_row(d30)}\n"
+            f"• <b>Текущий месяц:</b> {_fmt_row(c_month)}\n"
+            f"• <b>Текущий год:</b> <b>{html.escape(str(c_year.get('current') or '0'))}</b>\n\n"
+            "<i>Сравнение производится с аналогичным предыдущим периодом.</i>"
+        )
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_top_hwid(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    res = await api.get_top_hwid_users(start=0, size=15)
+    if not res:
+        text = "❌ <b>Не удалось получить топ по устройствам от сервера.</b>"
+    else:
+        users = res.get("users") or []
+        total = res.get("total", len(users))
+        lines = [f"📱 <b>Топ пользователей по HWID-устройствам</b> (всего: {total}):\n"]
+        for idx, u in enumerate(users, 1):
+            uname = html.escape(str(u.get("username") or u.get("id") or "—"))
+            count = u.get("devicesCount", 0)
+            lines.append(f"<b>{idx}.</b> <code>{uname}</code> — <b>{count}</b> устр.")
+        lines.append("\n<i>Полезно для выявления шеринга и передачи ключей.</i>")
+        text = "\n".join(lines)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_stats_back_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_srr(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    stats_data = await api.get_subscription_request_history_stats()
+    history_data = await api.get_all_subscription_request_history(limit=100)
+    
+    if not stats_data and not history_data:
+        text = "❌ <b>Не удалось получить данные SRR и историю запросов.</b>"
+    else:
+        stats_obj = stats_data or {}
+        records = (history_data.get("records") if isinstance(history_data, dict) else history_data) or []
+        
+        # 1. Apps Breakdown
+        by_app = stats_obj.get("byParsedApp") or []
+        total_app_requests = sum(item.get("count", 0) for item in by_app)
+        
+        # 2. Hourly Stats
+        hourly = stats_obj.get("hourlyRequestStats") or []
+        total_hourly_requests = sum(item.get("requestCount", 0) for item in hourly)
+        total_requests = max(total_app_requests, total_hourly_requests, len(records))
+        
+        lines = [
+            "📱 <b>Статистика запросов подписок и правил SRR</b>\n",
+            f"📊 <b>Всего обращений:</b> <code>{total_requests}</code> (за последние 48ч)\n",
+            "👥 <b>Популярность VPN-клиентов:</b>"
+        ]
+        
+        if by_app:
+            for item in by_app[:7]:
+                app_name = item.get("app") or "Другие"
+                cnt = item.get("count", 0)
+                pct = (cnt / total_app_requests * 100) if total_app_requests > 0 else 0
+                filled = int(round(pct / 10))
+                bar = "█" * filled + "░" * (10 - filled)
+                lines.append(f"  · <b>{html.escape(app_name)}</b>: {cnt} (<code>{pct:.1f}%</code>) {bar}")
+        else:
+            lines.append("  <i>Нет данных о приложениях</i>")
+            
+        # 3. Breakdown by SRR Rule Name & Format
+        lines.append("\n🔄 <b>Правила маршрутизации (SRR Rules):</b>")
+        if records:
+            rule_counts = {}
+            type_counts = {}
+            for r in records:
+                rname = r.get("srrRuleName") or "Fallback / Без правила"
+                rtype = r.get("srrResponseType") or "UNKNOWN"
+                rule_counts[rname] = rule_counts.get(rname, 0) + 1
+                type_counts[rtype] = type_counts.get(rtype, 0) + 1
+                
+            tot_hist = len(records)
+            for rname, cnt in sorted(rule_counts.items(), key=lambda x: -x[1]):
+                pct = (cnt / tot_hist * 100)
+                lines.append(f"  · <b>{html.escape(rname)}</b>: {cnt} (<code>{pct:.1f}%</code>)")
+                
+            lines.append("\n📦 <b>Форматы выдачи конфигов:</b>")
+            type_icons = {
+                "MIHOMO": "🟣",
+                "SINGBOX": "🟢",
+                "CLASH": "🟡",
+                "XRAY_BASE64": "⚪️",
+                "BROWSER": "🌐",
+                "STASH": "🟠",
+                "UNKNOWN": "❓",
+            }
+            for rtype, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+                icon = type_icons.get(rtype, "🔹")
+                pct = (cnt / tot_hist * 100)
+                lines.append(f"  {icon} <code>{html.escape(rtype)}</code>: {cnt} ({pct:.1f}%)")
+        else:
+            lines.append("  <i>Нет записей истории</i>")
+            
+        # 4. Hourly background update activity
+        if hourly:
+            recent_24 = hourly[-24:]
+            counts = [item.get("requestCount", 0) for item in recent_24]
+            max_c = max(counts) if counts else 1
+            spark_chars = "  ▂▃▄▅▆▇█"
+            sparkline = "".join(spark_chars[min(int(c / max_c * (len(spark_chars) - 1)), len(spark_chars) - 1)] for c in counts)
+            
+            bg_apps = {"happ", "hiddify", "sing-box", "karing", "clash", "flclash", "nekobox", "incy"}
+            bg_count = sum(item.get("count", 0) for item in by_app if str(item.get("app", "")).lower() in bg_apps)
+            bg_pct = (bg_count / total_app_requests * 100) if total_app_requests > 0 else 0
+            
+            lines.append("\n⏱ <b>Активность авто-обновлений (24ч):</b>")
+            lines.append(f"<code>[{sparkline}]</code> (пик: {max_c} запр/час)")
+            lines.append(f"🔄 Доля фоновых авто-синхронизаций: ~<b>{bg_pct:.1f}%</b>")
+
+        text = "\n".join(lines)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_srr_stats_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_srr_recent(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    history_data = await api.get_all_subscription_request_history(limit=15)
+    records = (history_data.get("records") if isinstance(history_data, dict) else history_data) or []
+    
+    if not records:
+        text = "📋 <b>Последние запросы подписок</b>\n\n<i>История обращений пуста.</i>"
+    else:
+        lines = [f"📋 <b>Последние {len(records)} запросов подписок:</b>\n"]
+        for r in records:
+            req_at = r.get("requestAt") or ""
+            dt_str = format_expire_display(req_at) if req_at else "—"
+            ua = html.escape(str(r.get("userAgent") or "—")[:40])
+            rname = html.escape(str(r.get("srrRuleName") or r.get("srrResponseType") or "Default"))
+            ip = html.escape(str(r.get("requestIp") or "—"))
+            uid = r.get("userId")
+            u_str = f"user=<code>{uid}</code>" if uid else ""
+            lines.append(f"⏱ <code>{dt_str}</code> · {u_str}\n   📱 <i>{ua}</i>\n   ⚡️ Правило: <b>{rname}</b> · IP: <code>{ip}</code>\n")
+        text = "\n".join(lines)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_srr_recent_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
+async def _send_admin_stats_srr_rules(callback: CallbackQuery, *, prefer_edit: bool = True) -> None:
+    settings = await api.get_subscription_settings()
+    if not settings:
+        text = "⚙️ <b>Не удалось получить настройки SRR из панели.</b>"
+    else:
+        resp_obj = settings if "response" not in settings else settings["response"]
+        rules = resp_obj.get("responseRules", {}).get("rules") or []
+        custom_headers = resp_obj.get("customResponseHeaders") or {}
+        update_interval = custom_headers.get("profile-update-interval") or "—"
+        announce = custom_headers.get("announce") or "—"
+        if announce.startswith("rwEncodeBase64:"):
+            announce = announce.replace("rwEncodeBase64:", "")
+                
+        lines = [
+            "⚙️ <b>Настройки маршрутизации (Subscription Response Rules)</b>\n",
+            f"⏱ <b>Интервал авто-обновления профилей:</b> каждые <code>{update_interval}ч</code>",
+            f"📢 <b>Анонс в заголовках:</b> <i>{html.escape(announce[:60])}</i>\n",
+            f"📋 <b>Активные правила SRR ({len(rules)}):</b>"
+        ]
+        
+        for idx, r in enumerate(rules, 1):
+            rname = html.escape(str(r.get("name") or f"Правило #{idx}"))
+            rtype = html.escape(str(r.get("responseType") or "DEFAULT"))
+            enabled = "✅" if r.get("enabled", True) else "❌"
+            conds = r.get("conditions") or []
+            cond_str = f" ({len(conds)} условий)" if conds else " (fallback)"
+            lines.append(f"{enabled} <b>{rname}</b> ➔ <code>{rtype}</code>{cond_str}")
+            
+        text = "\n".join(lines)
+
+    await safe_edit(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb.admin_srr_rules_keyboard(),
+        prefer_edit=prefer_edit,
+    )
+
+
 @dp.callback_query(F.data.startswith("admin_stats:"))
 async def cb_admin_stats_sub(callback: CallbackQuery):
     if not await auth.is_admin(callback.from_user.id):
@@ -580,6 +946,25 @@ async def cb_admin_stats_sub(callback: CallbackQuery):
         await cb_nodes_total_chart(callback)
     elif section == "nodes_compare_chart":
         await cb_nodes_compare_chart(callback)
+    elif section == "digest_menu":
+        await _send_admin_stats_digest(callback, "7d", prefer_edit=True)
+    elif section.startswith("digest:"):
+        period = section.split(":", 1)[1]
+        await _send_admin_stats_digest(callback, period, prefer_edit=True)
+    elif section == "recap":
+        await _send_admin_stats_recap(callback, prefer_edit=True)
+    elif section == "bandwidth":
+        await _send_admin_stats_bandwidth(callback, prefer_edit=True)
+    elif section == "top_hwid":
+        await _send_admin_stats_top_hwid(callback, prefer_edit=True)
+    elif section == "srr":
+        await _send_admin_stats_srr(callback, prefer_edit=True)
+    elif section == "srr_recent":
+        await _send_admin_stats_srr_recent(callback, prefer_edit=True)
+    elif section == "srr_rules":
+        await _send_admin_stats_srr_rules(callback, prefer_edit=True)
+    elif section == "health":
+        await _send_admin_stats_health(callback, prefer_edit=True)
     else:
         await _send_admin_stats_summary(callback, prefer_edit=True)
 

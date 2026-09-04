@@ -13,6 +13,27 @@ def back_only_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def welcome_trial_keyboard(trial_days: int = 3) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎁 Получить тест на {trial_days} дня", callback_data="trial_claim")],
+            [
+                InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt"),
+                InlineKeyboardButton(text="❓ Поддержка", callback_data="support"),
+            ],
+        ]
+    )
+
+
+def trial_success_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Подключить (Инструкция / QR)", callback_data="connect")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")],
+        ]
+    )
+
+
 def main_keyboard_user() -> InlineKeyboardMarkup:
     """Меню обычного пользователя — read-only, с поддержкой нескольких подписок."""
     return InlineKeyboardMarkup(
@@ -127,7 +148,10 @@ def user_sub_menu_keyboard(sub_id: int, has_multiple: bool = True) -> InlineKeyb
                 InlineKeyboardButton(text="📈 Аналитика", callback_data=f"sub:info:{sub_id}"),
                 InlineKeyboardButton(text="📱 Устройства", callback_data=f"sub:dev:{sub_id}"),
             ],
-            [InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}")],
+            [
+                InlineKeyboardButton(text="🌐 Мои сессии", callback_data=f"sub:conn_view:{sub_id}"),
+                InlineKeyboardButton(text="📥 Подключить", callback_data=f"sub:conn:{sub_id}"),
+            ],
             [back_btn],
         ]
     )
@@ -141,13 +165,117 @@ def admin_sub_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="+30 дней", callback_data=f"admu:{target_tg}:s:{sub_id}:ext:30"),
             ],
             [InlineKeyboardButton(text="♾ Без лимита по времени", callback_data=f"admu:{target_tg}:s:{sub_id}:ext_inf")],
-            [InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev")],
-            [InlineKeyboardButton(text="👥 Сквады", callback_data=f"admu:{target_tg}:s:{sub_id}:squads")],
+            [
+                InlineKeyboardButton(text="📱 Устройства", callback_data=f"admu:{target_tg}:s:{sub_id}:dev"),
+                InlineKeyboardButton(text="🌐 Сессии", callback_data=f"admu:{target_tg}:s:{sub_id}:conn"),
+            ],
+            [
+                InlineKeyboardButton(text="📋 История запросов", callback_data=f"admu:{target_tg}:s:{sub_id}:req_hist"),
+                InlineKeyboardButton(text="👥 Сквады", callback_data=f"admu:{target_tg}:s:{sub_id}:squads"),
+            ],
+            [InlineKeyboardButton(text="🔌 Сбросить сессии (Кик)", callback_data=f"admu:{target_tg}:s:{sub_id}:drop_confirm")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
             [InlineKeyboardButton(text="🗑 Удалить эту подписку", callback_data=f"admu:{target_tg}:s:{sub_id}:del")],
             [InlineKeyboardButton(text="◀️ К пользователю", callback_data=f"admu:{target_tg}:open")],
         ]
     )
+
+
+def admin_sub_history_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить историю", callback_data=f"admu:{target_tg}:s:{sub_id}:req_hist")],
+            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
+        ]
+    )
+
+
+def admin_sub_sessions_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔌 Сбросить все сессии (Кик)", callback_data=f"admu:{target_tg}:s:{sub_id}:drop_confirm")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admu:{target_tg}:s:{sub_id}:conn")],
+            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
+        ]
+    )
+
+
+def admin_sub_drop_confirm_keyboard(target_tg: int, sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️ Да, сбросить все сессии", callback_data=f"admu:{target_tg}:s:{sub_id}:drop_do")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"admu:{target_tg}:s:{sub_id}:open")],
+        ]
+    )
+
+
+def user_sub_sessions_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔌 Сбросить активные сессии", callback_data=f"sub:drop:{sub_id}")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sub:conn_view:{sub_id}")],
+            [InlineKeyboardButton(text="◀️ К подписке", callback_data=f"sub:open:{sub_id}")],
+        ]
+    )
+
+
+def node_metrics_keyboard(node_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить метрики", callback_data=f"nodes:metrics:{node_uuid}")],
+            [InlineKeyboardButton(text="◀️ К карточке ноды", callback_data=f"nodes:card:{node_uuid}")],
+        ]
+    )
+
+
+def node_sessions_keyboard(node_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"nodes:conn:{node_uuid}")],
+            [InlineKeyboardButton(text="◀️ К карточке ноды", callback_data=f"nodes:card:{node_uuid}")],
+        ]
+    )
+
+
+def node_drop_confirm_keyboard(node_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️ Да, сбросить все подключения", callback_data=f"nodes:drop_do:{node_uuid}")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"nodes:card:{node_uuid}")],
+        ]
+    )
+
+
+def node_geocheck_keyboard(node_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Повторить гео-тест", callback_data=f"nodes:geocheck:{node_uuid}")],
+            [InlineKeyboardButton(text="◀️ К карточке ноды", callback_data=f"nodes:card:{node_uuid}")],
+        ]
+    )
+
+
+def node_bw_users_keyboard(node_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"nodes:bw_users:{node_uuid}")],
+            [InlineKeyboardButton(text="◀️ К карточке ноды", callback_data=f"nodes:card:{node_uuid}")],
+        ]
+    )
+
+
+def admin_stats_digest_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏱ За 24 часа", callback_data="admin_stats:digest:24h"),
+                InlineKeyboardButton(text="📅 За 7 дней", callback_data="admin_stats:digest:7d"),
+                InlineKeyboardButton(text="🗓 За 30 дней", callback_data="admin_stats:digest:30d"),
+            ],
+            [InlineKeyboardButton(text="◀️ К аналитике", callback_data="admin_stats")],
+        ]
+    )
+
 
 
 def admin_sub_squads_keyboard(
@@ -188,3 +316,37 @@ def admin_sub_devices_keyboard(target_tg: int, sub_id: int, devices_count: int, 
         rows.append([InlineKeyboardButton(text="♾ Без лимита", callback_data=f"admu:{target_tg}:s:{sub_id}:hw_lim:inf")])
     rows.append([InlineKeyboardButton(text="◀️ К подписке", callback_data=f"admu:{target_tg}:s:{sub_id}:open")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_srr_stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Последние запросы", callback_data="admin_stats:srr_recent"),
+                InlineKeyboardButton(text="⚙️ Правила SRR", callback_data="admin_stats:srr_rules"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats:srr"),
+                InlineKeyboardButton(text="◀️ К аналитике", callback_data="admin_stats"),
+            ],
+        ]
+    )
+
+
+def admin_srr_recent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats:srr_recent")],
+            [InlineKeyboardButton(text="◀️ К статистике SRR", callback_data="admin_stats:srr")],
+        ]
+    )
+
+
+def admin_srr_rules_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats:srr_rules")],
+            [InlineKeyboardButton(text="◀️ К статистике SRR", callback_data="admin_stats:srr")],
+        ]
+    )
+

@@ -6,6 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     image: bot-remna:latest
     container_name: bot-remna
     init: true

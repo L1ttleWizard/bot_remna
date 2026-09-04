@@ -25,3 +25,12 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 ### 4. Nodes & Squads
 - `GET /api/nodes`: Lists all nodes and their status (`isConnected`, `isDisabled`, `address`, `name`).
 - `GET /api/internal-squads`: Lists internal squads (profiles) available in the panel.
+
+## Bot Internal Contracts
+
+### Self-Registration & Trial Flow
+- **Trigger**: `/start`, `/trial`, deep link `?start=trial`, or `trial_claim` inline button.
+- **Eligibility Check**: `db.has_claimed_trial(tg_id) == False` and `db.count_subscriptions(tg_id) == 0`.
+- **Issuance**: Automatically provisions a 3-day subscription with 2 HWID devices in Remnawave and links it to `tg_id`.
+- **Referral Tie-in**: If a pending referral was recorded (`referee_id == tg_id`), reward is granted upon trial activation.
+

@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from aiogram import F
@@ -72,6 +72,9 @@ from config import (
     ADMIN_TG_IDS,
     DEFAULT_TOKEN_EXPIRE_DAYS,
     DEFAULT_TOKEN_HWID_LIMIT,
+    DEFAULT_TRIAL_EXPIRE_DAYS,
+    DEFAULT_TRIAL_HWID_LIMIT,
+    TRIAL_ENABLED_DEFAULT,
     LOG_FILE_PATH,
     LOG_LEVEL,
     SCHEDULER_CRON_HOUR,
@@ -105,7 +108,10 @@ from formatters import (
 )
 from keyboards import (
     admin_sub_devices_keyboard as _admin_sub_devices_keyboard,
+    admin_sub_drop_confirm_keyboard as _admin_sub_drop_confirm_keyboard,
+    admin_sub_history_keyboard as _admin_sub_history_keyboard,
     admin_sub_keyboard as _admin_sub_keyboard,
+    admin_sub_sessions_keyboard as _admin_sub_sessions_keyboard,
     admin_sub_squads_keyboard as _admin_sub_squads_keyboard,
     back_only_keyboard,
     devices_admin_keyboard,
@@ -115,6 +121,9 @@ from keyboards import (
     subscription_admin_keyboard,
     subscription_user_keyboard,
     user_sub_menu_keyboard as _user_sub_menu_keyboard,
+    user_sub_sessions_keyboard as _user_sub_sessions_keyboard,
+    welcome_trial_keyboard,
+    trial_success_keyboard,
 )
 from scheduler import (
     check_expiring_subscriptions,
@@ -280,6 +289,10 @@ async def cmd_start_with_payload(message: Message, command: CommandObject):
         await _show_start_menu(message)
         return
 
+    if payload == "trial":
+        await _issue_trial_for_user(message, message.from_user)
+        return
+
     if payload.startswith("ref_"):
         tg_id = message.from_user.id
         try:
@@ -335,7 +348,7 @@ async def cmd_start_with_payload(message: Message, command: CommandObject):
         await message.answer(
             "👋 <b>Добро пожаловать!</b>\n\n"
             "Вы перешли по реферальной ссылке. "
-            "После того, как вы активируете свою первую подписку, "
+            "После того, как вы активируете свою первую подписку (включая бесплатный тест), "
             "пригласивший вас пользователь получит бонусные дни!",
             parse_mode="HTML"
         )
@@ -401,14 +414,33 @@ async def _show_start_menu(message: Message) -> None:
         if admins:
             contacts_str = "<b>Контакты администраторов:</b>\n" + "\n".join(f"• {a}" for a in admins)
 
-    caption = (
-        "🔒 <b>Доступ только по приглашению</b>\n\n"
-        "Получите токен у администратора и активируйте его командой:\n"
-        "<code>/redeem ВАШ_ТОКЕН</code>\n\n"
-        "Либо перейдите по ссылке-приглашению, которую выдал администратор."
-    )
-    if contacts_str:
-        caption += f"\n\n{contacts_str}"
+    trial_days = DEFAULT_TRIAL_EXPIRE_DAYS
+    trial_hwid = DEFAULT_TRIAL_HWID_LIMIT
+    already_claimed = await db.has_claimed_trial(tg_id)
+
+    if not already_claimed and TRIAL_ENABLED_DEFAULT:
+        caption = (
+            f"👋 <b>Добро пожаловать, {html.escape(message.from_user.first_name or 'друг')}!</b>\n\n"
+            f"🚀 <b>Попробуйте наш быстрый и надёжный VPN бесплатно!</b>\n\n"
+            f"🎁 Мы дарим вам тестовый доступ на <b>{trial_days} дня</b> (до {trial_hwid} устройств).\n"
+            f"Без скрытых условий — нажмите кнопку ниже, чтобы мгновенно начать пользоваться."
+        )
+        if contacts_str:
+            caption += f"\n\n{contacts_str}"
+        reply_markup = welcome_trial_keyboard(trial_days=trial_days)
+    else:
+        caption = (
+            "🔒 <b>Доступ по приглашению</b>\n\n"
+            "Получите токен у администратора и активируйте его командой:\n"
+            "<code>/redeem ВАШ_ТОКЕН</code>\n\n"
+            "Либо перейдите по ссылке-приглашению, которую выдал администратор."
+        )
+        if contacts_str:
+            caption += f"\n\n{contacts_str}"
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Ввести токен", callback_data="redeem_prompt")],
+            [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
+        ])
 
     # Try to send welcome photo
     photo_path = os.path.join(os.path.dirname(__file__), "welcome.png")
@@ -419,6 +451,7 @@ async def _show_start_menu(message: Message) -> None:
                 photo=photo,
                 caption=caption,
                 parse_mode="HTML",
+                reply_markup=reply_markup,
             )
             return
         except Exception as e:
@@ -428,6 +461,149 @@ async def _show_start_menu(message: Message) -> None:
     await message.answer(
         caption,
         parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+
+
+async def _issue_trial_for_user(event, tg_user, *, prefer_edit: bool = False) -> None:
+    tg_id = tg_user.id
+
+    # Check if user already has subscriptions or claimed trial
+    existing_subs = await db.count_subscriptions(tg_id)
+    already_claimed = await db.has_claimed_trial(tg_id)
+
+    if existing_subs > 0 or already_claimed:
+        msg_text = (
+            "⚠️ <b>Вы уже использовали пробный период</b> или у вас уже есть активная подписка.\n\n"
+            "Вы можете управлять своими подписками через главное меню или обратиться в поддержку."
+        )
+        if isinstance(event, CallbackQuery):
+            await event.answer("Пробный период уже был использован.", show_alert=True)
+            await safe_edit(
+                event,
+                msg_text,
+                parse_mode="HTML",
+                reply_markup=main_keyboard_user() if existing_subs > 0 else back_only_keyboard(),
+                prefer_edit=prefer_edit,
+            )
+        else:
+            await event.answer(
+                msg_text,
+                parse_mode="HTML",
+                reply_markup=main_keyboard_user() if existing_subs > 0 else back_only_keyboard(),
+            )
+        return
+
+    trial_days = DEFAULT_TRIAL_EXPIRE_DAYS
+    trial_hwid = DEFAULT_TRIAL_HWID_LIMIT
+
+    if isinstance(event, CallbackQuery):
+        await event.answer("⏳ Создаём вашу тестовую подписку…")
+
+    sub_url = await create_account_for_user(
+        tg_id,
+        expire_days=trial_days,
+        hwid_device_limit=trial_hwid,
+        tg_username=tg_user.username,
+        tg_first_name=tg_user.first_name,
+    )
+
+    if not sub_url:
+        err_msg = "❌ Не удалось автоматически создать подписку. Обратитесь к администратору."
+        if isinstance(event, CallbackQuery):
+            await safe_edit(event, err_msg, reply_markup=back_only_keyboard(), prefer_edit=prefer_edit)
+        else:
+            await event.answer(err_msg, reply_markup=back_only_keyboard())
+        return
+
+    # Record trial claim in DB
+    await db.record_trial_claim(tg_id)
+
+    # Process pending referral if any
+    ref = await db.get_referral_by_referee(tg_id)
+    if ref and ref[3] == "pending":
+        referrer_id = ref[1]
+        referrer_data = await db.get_user(referrer_id)
+        if referrer_data and referrer_data[1]:
+            referrer_uuid = referrer_data[1]
+            ok, _ = await api.extend_user_subscription_days(referrer_uuid, 7)
+            if ok:
+                await sync_local_expire_from_panel(referrer_id, referrer_uuid)
+                await db.mark_referral_rewarded(tg_id)
+                referee_username = tg_user.username
+                if referee_username:
+                    referee_display = f"@{referee_username}"
+                else:
+                    referee_display = html.escape(tg_user.first_name or "Пользователь")
+                try:
+                    await bot.send_message(
+                        chat_id=referrer_id,
+                        text=f"🎉 {referee_display} активировал подписку! Вам начислено <b>+7 дней</b> подписки!",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.error("Failed to send referral reward notification to %s: %s", referrer_id, e)
+
+                # Notify admins
+                referrer_info = await db.get_user_full(referrer_id)
+                if referrer_info:
+                    ref_username = referrer_info[6]
+                    ref_first_name = referrer_info[7]
+                    referrer_display = f"@{ref_username}" if ref_username else html.escape(ref_first_name or "Пользователь")
+                else:
+                    referrer_display = f"ID: {referrer_id}"
+
+                admin_msg = (
+                    "🎉 <b>Реферальная система: начислена награда!</b>\n\n"
+                    f"Пригласитель: {referrer_display} (ID: <code>{referrer_id}</code>) (+7 дней)\n"
+                    f"Реферал: {referee_display} (ID: <code>{tg_id}</code>)"
+                )
+                await notify_admins_referral(admin_msg)
+
+    expire_dt = datetime.now() + timedelta(days=trial_days)
+    expire_str = expire_dt.strftime("%d.%m.%Y %H:%M")
+
+    success_text = (
+        f"🎉 <b>Тестовый доступ на {trial_days} дня активирован!</b>\n\n"
+        f"📅 Доступ действует до: <b>{expire_str}</b>\n"
+        f"📱 Лимит устройств: <b>{trial_hwid}</b>\n\n"
+        "Нажмите <b>«📥 Подключить»</b> ниже, чтобы выбрать ваше устройство "
+        "(iOS, Android, Windows, macOS, Linux), получить deep-link и QR-код для быстрого импорта."
+    )
+
+    if isinstance(event, CallbackQuery):
+        await safe_edit(
+            event,
+            success_text,
+            parse_mode="HTML",
+            reply_markup=trial_success_keyboard(),
+            prefer_edit=prefer_edit,
+        )
+    else:
+        await event.answer(success_text, parse_mode="HTML", reply_markup=trial_success_keyboard())
+
+
+@dp.callback_query(F.data == "trial_claim")
+async def cb_trial_claim(callback: CallbackQuery):
+    await _issue_trial_for_user(callback, callback.from_user, prefer_edit=True)
+
+
+@dp.message(Command("trial"))
+async def cmd_trial(message: Message):
+    await _issue_trial_for_user(message, message.from_user)
+
+
+@dp.callback_query(F.data == "redeem_prompt")
+async def cb_redeem_prompt(callback: CallbackQuery):
+    await callback.answer()
+    await safe_edit(
+        callback,
+        "🔑 <b>Активация токена доступа</b>\n\n"
+        "Отправьте команду с вашим токеном в чат:\n"
+        "<code>/redeem ВАШ_ТОКЕН</code>",
+        parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
+        prefer_edit=True,
     )
 
 
@@ -1414,6 +1590,7 @@ _ensure_sub_belongs_to_user = ensure_sub_belongs_to_user
 
 @dp.callback_query(F.data == "my_subs")
 async def cb_my_subs(callback: CallbackQuery):
+    await callback.answer()
     if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
         await callback.answer("Доступ только по приглашению.", show_alert=True)
         return
@@ -1426,7 +1603,6 @@ async def cb_my_subs(callback: CallbackQuery):
             reply_markup=back_only_keyboard(),
             prefer_edit=True,
         )
-        await callback.answer()
         return
     if len(subs) == 1:
         await _render_sub_open(callback, subs[0], prefer_edit=True)
@@ -1443,7 +1619,6 @@ async def cb_my_subs(callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         prefer_edit=True,
     )
-    await callback.answer()
 
 
 async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: bool) -> None:
@@ -1468,11 +1643,15 @@ async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: 
         callback, text, parse_mode="HTML",
         reply_markup=_user_sub_menu_keyboard(sid, has_multiple), prefer_edit=prefer_edit,
     )
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("sub:open:"))
 async def cb_sub_open(callback: CallbackQuery):
+    await callback.answer()
     sub_id = int(callback.data.split(":", 2)[2])
     sub = await _ensure_sub_belongs_to_user(callback, sub_id)
     if not sub:
@@ -1484,12 +1663,15 @@ async def cb_sub_open(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sub:info:"))
 async def cb_sub_info(callback: CallbackQuery):
+    await callback.answer()
     sub_id = int(callback.data.split(":", 2)[2])
     sub = await _ensure_sub_belongs_to_user(callback, sub_id)
     if not sub:
         return
     full_uuid = sub[2]
     short_uuid = sub[3]
+    username = sub[4]
+    user_ident = short_uuid or username or full_uuid
     expire_timestamp = sub[5]
     expire_date_str = (
         datetime.fromtimestamp(expire_timestamp).strftime("%d.%m.%Y %H:%M")
@@ -1504,18 +1686,13 @@ async def cb_sub_info(callback: CallbackQuery):
     start_7_d = (end_dt - timedelta(days=6)).strftime("%Y-%m-%d")
     end_7_d = end_dt.strftime("%Y-%m-%d")
     
-    start_d, end_d = _analytics_date_range()
-    info_res, hw_res, period_res, spark_res = await asyncio.gather(
-        api.get_user_info(full_uuid),
-        api.get_user_hwid_devices(full_uuid),
-        api.get_user_usage_range(full_uuid, start_d, end_d),
-        api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
-        return_exceptions=True,
-    )
-    info = info_res if not isinstance(info_res, BaseException) else None
-    hw_raw = hw_res if not isinstance(hw_res, BaseException) else None
-    period_30 = period_res if not isinstance(period_res, BaseException) else None
-    spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
+    resolved = await api.resolve_user(user_ident)
+    num_id = resolved.get("id") if resolved else user_ident
+
+    info = await api.get_user_info(num_id)
+    hw_raw = await api.get_user_hwid_devices(num_id)
+    spark_7 = await api.get_user_sparkline_traffic(num_id, start_7_d, end_7_d)
+    period_30 = sum(spark_7) if spark_7 else None
     
     status_text = "Активна ✅"
     limit_text = str(DEFAULT_HWID_DEVICE_LIMIT)
@@ -1558,7 +1735,6 @@ async def cb_sub_info(callback: CallbackQuery):
         ]
     )
     await safe_edit(callback, text, parse_mode="Markdown", reply_markup=kb, prefer_edit=True)
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("sub:dev:"))
@@ -1613,6 +1789,57 @@ async def cb_sub_device_remove(callback: CallbackQuery):
     else:
         await callback.answer("❌ Не удалось удалить устройство.", show_alert=True)
     await cb_sub_devices(callback)
+
+
+@dp.callback_query(F.data.startswith("sub:conn_view:"))
+async def cb_sub_conn_view(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    full_uuid = sub[2]
+    await callback.answer("Сканирую ваши подключения...")
+    res = await api.get_user_connections(full_uuid)
+    lines = [f"🌐 <b>Активные подключения для подписки #{sub_id}:</b>\n"]
+    if res and isinstance(res, dict):
+        nodes = res.get("nodes") or []
+        if nodes:
+            for n in nodes:
+                nname = html.escape(str(n.get("nodeName") or "Сервер"))
+                emoji = html.escape(str(n.get("countryEmoji") or "🌐"))
+                ips = n.get("ips") or n.get("clientIps") or []
+                lines.append(f"{emoji} <b>Сервер {nname}</b>:")
+                for ip in ips:
+                    lines.append(f"  · IP: <code>{html.escape(str(ip))}</code>")
+        else:
+            lines.append("<i>Сейчас у вас нет активных подключений к VPN.</i>")
+    else:
+        lines.append("<i>Сейчас активных подключений не найдено.</i>")
+
+    lines.append("\n<i>Если у вас зависло соединение на устройстве, вы можете сбросить сессии кнопкой ниже.</i>")
+    await safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=_user_sub_sessions_keyboard(sub_id),
+        prefer_edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("sub:drop:"))
+async def cb_sub_drop(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":", 2)[2])
+    sub = await _ensure_sub_belongs_to_user(callback, sub_id)
+    if not sub:
+        return
+    full_uuid = sub[2]
+    ok = await api.drop_user_connections(full_uuid)
+    if ok:
+        await callback.answer("⚡ Все активные сессии сброшены!", show_alert=True)
+    else:
+        await callback.answer("Не удалось сбросить сессии.", show_alert=True)
+    await cb_sub_conn_view(callback)
+
 
 
 
@@ -1812,7 +2039,6 @@ async def _admin_target(callback: CallbackQuery, target_tg: int) -> Optional[tup
 
 
 async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, prefer_edit: bool) -> None:
-    # Sync all subscriptions of the target user before fetching the profile info.
     subs_to_sync = await db.list_subscriptions(target_tg)
     if subs_to_sync:
         await asyncio.gather(
@@ -2131,7 +2357,9 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
         return
     full_uuid = sub[2]
-    text = await load_subscription_text(full_uuid)
+    short_uuid = sub[3]
+    username = sub[4]
+    user_ident = short_uuid or username or full_uuid
     expire_str = (
         datetime.fromtimestamp(int(sub[5])).strftime("%d.%m.%Y %H:%M")
         if sub[5] else "—"
@@ -2144,19 +2372,14 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
     start_7_d = (end_dt - timedelta(days=6)).strftime("%Y-%m-%d")
     end_7_d = end_dt.strftime("%Y-%m-%d")
 
-    # Аналитика: статус / трафик / онлайн / HWID + sparkline — параллельно.
-    start_d, end_d = _analytics_date_range()
-    info_res, hw_res, period_res, spark_res = await asyncio.gather(
-        api.get_user_info(full_uuid),
-        api.get_user_hwid_devices(full_uuid),
-        api.get_user_usage_range(full_uuid, start_d, end_d),
-        api.get_user_sparkline_traffic(full_uuid, start_7_d, end_7_d),
-        return_exceptions=True,
-    )
-    info = info_res if not isinstance(info_res, BaseException) else None
-    hw_raw = hw_res if not isinstance(hw_res, BaseException) else None
-    period_30 = period_res if not isinstance(period_res, BaseException) else None
-    spark_7 = spark_res if not isinstance(spark_res, BaseException) else None
+    # Быстрая выборка без блокировки сокетов: ~250 мс
+    resolved = await api.resolve_user(user_ident)
+    num_id = resolved.get("id") if resolved else user_ident
+
+    info = await api.get_user_info(num_id)
+    hw_raw = await api.get_user_hwid_devices(num_id)
+    spark_7 = await api.get_user_sparkline_traffic(num_id, start_7_d, end_7_d)
+    period_30 = sum(spark_7) if spark_7 else None
     stats_block = ""
     if info and "response" in info:
         ad = info["response"]
@@ -2189,7 +2412,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
             )
 
         stats_block = (
-            "\n📈 <b>Статистика</b>\n"
+            "📈 <b>Статистика</b>\n"
             f"  · Статус: <b>{html.escape(status)}</b>\n"
             f"  · Профили: <b>{squads_txt}</b>\n"
             f"  · Трафик за {ANALYTICS_PERIOD_DAYS} дн: "
@@ -2207,7 +2430,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
         f"<b>panel username:</b> {html.escape(sub[4] or '—')}\n"
         f"<b>uuid:</b> <code>{html.escape(sub[2])}</code>\n"
         f"<b>действует до:</b> {html.escape(expire_str)}\n\n"
-    ) + text + stats_block
+    ) + stats_block
     await safe_edit(
         callback,
         text,
@@ -2222,8 +2445,8 @@ async def _send_admin_sub_devices(callback: CallbackQuery, target_tg: int, sub_i
     if not sub or sub[1] != target_tg:
         await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
         return
-    full_uuid = sub[2]
-    text, devices, show_limits = await load_devices_text(full_uuid)
+    user_ident = sub[3] or sub[4] or sub[2]
+    text, devices, show_limits = await load_devices_text(user_ident)
     text = f"📱 <b>Устройства подписки #{sub_id}</b> · tg=<code>{target_tg}</code>\n\n" + text
     await safe_edit(
         callback,
@@ -2234,20 +2457,16 @@ async def _send_admin_sub_devices(callback: CallbackQuery, target_tg: int, sub_i
     )
 
 
-async def _load_squads_state(full_uuid: str) -> Optional[tuple[list[dict], set[str]]]:
-    """Параллельно подтягивает полный список internal squads и набор активных
+async def _load_squads_state(user_ident: str) -> Optional[tuple[list[dict], set[str]]]:
+    """Подтягивает полный список internal squads и набор активных
     у пользователя. Возвращает (squads_sorted, active_uuids_set) либо None
     если панель недоступна.
 
     Список сортируем по `viewPosition` (если есть) затем по имени, чтобы
     индексация в callback_data была стабильной между рендерами.
     """
-    squads_raw, info = await asyncio.gather(
-        api.get_internal_squads(),
-        api.get_user_info(full_uuid),
-        return_exceptions=True,
-    )
-    if isinstance(squads_raw, BaseException) or not squads_raw or "response" not in squads_raw:
+    squads_raw = await api.get_internal_squads()
+    if not squads_raw or "response" not in squads_raw:
         return None
     squads = squads_raw["response"].get("internalSquads") or []
     squads = sorted(
@@ -2257,8 +2476,9 @@ async def _load_squads_state(full_uuid: str) -> Optional[tuple[list[dict], set[s
             str(s.get("name") or ""),
         ),
     )
+    info = await api.get_user_info(user_ident)
     active: set[str] = set()
-    if not isinstance(info, BaseException) and info and "response" in info:
+    if info and "response" in info:
         for sq in info["response"].get("activeInternalSquads") or []:
             if isinstance(sq, dict):
                 u = sq.get("uuid")
@@ -2276,9 +2496,9 @@ async def _send_admin_sub_squads(
     if not sub or sub[1] != target_tg:
         await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
         return
-    full_uuid = sub[2]
+    user_ident = sub[3] or sub[4] or sub[2]
 
-    state = await _load_squads_state(full_uuid)
+    state = await _load_squads_state(user_ident)
     if state is None:
         await callback.answer("Не удалось получить список сквадов из панели.", show_alert=True)
         return
@@ -2308,10 +2528,13 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         await callback.answer("Подписка не найдена у этого пользователя.", show_alert=True)
         return
     full_uuid = sub[2]
+    short_uuid = sub[3]
+    username = sub[4]
+    user_ident = short_uuid or username or full_uuid
 
     if action == "open":
-        await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
         await callback.answer()
+        await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
         return
 
     if action == "ext":
@@ -2320,9 +2543,9 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         except ValueError:
             await callback.answer("Некорректные данные.", show_alert=True)
             return
-        ok, _ = await api.extend_user_subscription_days(full_uuid, days)
+        ok, _ = await api.extend_user_subscription_days(user_ident, days)
         if ok:
-            await sync_local_expire_from_panel(target_tg, full_uuid)
+            await sync_local_expire_from_panel(target_tg, user_ident)
             await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
             await callback.answer(f"Подписка продлена на {days} дн.")
         else:
@@ -2330,9 +2553,9 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         return
 
     if action == "ext_inf":
-        ok, _ = await api.set_user_expire_unlimited(full_uuid)
+        ok, _ = await api.set_user_expire_unlimited(user_ident)
         if ok:
-            await sync_local_expire_from_panel(target_tg, full_uuid)
+            await sync_local_expire_from_panel(target_tg, user_ident)
             await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
             await callback.answer("♾ Без лимита по времени")
         else:
@@ -2355,7 +2578,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         except ValueError:
             await callback.answer("Некорректные данные.", show_alert=True)
             return
-        state = await _load_squads_state(full_uuid)
+        state = await _load_squads_state(user_ident)
         if state is None:
             await callback.answer("Не удалось получить список сквадов.", show_alert=True)
             return
@@ -2382,7 +2605,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         return
 
     if action == "hw_lim":
-        info = await api.get_user_info(full_uuid)
+        info = await api.get_user_info(user_ident)
         if not info or "response" not in info:
             await callback.answer("Не удалось получить данные с панели.", show_alert=True)
             return
@@ -2391,7 +2614,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
             if is_hwid_unlimited(ad):
                 await callback.answer("Уже без лимита.", show_alert=True)
                 return
-            if await api.update_hwid_device_limit(full_uuid, HWID_UNLIMITED_VALUE):
+            if await api.update_hwid_device_limit(user_ident, HWID_UNLIMITED_VALUE):
                 await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
                 await callback.answer("Лимит снят")
             else:
@@ -2410,7 +2633,7 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         if new_val == cur and cur >= MAX_HWID_INCREMENT_CAP:
             await callback.answer(f"Достигнут верхний порог ({MAX_HWID_INCREMENT_CAP}).", show_alert=True)
             return
-        if await api.update_hwid_device_limit(full_uuid, new_val):
+        if await api.update_hwid_device_limit(user_ident, new_val):
             await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
             await callback.answer(f"Лимит: {cur} → {new_val}")
         else:
@@ -2423,17 +2646,95 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
         except ValueError:
             await callback.answer("Некорректные данные.", show_alert=True)
             return
-        hw_raw = await api.get_user_hwid_devices(full_uuid)
+        hw_raw = await api.get_user_hwid_devices(user_ident)
         devices = _extract_devices(hw_raw)
         if idx < 0 or idx >= len(devices):
             await callback.answer("Устройство не найдено. Обновите список.", show_alert=True)
             return
         hwid = devices[idx].get("hwid")
-        if not hwid or not await api.delete_user_hwid_device(full_uuid, hwid):
+        if not hwid or not await api.delete_user_hwid_device(user_ident, hwid):
             await callback.answer("Не удалось удалить устройство.", show_alert=True)
             return
         await _send_admin_sub_devices(callback, target_tg, sub_id, prefer_edit=True)
         await callback.answer("Устройство удалено")
+        return
+
+    if action == "conn":
+        await callback.answer("Сканирую активные подключения...")
+        res = await api.get_user_connections(user_ident)
+        lines = [f"🌐 <b>Активные сессии пользователя</b> (tg=<code>{target_tg}</code>, sub=#{sub_id}):\n"]
+        if res and isinstance(res, dict):
+            nodes = res.get("nodes") or []
+            if nodes:
+                for n in nodes:
+                    nname = html.escape(str(n.get("nodeName") or "Нода"))
+                    emoji = html.escape(str(n.get("countryEmoji") or "🌐"))
+                    ips = n.get("ips") or n.get("clientIps") or []
+                    conns = n.get("connectionsCount") or len(ips) or 1
+                    lines.append(f"{emoji} <b>{nname}</b> — <code>{conns} соед.</code>")
+                    for ip in ips:
+                        lines.append(f"   · IP: <code>{html.escape(str(ip))}</code>")
+            else:
+                lines.append("<i>Сейчас активных подключений к серверам нет.</i>")
+        else:
+            lines.append("<i>Сейчас активных подключений к серверам нет.</i>")
+
+        await safe_edit(
+            callback,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=_admin_sub_sessions_keyboard(target_tg, sub_id),
+            prefer_edit=True,
+        )
+        return
+
+    if action == "drop_confirm":
+        warning = (
+            f"⚠️ <b>Сбросить все сессии (Кик)</b> пользователя <code>{target_tg}</code> (sub=#{sub_id})?\n\n"
+            "Все активные соединения на всех серверах будут немедленно разорваны."
+        )
+        await safe_edit(
+            callback,
+            warning,
+            parse_mode="HTML",
+            reply_markup=_admin_sub_drop_confirm_keyboard(target_tg, sub_id),
+            prefer_edit=True,
+        )
+        await callback.answer()
+        return
+
+    if action == "drop_do":
+        ok = await api.drop_user_connections(user_ident)
+        if ok:
+            await callback.answer("⚡ Все активные сессии сброшены!", show_alert=True)
+        else:
+            await callback.answer("Не удалось сбросить сессии.", show_alert=True)
+        await _send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
+        return
+
+    if action == "req_hist":
+        await callback.answer("Загружаю историю запросов...")
+        records = await api.get_user_sub_history(user_ident)
+        lines = [f"📋 <b>История запросов подписки</b> (tg=<code>{target_tg}</code>, sub=#{sub_id}):\n"]
+        if records and isinstance(records, list):
+            for r in records[:10]:
+                req_at = r.get("requestAt") or ""
+                req_dt = format_expire_display(req_at) if req_at else "—"
+                ip = html.escape(str(r.get("requestIp") or "—"))
+                ua = html.escape(str(r.get("userAgent") or "—")[:42])
+                srr = html.escape(str(r.get("srrRuleName") or r.get("srrResponseType") or "Default"))
+                lines.append(f"⏱ <b>{req_dt}</b> (IP: <code>{ip}</code>)")
+                lines.append(f"   📱 <i>{ua}</i> · [<code>{srr}</code>]\n")
+        else:
+            lines.append("<i>История обращений к подписке пуста или пока нет записей.</i>")
+
+        await safe_edit(
+            callback,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=_admin_sub_history_keyboard(target_tg, sub_id),
+            prefer_edit=True,
+        )
         return
 
     if action == "del":
@@ -2479,12 +2780,11 @@ async def _handle_admu_sub(callback: CallbackQuery, target_tg: int, sub_id: int,
 
 @dp.callback_query(F.data.startswith("admu:"))
 async def cb_admu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not await auth.is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещён.", show_alert=True)
         return
     parsed = _parse_admu(callback.data)
     if not parsed:
-        await callback.answer("Некорректные данные.", show_alert=True)
         return
     target_tg, sub_id, action, arg = parsed
 
@@ -2494,7 +2794,6 @@ async def cb_admu(callback: CallbackQuery, state: FSMContext):
 
     if action == "open":
         await _send_admin_user_card(callback, target_tg, prefer_edit=True)
-        await callback.answer()
         return
 
     if action == "sub_create_manual":

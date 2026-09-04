@@ -7,6 +7,7 @@ from typing import List, Optional, Union, Tuple
 from contextlib import asynccontextmanager
 import socket
 import ssl
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +56,22 @@ class RemnawaveAPI:
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
         self._session_obj: Optional[aiohttp.ClientSession] = None
+        self._resolve_cache: dict[str, tuple[float, dict]] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session_obj is None or self._session_obj.closed:
-            conn = aiohttp.TCPConnector(ssl=self._ssl_ctx, happy_eyeballs_delay=None)
-            self._session_obj = aiohttp.ClientSession(headers=self.headers, connector=conn)
+            conn = aiohttp.TCPConnector(
+                ssl=self._ssl_ctx,
+                limit=100,
+                force_close=False,
+                happy_eyeballs_delay=None,
+            )
+            timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0)
+            self._session_obj = aiohttp.ClientSession(
+                headers=self.headers,
+                connector=conn,
+                timeout=timeout,
+            )
         return self._session_obj
 
     @asynccontextmanager
@@ -95,15 +107,15 @@ class RemnawaveAPI:
     ) -> dict:
         async with self._session() as session:
             # Рассчитываем дату окончания: текущее время (UTC) + количество дней
-            expire_date = datetime.utcnow() + timedelta(days=expire_days)
-            # Форматируем в строку стандарта ISO 8601, которую обычно ждут API
-            expire_at_str = expire_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            expire_date = datetime.now(timezone.utc) + timedelta(days=expire_days)
+            # Форматируем в строку стандарта ISO 8601 UTC
+            expire_at_str = _format_expire_iso_utc(expire_date)
 
             payload = {
                 "username": username,
-                "status": "ACTIVE",         # ИСПРАВЛЕНО: заглавные буквы
-                "expireAt": expire_at_str,  # ИСПРАВЛЕНО: правильное название и формат даты
-                "data_limit": 0,
+                "status": "ACTIVE",
+                "expireAt": expire_at_str,
+                "trafficLimitBytes": 0,
                 "hwidDeviceLimit": hwid_device_limit,
             }
 
@@ -143,7 +155,6 @@ class RemnawaveAPI:
                 async with session.post(url, json=payload) as resp:
                     if resp.status in (200, 201):
                         response_data = await resp.json()
-                        # ДЕБАГ: Выводим полный ответ панели
                         logger.info("=" * 40)
                         logger.info(f"СЫРОЙ ОТВЕТ ОТ REMNAWAVE: {response_data}")
                         logger.info("=" * 40)
@@ -159,10 +170,20 @@ class RemnawaveAPI:
     async def patch_user(self, payload: dict) -> bool:
         """PATCH /api/users — частичное обновление пользователя."""
         p = payload.copy()
-        if "uuid" in p and "id" not in p:
-            resolved = await self.resolve_user(p["uuid"])
-            if resolved and "id" in resolved:
-                p["id"] = resolved["id"]
+        if "id" not in p or not isinstance(p["id"], int):
+            ident = p.pop("uuid", None) or p.pop("userId", None) or p.get("username")
+            if ident:
+                resolved = await self.resolve_user(ident)
+                if resolved and "id" in resolved:
+                    p["id"] = int(resolved["id"])
+                elif str(ident).isdigit():
+                    p["id"] = int(ident)
+
+        p.pop("uuid", None)
+        if "id" not in p:
+            logger.error(f"patch_user: не удалось определить numeric ID для {payload}")
+            return False
+
         async with self._session() as session:
             url = f"{self.base_url}/api/users"
             try:
@@ -410,30 +431,41 @@ class RemnawaveAPI:
         return ok, new_iso if ok else None
 
     async def resolve_user(self, identifier: Union[str, int]) -> Optional[dict]:
-        """POST /api/users/resolve — резолвит UUID, shortUuid или username в словарь с {id, uuid, shortUuid, username}."""
+        """POST /api/users/resolve — резолвит shortUuid, username или numeric ID в словарь с {id, shortUuid, username}."""
         str_id = str(identifier).strip()
-        if not str_id:
+        if not str_id or str_id == "None":
             return None
+        
+        now = time.monotonic()
+        cached = self._resolve_cache.get(str_id)
+        if cached and cached[0] > now:
+            return cached[1]
+
         if str_id.isdigit():
-            payload = {"id": int(str_id)}
-        elif "-" in str_id and len(str_id) >= 32:
-            payload = {"uuid": str_id}
+            try_order = [{"id": int(str_id)}]
         else:
-            payload = {"shortUuid": str_id}
+            try_order = [{"shortUuid": str_id}, {"username": str_id}]
 
         async with self._session() as session:
             url = f"{self.base_url}/api/users/resolve"
-            try:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("response")
-                    err = await resp.text()
-                    logger.warning(f"resolve_user не удалось для {identifier}: {resp.status} {err}")
-                    return None
-            except Exception as e:
-                logger.error(f"resolve_user ошибка при {identifier}: {e}")
-                return None
+            for payload in try_order:
+                try:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            resp_data = data.get("response")
+                            if isinstance(resp_data, dict):
+                                ttl = now + 300.0
+                                for k in ("id", "uuid", "shortUuid", "username"):
+                                    if resp_data.get(k) is not None:
+                                        self._resolve_cache[str(resp_data[k])] = (ttl, resp_data)
+                                self._resolve_cache[str_id] = (ttl, resp_data)
+                                return resp_data
+                except Exception as e:
+                    logger.error(f"resolve_user ошибка при {payload}: {e}")
+
+            logger.warning(f"resolve_user не удалось для {identifier}")
+            return None
 
     async def delete_user(self, user_uuid: str) -> Tuple[bool, Optional[str]]:
         """Удаляет пользователя по UUID или numeric ID. Возвращает (успех: bool, error_msg: str | None)."""
@@ -637,7 +669,7 @@ class RemnawaveAPI:
                 return None
 
     async def delete_node(self, uuid: str) -> bool:
-        """DELETE /api/nodes/{uuid}."""
+        """DELETE /api/nodes/{uuid} — удалить ноду."""
         async with self._session() as session:
             url = f"{self.base_url}/api/nodes/{uuid}"
             try:
@@ -677,7 +709,7 @@ class RemnawaveAPI:
         return await self._node_action(uuid, "reset-traffic")
 
     async def restart_all_nodes(self) -> bool:
-        """POST /api/nodes/actions/restart-all."""
+        """POST /api/nodes/actions/restart-all — перезапустить все ноды."""
         async with self._session() as session:
             url = f"{self.base_url}/api/nodes/actions/restart-all"
             try:
@@ -695,7 +727,7 @@ class RemnawaveAPI:
     # =========================================================================
 
     async def list_billing_providers(self) -> Optional[list]:
-        """GET /api/infra-billing/providers."""
+        """GET /api/infra-billing/providers — список провайдеров."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/providers"
             try:
@@ -714,7 +746,7 @@ class RemnawaveAPI:
                 return None
 
     async def get_billing_provider(self, uuid: str) -> Optional[dict]:
-        """GET /api/infra-billing/providers/{uuid}."""
+        """GET /api/infra-billing/providers/{uuid} — провайдер по UUID."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
             try:
@@ -732,7 +764,7 @@ class RemnawaveAPI:
                 return None
 
     async def create_billing_provider(self, payload: dict) -> Optional[dict]:
-        """POST /api/infra-billing/providers."""
+        """POST /api/infra-billing/providers — создать провайдера."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/providers"
             try:
@@ -750,7 +782,7 @@ class RemnawaveAPI:
                 return None
 
     async def delete_billing_provider(self, uuid: str) -> bool:
-        """DELETE /api/infra-billing/providers/{uuid}."""
+        """DELETE /api/infra-billing/providers/{uuid} — удалить провайдера."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/providers/{uuid}"
             try:
@@ -764,7 +796,7 @@ class RemnawaveAPI:
                 return False
 
     async def list_billing_nodes(self) -> Optional[list]:
-        """GET /api/infra-billing/nodes."""
+        """GET /api/infra-billing/nodes — список биллингов нод."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/nodes"
             try:
@@ -783,7 +815,7 @@ class RemnawaveAPI:
                 return None
 
     async def create_billing_node(self, payload: dict) -> Optional[dict]:
-        """POST /api/infra-billing/nodes."""
+        """POST /api/infra-billing/nodes — создать биллинг ноды."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/nodes"
             try:
@@ -801,7 +833,7 @@ class RemnawaveAPI:
                 return None
 
     async def update_billing_nodes(self, payload: dict) -> Optional[dict]:
-        """PATCH /api/infra-billing/nodes."""
+        """PATCH /api/infra-billing/nodes — обновить биллинг ноды."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/nodes"
             try:
@@ -819,7 +851,7 @@ class RemnawaveAPI:
                 return None
 
     async def delete_billing_node(self, uuid: str) -> bool:
-        """DELETE /api/infra-billing/nodes/{uuid}."""
+        """DELETE /api/infra-billing/nodes/{uuid} — удалить биллинг ноды."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/nodes/{uuid}"
             try:
@@ -833,7 +865,7 @@ class RemnawaveAPI:
                 return False
 
     async def list_billing_history(self, params: dict) -> Optional[list]:
-        """GET /api/infra-billing/history."""
+        """GET /api/infra-billing/history — история платежей."""
         async with self._session() as session:
             url = f"{self.base_url}/api/infra-billing/history"
             try:
@@ -849,4 +881,376 @@ class RemnawaveAPI:
                     return None
             except Exception as e:
                 logger.error(f"list_billing_history: {e}")
-                return None
+                return None
+
+    # =========================================================================
+    # Connections & Session Management (Connections Controller)
+    # =========================================================================
+
+    async def get_user_connections(self, user_id_or_uuid: Union[str, int], *, timeout_s: float = 5.0) -> Optional[dict]:
+        """POST /api/connections/by-user/{userId} + GET /api/connections/by-user/{jobId}
+        Запускает асинхронный опрос активных сессий пользователя по всем нодам и ожидает завершения.
+        Возвращает dict с результатом (включая массив nodes с активными IP и подключениями) или None.
+        """
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = int(str_id) if str_id.isdigit() else None
+        if numeric_id is None:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = int(resolved["id"])
+
+        if numeric_id is None:
+            logger.error(f"get_user_connections: не удалось определить numeric ID для {user_id_or_uuid}")
+            return None
+
+        async with self._session() as session:
+            url_start = f"{self.base_url}/api/connections/by-user/{numeric_id}"
+            try:
+                async with session.post(url_start, json={}) as resp:
+                    if resp.status not in (200, 201):
+                        err = await resp.text()
+                        logger.error(f"get_user_connections: старт джобы статус {resp.status}, ответ: {err}")
+                        return None
+                    data = await resp.json()
+                    job_id = data.get("response", {}).get("jobId")
+                    if not job_id:
+                        return None
+
+                url_poll = f"{self.base_url}/api/connections/by-user/{job_id}"
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.5)
+                    async with session.get(url_poll) as poll_resp:
+                        if poll_resp.status == 200:
+                            poll_data = await poll_resp.json()
+                            resp_obj = poll_data.get("response", {})
+                            if resp_obj.get("isCompleted"):
+                                return resp_obj.get("result")
+                            if resp_obj.get("isFailed"):
+                                logger.error(f"get_user_connections: job {job_id} failed")
+                                return None
+                logger.warning(f"get_user_connections: таймаут ожидания job {job_id}")
+                return None
+            except Exception as e:
+                logger.error(f"get_user_connections: {e}")
+                return None
+
+    async def get_node_connections(self, node_uuid: str, *, timeout_s: float = 5.0) -> Optional[dict]:
+        """POST /api/connections/by-node/{nodeUuid} + GET /api/connections/by-node/{jobId}
+        Запрашивает список активных подключений на конкретной ноде.
+        """
+        async with self._session() as session:
+            url_start = f"{self.base_url}/api/connections/by-node/{node_uuid}"
+            try:
+                async with session.post(url_start, json={}) as resp:
+                    if resp.status not in (200, 201):
+                        err = await resp.text()
+                        logger.error(f"get_node_connections: старт джобы статус {resp.status}, ответ: {err}")
+                        return None
+                    data = await resp.json()
+                    job_id = data.get("response", {}).get("jobId")
+                    if not job_id:
+                        return None
+
+                url_poll = f"{self.base_url}/api/connections/by-node/{job_id}"
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.5)
+                    async with session.get(url_poll) as poll_resp:
+                        if poll_resp.status == 200:
+                            poll_data = await poll_resp.json()
+                            resp_obj = poll_data.get("response", {})
+                            if resp_obj.get("isCompleted"):
+                                return resp_obj.get("result")
+                            if resp_obj.get("isFailed"):
+                                logger.error(f"get_node_connections: job {job_id} failed")
+                                return None
+                logger.warning(f"get_node_connections: таймаут ожидания job {job_id}")
+                return None
+            except Exception as e:
+                logger.error(f"get_node_connections: {e}")
+                return None
+
+    async def drop_user_connections(
+        self,
+        user_id_or_uuid: Union[str, int],
+        *,
+        node_uuid: Optional[str] = None
+    ) -> bool:
+        """POST /api/connections/drop — сбросить все активные сессии пользователя (на всех или одной ноде)."""
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = int(str_id) if str_id.isdigit() else None
+        if numeric_id is None:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = int(resolved["id"])
+
+        if numeric_id is None:
+            logger.error(f"drop_user_connections: не удалось определить numeric ID для {user_id_or_uuid}")
+            return False
+
+        payload = {
+            "dropBy": {
+                "by": "userIds",
+                "userIds": [numeric_id]
+            },
+            "targetNodes": {
+                "target": "specificNodes" if node_uuid else "allNodes",
+                **({"nodeUuids": [node_uuid]} if node_uuid else {})
+            }
+        }
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/connections/drop"
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status not in (200, 201, 202):
+                        err = await resp.text()
+                        logger.error(f"drop_user_connections: статус {resp.status}, ответ: {err}")
+                    return resp.status in (200, 201, 202)
+            except Exception as e:
+                logger.error(f"drop_user_connections: {e}")
+                return False
+
+    # =========================================================================
+    # System Controller (Health, Metrics, Digest)
+    # =========================================================================
+
+    async def get_system_health(self) -> Optional[dict]:
+        """GET /api/system/health — состояние рантайма (память, event loop, uptime)."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/system/health"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_system_health: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_system_health: {e}")
+                return None
+
+    async def get_system_nodes_metrics(self) -> Optional[list]:
+        """GET /api/system/nodes/metrics — метрики онлайна и трафика по инбаундам/аутбаундам нод."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/system/nodes/metrics"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        resp_obj = data.get("response") if isinstance(data, dict) else data
+                        if isinstance(resp_obj, dict) and "nodes" in resp_obj:
+                            return resp_obj["nodes"]
+                        return resp_obj if isinstance(resp_obj, list) else None
+                    err = await resp.text()
+                    logger.error(f"get_system_nodes_metrics: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_system_nodes_metrics: {e}")
+                return None
+
+    async def get_system_digest(self, start_iso: str, end_iso: str) -> Optional[dict]:
+        """GET /api/system/stats/digest — готовая сводка за период (пользователи, трафик, HWID)."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/system/stats/digest"
+            params = {"start": start_iso, "end": end_iso}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_system_digest: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_system_digest: {e}")
+                return None
+
+    async def get_system_recap(self) -> Optional[dict]:
+        """GET /api/system/stats/recap — общая статистика (за месяц, за всё время, RAM, CPU)."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/system/stats/recap"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_system_recap: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_system_recap: {e}")
+                return None
+
+    async def get_system_bandwidth(self, tz: str = "Europe/Moscow") -> Optional[dict]:
+        """GET /api/system/stats/bandwidth — агрегация трафика во времени (2д, 7д, 30д, месяц, год)."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/system/stats/bandwidth"
+            params = {"tz": tz}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_system_bandwidth: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_system_bandwidth: {e}")
+                return None
+
+    async def get_top_hwid_users(self, start: int = 0, size: int = 10) -> Optional[dict]:
+        """GET /api/hwid/devices/top-users — топ пользователей по количеству привязанных устройств."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/hwid/devices/top-users"
+            params = {"start": start, "size": size}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_top_hwid_users: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_top_hwid_users: {e}")
+                return None
+
+    async def get_user_sub_history(self, user_id_or_uuid: Union[str, int]) -> Optional[list]:
+        """GET /api/users/{userId}/subscription-request-history — последние 24 запроса подписки (IP, User-Agent, дата)."""
+        str_id = str(user_id_or_uuid).strip()
+        numeric_id = int(str_id) if str_id.isdigit() else None
+        if numeric_id is None:
+            resolved = await self.resolve_user(str_id)
+            if resolved and "id" in resolved:
+                numeric_id = int(resolved["id"])
+
+        if numeric_id is None:
+            logger.error(f"get_user_sub_history: не удалось определить numeric ID для {user_id_or_uuid}")
+            return None
+
+        async with self._session() as session:
+            url = f"{self.base_url}/api/users/{numeric_id}/subscription-request-history"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        resp_obj = data.get("response") if isinstance(data, dict) else data
+                        if isinstance(resp_obj, dict) and "records" in resp_obj:
+                            return resp_obj["records"]
+                        return resp_obj if isinstance(resp_obj, list) else None
+                    err = await resp.text()
+                    logger.error(f"get_user_sub_history: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_user_sub_history: {e}")
+                return None
+
+    async def get_node_bandwidth_users(
+        self, node_uuid: str, start_date: str, end_date: str, top_limit: int = 5
+    ) -> Optional[dict]:
+        """GET /api/bandwidth-stats/nodes/{uuid}/users — история трафика ноды и топ активных юзеров."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/bandwidth-stats/nodes/{node_uuid}/users"
+            params = {"start": start_date, "end": end_date, "topUsersLimit": top_limit}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_node_bandwidth_users: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_node_bandwidth_users: {e}")
+                return None
+
+    async def node_geocheck(self, node_uuid: str, *, timeout_s: float = 5.0) -> Optional[dict]:
+        """POST /api/connections/geocheck/{nodeUuid} + GET /api/connections/geocheck/{jobId}
+        Запускает гео-проверку ноды и ожидает результат.
+        """
+        async with self._session() as session:
+            url_start = f"{self.base_url}/api/connections/geocheck/{node_uuid}"
+            try:
+                async with session.post(url_start, json={}) as resp:
+                    if resp.status not in (200, 201):
+                        err = await resp.text()
+                        logger.error(f"node_geocheck: старт джобы статус {resp.status}, ответ: {err}")
+                        return None
+                    data = await resp.json()
+                    job_id = data.get("response", {}).get("jobId")
+                    if not job_id:
+                        return None
+
+                url_poll = f"{self.base_url}/api/connections/geocheck/{job_id}"
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.5)
+                    async with session.get(url_poll) as poll_resp:
+                        if poll_resp.status == 200:
+                            poll_data = await poll_resp.json()
+                            resp_obj = poll_data.get("response", {})
+                            if resp_obj.get("isCompleted"):
+                                return resp_obj.get("result")
+                            if resp_obj.get("isFailed"):
+                                logger.error(f"node_geocheck: job {job_id} failed")
+                                return None
+                logger.warning(f"node_geocheck: таймаут ожидания job {job_id}")
+                return None
+            except Exception as e:
+                logger.error(f"node_geocheck: {e}")
+                return None
+
+    async def get_subscription_request_history_stats(self) -> Optional[dict]:
+        """GET /api/subscription-request-history/stats — агрегированная статистика запросов (по приложениям и по часам)."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/subscription-request-history/stats"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_subscription_request_history_stats: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_subscription_request_history_stats: {e}")
+                return None
+
+    async def get_all_subscription_request_history(self, limit: int = 100) -> Optional[dict]:
+        """GET /api/subscription-request-history — список последних запросов подписок с информацией о клиентах и SRR."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/subscription-request-history"
+            params = {"limit": limit}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_all_subscription_request_history: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_all_subscription_request_history: {e}")
+                return None
+
+    async def get_subscription_settings(self) -> Optional[dict]:
+        """GET /api/subscription-settings — настройки выдачи подписок и правила SRR."""
+        async with self._session() as session:
+            url = f"{self.base_url}/api/subscription-settings"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("response") if isinstance(data, dict) else data
+                    err = await resp.text()
+                    logger.error(f"get_subscription_settings: статус {resp.status}, ответ: {err}")
+                    return None
+            except Exception as e:
+                logger.error(f"get_subscription_settings: {e}")
+                return None
+
+
+
