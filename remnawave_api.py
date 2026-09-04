@@ -464,6 +464,22 @@ class RemnawaveAPI:
                 except Exception as e:
                     logger.error(f"resolve_user ошибка при {payload}: {e}")
 
+            # Fallback: если identifier — это UUID, пробуем найти запись в локальной БД (short_uuid или username)
+            try:
+                import database as _db
+                sub = await _db.find_subscription_by_uuid(str_id)
+                if sub:
+                    # sub: (id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+                    for candidate in (sub[3], sub[4]):
+                        if candidate and str(candidate).strip() and str(candidate).strip() != str_id:
+                            res = await self.resolve_user(candidate)
+                            if res:
+                                ttl = now + 300.0
+                                self._resolve_cache[str_id] = (ttl, res)
+                                return res
+            except Exception as e:
+                logger.debug(f"resolve_user db fallback check error for {str_id}: {e}")
+
             logger.warning(f"resolve_user не удалось для {identifier}")
             return None
 

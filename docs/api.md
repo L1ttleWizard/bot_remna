@@ -9,8 +9,8 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 ### 1. User Management
 - `GET /api/users`: Fetches paginated user list. Returns `{"response": [...]}` or `{"response": {"users": [...], "total": ...}}`.
 - `GET /api/users/{userId}`: Gets full user profile by numeric ID.
-- `POST /api/users/resolve`: Resolves identifier `{uuid: "..."}` or `{shortUuid: "..."}` to `{id, uuid, shortUuid, username}`.
-- `POST /api/users`: Creates a new user with `username`, `expireAt`, `status`, `hwidDeviceLimit`, and optional `activeInternalSquads`.
+- `POST /api/users/resolve`: Resolves identifier to `{id, shortUuid, username}`. Panel accepts exactly one of `{"id": int}`, `{"shortUuid": str}`, or `{"username": str}` (passing `uuid` or `vlessUuid` results in 400 Bad Request; resolving UUIDs falls back to local database lookups for `shortUuid` or `username`).
+- `POST /api/users`: Creates a new user with `username`, `expireAt`, `status`, `hwidDeviceLimit`, and optional `activeInternalSquads`. Returns envelope containing `id`, `shortUuid`, `vlessUuid`, `trafficLimitBytes`, `hwidDeviceLimit`.
 - `PATCH /api/users`: Updates user attributes (e.g. `expireAt`, `hwidDeviceLimit`, `activeInternalSquads`). Requires `id` or `uuid`.
 - `DELETE /api/users/{userId}`: Deletes user by numeric ID.
 
