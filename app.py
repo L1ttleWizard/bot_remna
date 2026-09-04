@@ -348,6 +348,11 @@ async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     """Синкает expire_date конкретной подписки (по uuid) с тем, что отдаёт панель."""
     info = await api.get_user_info(full_uuid)
     if not info or "response" not in info:
+        import database as _db
+        sub = await _db.find_subscription_by_uuid(full_uuid)
+        if sub and sub[3]:
+            info = await api.get_user_info(sub[3])
+    if not info or "response" not in info:
         return
     iso = info["response"].get("expireAt")
     if not iso:

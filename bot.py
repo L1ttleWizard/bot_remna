@@ -248,7 +248,15 @@ async def create_account_for_user(
         return None
     api_data = response["response"]
     sub_url = api_data.get("subscriptionUrl", "")
-    full_uuid = api_data.get("uuid", "")
+    full_uuid = (
+        api_data.get("uuid")
+        or api_data.get("vlessUuid")
+        or api_data.get("shortUuid")
+        or (str(api_data.get("id")) if api_data.get("id") is not None else "")
+    )
+    if not full_uuid:
+        import uuid as _uuid
+        full_uuid = str(_uuid.uuid4())
     short_uuid = api_data.get("shortUuid", "")
     expire_time = int(time.time()) + (expire_days * 24 * 60 * 60)
     await db.add_user(
@@ -944,8 +952,12 @@ async def cmd_import_users(message: Message):
             except ValueError:
                 skipped_invalid_id += 1
                 continue
-            matched += 1
-            uuid_v = u.get("uuid") or ""
+            uuid_v = (
+                u.get("uuid")
+                or u.get("vlessUuid")
+                or u.get("shortUuid")
+                or (str(u.get("id")) if u.get("id") is not None else "")
+            )
             short_uuid = u.get("shortUuid") or ""
             expire_ts = _parse_expire_to_ts(u.get("expireAt"))
 
@@ -2317,13 +2329,12 @@ async def cb_admu_link_confirm(callback: CallbackQuery):
     panel_username = panel_user.get("username") or ""
     short_uuid = panel_user.get("shortUuid") or ""
     expire_ts = _parse_expire_to_ts(panel_user.get("expireAt"))
-    # Гарантируем, что у tg-юзера есть запись в users (для FK / отображения).
     if not await db.get_user_full(target_tg):
-        await db.add_user(
-            tg_id=target_tg,
-            uuid="", short_uuid="", username="",
-            expire_date=0,
-            created_by=callback.from_user.id,
+        await db.upsert_tg_profile(
+            target_tg,
+            tg_username=None,
+            tg_first_name=None,
+            tg_last_name=None,
         )
     sub_id = await db.add_subscription(
         target_tg,

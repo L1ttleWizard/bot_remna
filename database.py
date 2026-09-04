@@ -259,18 +259,20 @@ async def add_user(
             """,
             (tg_id, role, now, created_by),
         )
-        await db.execute(
-            """
-            INSERT INTO subscriptions
-              (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-            ON CONFLICT(uuid) DO UPDATE SET
-                short_uuid = excluded.short_uuid,
-                username = excluded.username,
-                expire_date = excluded.expire_date
-            """,
-            (tg_id, uuid, short_uuid, username, expire_date, created_by, now),
-        )
+        if uuid:
+            await db.execute(
+                """
+                INSERT INTO subscriptions
+                  (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(uuid) DO UPDATE SET
+                    tg_id = excluded.tg_id,
+                    short_uuid = excluded.short_uuid,
+                    username = excluded.username,
+                    expire_date = excluded.expire_date
+                """,
+                (tg_id, uuid, short_uuid, username, expire_date, created_by, now),
+            )
         await db.commit()
 
 
