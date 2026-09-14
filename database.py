@@ -342,6 +342,11 @@ async def add_subscription(
             INSERT INTO subscriptions
               (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uuid) DO UPDATE SET
+              tg_id = excluded.tg_id,
+              short_uuid = excluded.short_uuid,
+              username = excluded.username,
+              expire_date = excluded.expire_date
             """,
             (tg_id, uuid, short_uuid, username, expire_date, label, created_by, now),
         )
@@ -378,14 +383,50 @@ async def get_subscription(sub_id: int):
 
 
 async def find_subscription_by_uuid(uuid: str):
+    """Ищет подписку по uuid, а также fallback по short_uuid или username."""
+    if not uuid or not str(uuid).strip():
+        return None
+    val = str(uuid).strip()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
             SELECT id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at
-            FROM subscriptions WHERE uuid = ?
+            FROM subscriptions
+            WHERE uuid = ? OR (short_uuid IS NOT NULL AND short_uuid != '' AND short_uuid = ?) OR (username IS NOT NULL AND username != '' AND username = ?)
+            LIMIT 1
             """,
-            (uuid,),
+            (val, val, val),
         ) as cursor:
+            return await cursor.fetchone()
+
+
+async def find_subscription_by_any(
+    *,
+    uuid: Optional[str] = None,
+    short_uuid: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    """Найти подписку по любому из доступных идентификаторов (uuid, short_uuid, username)."""
+    clauses = []
+    params = []
+    if uuid and str(uuid).strip():
+        clauses.append("uuid = ?")
+        params.append(str(uuid).strip())
+    if short_uuid and str(short_uuid).strip():
+        clauses.append("(short_uuid IS NOT NULL AND short_uuid != '' AND short_uuid = ?)")
+        params.append(str(short_uuid).strip())
+    if username and str(username).strip() and str(username).strip() != "—":
+        clauses.append("(username IS NOT NULL AND username != '' AND username = ?)")
+        params.append(str(username).strip())
+    if not clauses:
+        return None
+    query = f"""
+        SELECT id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at
+        FROM subscriptions WHERE {" OR ".join(clauses)}
+        LIMIT 1
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(query, tuple(params)) as cursor:
             return await cursor.fetchone()
 
 

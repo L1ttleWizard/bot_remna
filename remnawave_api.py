@@ -480,6 +480,33 @@ class RemnawaveAPI:
             except Exception as e:
                 logger.debug(f"resolve_user db fallback check error for {str_id}: {e}")
 
+            # Fallback 2: если identifier похож на UUID (содержит дефис) и не найден в локальной БД,
+            # ищем пользователя напрямую в списке панели (list_users) по vlessUuid
+            if "-" in str_id and len(str_id) >= 32:
+                try:
+                    p_users = await self.list_users(size=100)
+                    if p_users and "response" in p_users:
+                        users_list = p_users["response"]
+                        if isinstance(users_list, dict):
+                            users_list = users_list.get("users", [])
+                        if isinstance(users_list, list):
+                            for pu in users_list:
+                                if pu.get("vlessUuid") == str_id or pu.get("uuid") == str_id:
+                                    res = {
+                                        "id": pu.get("id"),
+                                        "shortUuid": pu.get("shortUuid"),
+                                        "username": pu.get("username"),
+                                        "uuid": pu.get("vlessUuid") or pu.get("uuid"),
+                                    }
+                                    ttl = now + 300.0
+                                    for k in ("id", "uuid", "shortUuid", "username"):
+                                        if res.get(k) is not None:
+                                            self._resolve_cache[str(res[k])] = (ttl, res)
+                                    self._resolve_cache[str_id] = (ttl, res)
+                                    return res
+                except Exception as e:
+                    logger.debug(f"resolve_user list_users fallback error for {str_id}: {e}")
+
             logger.warning(f"resolve_user не удалось для {identifier}")
             return None
 

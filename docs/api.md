@@ -34,3 +34,10 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 - **Issuance**: Automatically provisions a 5-day subscription with 3 HWID devices in Remnawave and links it to `tg_id`.
 - **Referral Tie-in**: If a pending referral was recorded (`referee_id == tg_id`), reward is granted upon trial activation.
 
+### Admin Subscription Linking Flow (`admu:<tg>:link:<page>`)
+- **Picker**: Fetches users from `GET /api/users`. In Remnawave 3.4+, records contain `vlessUuid`, `shortUuid`, and `id`.
+- **Deduplication**: Filters out accounts already associated with any `tg_id` via `db.find_subscription_by_any(...)`.
+- **Identifier**: Uses `shortUuid` (or numeric `id`) in callback data to avoid Telegram's 64-byte payload constraint and guarantee instant resolution via `GET /api/users/{id}` or `POST /api/users/resolve`.
+- **Persistence**: Upon confirmation (`lnkok:<tg>:<ident>`), inserts into `subscriptions` using `vlessUuid` (as primary UUID), `shortUuid`, `username`, and `expireAt`.
+
+

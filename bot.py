@@ -2198,11 +2198,21 @@ async def _send_admin_link_picker(
     ]
     available = 0
     for u in panel_users:
-        uuid_v = u.get("uuid") or ""
+        uuid_v = (
+            u.get("uuid")
+            or u.get("vlessUuid")
+            or u.get("shortUuid")
+            or (str(u.get("id")) if u.get("id") is not None else "")
+        )
         if not uuid_v:
             continue
-        existing = await db.find_subscription_by_uuid(uuid_v)
+        short_u = u.get("shortUuid") or ""
         username_p = u.get("username") or "—"
+        user_num_id = u.get("id")
+
+        existing = await db.find_subscription_by_any(
+            uuid=uuid_v, short_uuid=short_u, username=username_p
+        )
         if existing:
             lines.append(f"  · <s>{html.escape(username_p)}</s> — уже у tg_id <code>{existing[1]}</code>")
             continue
@@ -2214,9 +2224,10 @@ async def _send_admin_link_picker(
             if ts:
                 when = datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
         label = f"➕ {username_p[:32]} · до {when}"
+        ident = short_u or (str(user_num_id) if user_num_id is not None else uuid_v)
         rows.append([InlineKeyboardButton(
             text=label[:64],
-            callback_data=f"lnk:{target_tg}:{uuid_v}",
+            callback_data=f"lnk:{target_tg}:{ident}",
         )])
 
     if not rows and available == 0 and not panel_users:
@@ -2246,7 +2257,7 @@ async def _send_admin_link_picker(
 
 @dp.callback_query(F.data.startswith("lnk:"))
 async def cb_admu_link_pick(callback: CallbackQuery):
-    """lnk:<tg>:<uuid> — шаг подтверждения привязки."""
+    """lnk:<tg>:<ident> — шаг подтверждения привязки."""
     if not await auth.is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
@@ -2259,19 +2270,22 @@ async def cb_admu_link_pick(callback: CallbackQuery):
     except ValueError:
         await callback.answer("Некорректные данные.", show_alert=True)
         return
-    uuid_v = parts[2]
-    info = await api.get_user_info(uuid_v)
+    ident = parts[2]
+    info = await api.get_user_info(ident)
     if not info or "response" not in info:
         await callback.answer("Не удалось получить данные из панели.", show_alert=True)
         return
     panel_user = info["response"]
     panel_username = panel_user.get("username") or "—"
     short_uuid = panel_user.get("shortUuid") or ""
+    vless_uuid = panel_user.get("vlessUuid") or panel_user.get("uuid") or short_uuid or ident
     expire_iso = panel_user.get("expireAt") or ""
     expire_h = format_expire_display(expire_iso) if expire_iso else "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
 
-    existing = await db.find_subscription_by_uuid(uuid_v)
+    existing = await db.find_subscription_by_any(
+        uuid=vless_uuid, short_uuid=short_uuid, username=panel_username
+    )
     if existing:
         await callback.answer(
             f"Эта подписка уже привязана к tg_id {existing[1]}.", show_alert=True,
@@ -2283,7 +2297,7 @@ async def cb_admu_link_pick(callback: CallbackQuery):
         f"К tg_id: <code>{target_tg}</code>\n"
         f"Из Remnawave:\n"
         f"  · username: <code>{html.escape(panel_username)}</code>\n"
-        f"  · uuid: <code>{html.escape(uuid_v)}</code>\n"
+        f"  · uuid: <code>{html.escape(vless_uuid)}</code>\n"
         f"  · до: <b>{html.escape(expire_h)}</b>\n"
         f"  · ссылка: <code>{html.escape(sub_url)}</code>\n\n"
         "Запись в панели не изменится — добавится только связь в БД бота."
@@ -2291,7 +2305,7 @@ async def cb_admu_link_pick(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Подтвердить привязку",
-            callback_data=f"lnkok:{target_tg}:{uuid_v}",
+            callback_data=f"lnkok:{target_tg}:{ident}",
         )],
         [InlineKeyboardButton(
             text="◀️ Назад",
@@ -2304,7 +2318,7 @@ async def cb_admu_link_pick(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("lnkok:"))
 async def cb_admu_link_confirm(callback: CallbackQuery):
-    """lnkok:<tg>:<uuid> — финальная привязка."""
+    """lnkok:<tg>:<ident> — финальная привязка."""
     if not await auth.is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
@@ -2317,19 +2331,25 @@ async def cb_admu_link_confirm(callback: CallbackQuery):
     except ValueError:
         await callback.answer("Некорректные данные.", show_alert=True)
         return
-    uuid_v = parts[2]
-    if await db.find_subscription_by_uuid(uuid_v):
-        await callback.answer("Эта подписка уже привязана.", show_alert=True)
-        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
-        return
-    info = await api.get_user_info(uuid_v)
+    ident = parts[2]
+    info = await api.get_user_info(ident)
     if not info or "response" not in info:
         await callback.answer("Не удалось получить данные из панели.", show_alert=True)
         return
     panel_user = info["response"]
     panel_username = panel_user.get("username") or ""
     short_uuid = panel_user.get("shortUuid") or ""
+    vless_uuid = panel_user.get("vlessUuid") or panel_user.get("uuid") or short_uuid or ident
     expire_ts = _parse_expire_to_ts(panel_user.get("expireAt"))
+
+    existing = await db.find_subscription_by_any(
+        uuid=vless_uuid, short_uuid=short_uuid, username=panel_username
+    )
+    if existing:
+        await callback.answer("Эта подписка уже привязана.", show_alert=True)
+        await _send_admin_user_card(callback, target_tg, prefer_edit=True)
+        return
+
     if not await db.get_user_full(target_tg):
         await db.upsert_tg_profile(
             target_tg,
@@ -2339,7 +2359,7 @@ async def cb_admu_link_confirm(callback: CallbackQuery):
         )
     sub_id = await db.add_subscription(
         target_tg,
-        uuid=uuid_v,
+        uuid=vless_uuid,
         short_uuid=short_uuid,
         username=panel_username,
         expire_date=expire_ts,

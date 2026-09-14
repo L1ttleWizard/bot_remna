@@ -201,3 +201,97 @@ async def test_cb_my_subscription_syncs_expiration():
         mock_sync.assert_called_once_with(user_tg, "uuid-A")
         mock_safe.assert_called_once()
         callback.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_link_picker_remnawave_vless_uuid():
+    """Verify that _send_admin_link_picker shows users having vlessUuid and shortUuid without uuid."""
+    import bot
+    from aiogram.types import InlineKeyboardMarkup
+
+    target_tg = 12345
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+
+    mock_panel_page = {
+        "response": {
+            "total": 2,
+            "users": [
+                {
+                    "id": 101,
+                    "vlessUuid": "11111111-2222-3333-4444-555555555555",
+                    "shortUuid": "short_user_1",
+                    "username": "user_one",
+                    "expireAt": "2026-10-01T00:00:00Z",
+                },
+                {
+                    "id": 102,
+                    "vlessUuid": "22222222-3333-4444-5555-666666666666",
+                    "shortUuid": "short_user_2",
+                    "username": "user_two",
+                    "expireAt": "2026-10-02T00:00:00Z",
+                },
+            ],
+        }
+    }
+
+    with patch("bot.api.list_users", AsyncMock(return_value=mock_panel_page)), \
+         patch("bot.db.find_subscription_by_any", AsyncMock(return_value=None)), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe:
+
+        await bot._send_admin_link_picker(callback, target_tg, page=0, prefer_edit=True)
+
+        mock_safe.assert_called_once()
+        args, kwargs = mock_safe.call_args
+        text = args[1]
+        reply_markup = kwargs.get("reply_markup") or args[2]
+
+        assert "Всего в панели: <b>2</b>" in text
+        # Both users should be available in rows
+        buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+        callback_datas = [btn.callback_data for btn in buttons]
+        assert f"lnk:{target_tg}:short_user_1" in callback_datas
+        assert f"lnk:{target_tg}:short_user_2" in callback_datas
+
+
+@pytest.mark.asyncio
+async def test_cb_admu_link_confirm_success():
+    """Verify that confirming linking saves vlessUuid and shortUuid to database."""
+    import bot
+
+    target_tg = 777888
+    callback = MagicMock()
+    callback.from_user.id = 999  # admin
+    callback.data = f"lnkok:{target_tg}:short_user_1"
+    callback.answer = AsyncMock()
+
+    mock_info = {
+        "response": {
+            "id": 101,
+            "vlessUuid": "11111111-2222-3333-4444-555555555555",
+            "shortUuid": "short_user_1",
+            "username": "user_one",
+            "expireAt": "2026-10-01T00:00:00Z",
+        }
+    }
+
+    with patch("bot.auth.is_admin", AsyncMock(return_value=True)), \
+         patch("bot.api.get_user_info", AsyncMock(return_value=mock_info)), \
+         patch("bot.db.find_subscription_by_any", AsyncMock(return_value=None)), \
+         patch("bot.db.get_user_full", AsyncMock(return_value=None)), \
+         patch("bot.db.upsert_tg_profile", AsyncMock()) as mock_upsert, \
+         patch("bot.db.add_subscription", AsyncMock(return_value=42)) as mock_add_sub, \
+         patch("bot._send_admin_user_card", AsyncMock()) as mock_card:
+
+        await bot.cb_admu_link_confirm(callback)
+
+        mock_upsert.assert_called_once_with(target_tg, tg_username=None, tg_first_name=None, tg_last_name=None)
+        mock_add_sub.assert_called_once()
+        _, kwargs = mock_add_sub.call_args
+        assert kwargs["uuid"] == "11111111-2222-3333-4444-555555555555"
+        assert kwargs["short_uuid"] == "short_user_1"
+        assert kwargs["username"] == "user_one"
+        assert kwargs["created_by"] == 999
+        callback.answer.assert_called_once_with("✅ Привязано (sub #42).")
+        mock_card.assert_called_once_with(callback, target_tg, prefer_edit=True)
+
