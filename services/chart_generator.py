@@ -1,4 +1,5 @@
 import io
+import re
 import time
 from datetime import datetime
 import matplotlib
@@ -255,4 +256,113 @@ def generate_nodes_traffic_comparison_chart(categories: list[str], series: list[
     buf.seek(0)
     plt.close(fig)
     return buf.getvalue()
+
+
+def generate_daily_nodes_distribution_chart(
+    nodes_traffic: list[tuple[str, int, str]],
+    total_bytes: int,
+    date_str: str,
+) -> bytes:
+    """
+    Генерирует премиальный donut chart распределения трафика по нодам за указанную дату в темном киберпанк стиле.
+    
+    nodes_traffic: список кортежей (node_name, traffic_bytes, color_or_country)
+    total_bytes: суммарный объем трафика за день в байтах
+    date_str: строковое представление даты (например, '26.09.2026')
+    """
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor='#121214')
+    ax.set_facecolor('#121214')
+
+    # Фильтруем ноды с положительным трафиком
+    active_nodes = [(name, val, col) for name, val, col in nodes_traffic if val > 0]
+    active_nodes.sort(key=lambda x: x[1], reverse=True)
+
+    if not active_nodes or total_bytes <= 0:
+        ax.text(
+            0.5, 0.5,
+            f"Нет данных по расходу трафика\nза {date_str}",
+            color='#8E8E93', fontsize=14, ha='center', va='center'
+        )
+        ax.set_title(f"Распределение трафика за {date_str}", color='#FFFFFF', fontsize=15, weight='bold', pad=15)
+        ax.axis('off')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#121214')
+        buf.seek(0)
+        plt.close(fig)
+        return buf.getvalue()
+
+    # Неоновая контрастная палитра
+    neon_palette = [
+        '#00F0FF',  # Cyan
+        '#FF007F',  # Neon Pink / Magenta
+        '#39FF14',  # Lime Green
+        '#FFCC00',  # Amber Yellow
+        '#BF00FF',  # Purple
+        '#FF5E00',  # Orange
+        '#00E5FF',  # Sky Blue
+        '#FF3366',  # Rose
+        '#7000FF',  # Indigo
+        '#00FF88',  # Mint
+    ]
+
+    labels = []
+    sizes = []
+    colors = []
+
+    for idx, (name, val, col) in enumerate(active_nodes):
+        pct = (val / total_bytes) * 100.0 if total_bytes > 0 else 0.0
+        # Человекочитаемый размер
+        size_str = _format_bytes_y_axis(val, 0)
+        # Очищаем эмодзи-флаги для чистого рендеринга шрифтов в Matplotlib
+        clean_name = re.sub(r'[\U0001F1E6-\U0001F1FF]{2}', '', name).strip()
+        labels.append(f"{clean_name}: {pct:.1f}% ({size_str})")
+        sizes.append(val)
+        # Если цвет передан валидный hex, используем его или fallback из палитры
+        if col and col.startswith('#') and len(col) in (4, 7):
+            colors.append(col)
+        else:
+            colors.append(neon_palette[idx % len(neon_palette)])
+
+    # Donut pie chart
+    wedges, _ = ax.pie(
+        sizes,
+        colors=colors,
+        startangle=90,
+        counterclock=False,
+        wedgeprops=dict(width=0.40, edgecolor='#121214', linewidth=2.5),
+    )
+
+    # Центральная плашка с общим трафиком
+    total_str = _format_bytes_y_axis(total_bytes, 0)
+    ax.text(0, 0.12, total_str, ha='center', va='center', fontsize=20, fontweight='bold', color='#FFFFFF')
+    ax.text(0, -0.12, "Всего за день", ha='center', va='center', fontsize=11, color='#8E8E93')
+
+    # Заголовок
+    ax.set_title(f"Распределение трафика по серверам за {date_str}", color='#FFFFFF', fontsize=14, weight='bold', pad=20)
+
+    # Легенда справа с удобным отступом
+    legend = ax.legend(
+        wedges, labels,
+        title="Серверы",
+        loc="center left",
+        bbox_to_anchor=(0.95, 0.5),
+        frameon=True,
+        facecolor='#18181C',
+        edgecolor='#2C2C30',
+        fontsize=10,
+        title_fontsize=11,
+    )
+    legend.get_title().set_color('#E5E5EA')
+    legend.get_title().set_weight('bold')
+    for text in legend.get_texts():
+        text.set_color('#E5E5EA')
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#121214')
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
+
 

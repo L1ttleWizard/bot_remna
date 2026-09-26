@@ -4,7 +4,7 @@ import html
 import time
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Union
 
 from aiogram import F
 from aiogram.filters import Command
@@ -74,6 +74,7 @@ def _stats_keyboard() -> InlineKeyboardMarkup:
 
 def _nodes_stats_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Отчет за день (23:59)", callback_data="admin_stats:daily_report_now")],
         [InlineKeyboardButton(text="📈 Общий трафик (график)", callback_data="admin_stats:nodes_total_chart")],
         [InlineKeyboardButton(text="📊 Сравнение нод (график)", callback_data="admin_stats:nodes_compare_chart")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_stats")],
@@ -102,6 +103,263 @@ def draw_nodes_traffic_text_chart(nodes_traffic: list[tuple[str, int]]) -> str:
         bar = "█" * filled + "░" * empty
         lines.append(f"{html.escape(name):<15} | {bar} | {pct:>5.1f}% ({html.escape(human_bytes(val))})")
     return "\n".join(lines)
+
+
+def get_country_flag(country_code: Optional[str]) -> str:
+    """Конвертирует двухбуквенный ISO код страны (например, 'AT') в эмодзи-флаг (🇦🇹)."""
+    if not country_code or len(country_code) != 2:
+        return "🌐"
+    code = country_code.upper()
+    if not all('A' <= c <= 'Z' for c in code):
+        return "🌐"
+    return chr(127397 + ord(code[0])) + chr(127397 + ord(code[1]))
+
+
+def format_node_display_name(name: str, country_code: Optional[str]) -> str:
+    """Возвращает название ноды с флагом страны без дублирования."""
+    flag = get_country_flag(country_code)
+    clean_name = name.strip()
+    if flag and flag != "🌐" and flag not in clean_name:
+        return f"{flag} {clean_name}"
+    return clean_name
+
+
+async def _resolve_tg_user_info(
+    username: Optional[str],
+    user_id: Optional[Union[str, int]] = None,
+) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Возвращает (tg_id, tg_username, full_name) для пользователя Remnawave.
+    """
+    tg_id = None
+    tg_username = None
+    full_name = None
+
+    # 1. Проверяем префикс tg_<id>
+    if username and username.startswith("tg_"):
+        part = username[3:]
+        if part.isdigit():
+            tg_id = int(part)
+
+    # 2. Если tg_id не определен, пробуем найти в subscriptions
+    if tg_id is None:
+        sub = await db.find_subscription_by_any(username=username)
+        if not sub and user_id:
+            sub = await db.find_subscription_by_any(uuid=str(user_id))
+        if sub:
+            tg_id = sub[1]
+
+    # 3. Если tg_id найден, подтягиваем данные профиля из таблицы users
+    if tg_id:
+        user_row = await db.get_user(tg_id)
+        if user_row and len(user_row) >= 6:
+            tg_username = user_row[3]
+            first = user_row[4] or ""
+            last = user_row[5] or ""
+            full_name = f"{first} {last}".strip() or None
+
+    return tg_id, tg_username, full_name
+
+
+def _format_user_display(user_info: Optional[dict]) -> str:
+    """Форматирует представление пользователя (Telegram mention/ID, трафик)."""
+    if not user_info or user_info.get("total", 0) <= 0:
+        return "—"
+    uname = user_info.get("username") or str(user_info.get("userId") or "—")
+    tg_id = user_info.get("tg_id")
+    tg_username = user_info.get("tg_username")
+
+    if tg_username:
+        user_str = f"@{html.escape(tg_username)}"
+        if tg_id:
+            user_str += f" (<code>{tg_id}</code>)"
+    elif tg_id:
+        name = user_info.get("tg_name")
+        if name:
+            user_str = f"{html.escape(name)} (<code>{tg_id}</code>)"
+        else:
+            user_str = f"tg: <code>{tg_id}</code>"
+    else:
+        user_str = f"<code>{html.escape(uname)}</code>"
+
+    traffic_str = human_bytes(user_info["total"])
+    return f"{user_str} — <b>{html.escape(traffic_str)}</b>"
+
+
+async def collect_daily_traffic_data(raw_date: str) -> dict:
+    """
+    Собирает агрегированные данные о трафике нод и топ пользователях за указанную дату (YYYY-MM-DD).
+    """
+    try:
+        dt = datetime.strptime(raw_date, "%Y-%m-%d")
+        date_display = dt.strftime("%d.%m.%Y")
+    except Exception:
+        date_display = raw_date
+
+    bw_stats = await api.get_nodes_bandwidth_stats(raw_date, raw_date)
+    series = (bw_stats.get("series") or []) if bw_stats else []
+
+    # Запрашиваем топ юзеров по каждой ноде параллельно
+    async def _fetch_node_users(node_uuid: str) -> Optional[dict]:
+        try:
+            return await api.get_node_bandwidth_users(node_uuid, raw_date, raw_date, top_limit=10)
+        except Exception as e:
+            logger.warning("Failed to fetch node users for %s: %s", node_uuid, e)
+            return None
+
+    user_tasks = [
+        _fetch_node_users(s.get("uuid")) if s.get("uuid") else asyncio.sleep(0, result=None)
+        for s in series
+    ]
+    node_users_results = await asyncio.gather(*user_tasks, return_exceptions=True) if user_tasks else []
+
+    total_traffic_bytes = 0
+    nodes_data = []
+    user_totals: dict[str, dict] = {}  # key -> {"username", "userId", "total"}
+
+    for idx, s in enumerate(series):
+        uuid = s.get("uuid") or ""
+        name = s.get("name") or "Unnamed"
+        country_code = s.get("countryCode") or ""
+        color = s.get("color") or ""
+
+        # Общий трафик ноды за день
+        data_list = s.get("data") or []
+        node_total = int(s.get("total") or sum(int(x) for x in data_list))
+        total_traffic_bytes += node_total
+
+        # Топ юзер ноды
+        top_user_entry = None
+        users_res = node_users_results[idx] if idx < len(node_users_results) else None
+        if isinstance(users_res, dict):
+            top_users = users_res.get("topUsers") or []
+            active_users = [u for u in top_users if int(u.get("total") or 0) > 0]
+            if active_users:
+                best = active_users[0]
+                top_user_entry = {
+                    "username": best.get("username") or "",
+                    "userId": best.get("userId"),
+                    "total": int(best.get("total") or 0),
+                }
+
+            # Агрегируем по всем юзерам для общего топа дня
+            for u in top_users:
+                u_tot = int(u.get("total") or 0)
+                if u_tot <= 0:
+                    continue
+                u_key = str(u.get("username") or u.get("userId") or "")
+                if not u_key:
+                    continue
+                if u_key not in user_totals:
+                    user_totals[u_key] = {
+                        "username": u.get("username") or "",
+                        "userId": u.get("userId"),
+                        "total": 0,
+                    }
+                user_totals[u_key]["total"] += u_tot
+
+        nodes_data.append({
+            "uuid": uuid,
+            "name": name,
+            "display_name": format_node_display_name(name, country_code),
+            "country_code": country_code,
+            "flag": get_country_flag(country_code),
+            "color": color,
+            "total_bytes": node_total,
+            "top_user": top_user_entry,
+        })
+
+    # Считаем доли нод и сортируем по убыванию трафика
+    for n in nodes_data:
+        pct = (n["total_bytes"] / total_traffic_bytes * 100.0) if total_traffic_bytes > 0 else 0.0
+        n["percentage"] = pct
+    nodes_data.sort(key=lambda x: x["total_bytes"], reverse=True)
+
+    # Находим абсолютного топ юзера дня
+    overall_top_user = None
+    if user_totals:
+        best_overall = max(user_totals.values(), key=lambda x: x["total"])
+        if best_overall["total"] > 0:
+            overall_top_user = best_overall
+
+    # Обогащаем топ юзеров данными Telegram
+    users_to_resolve = []
+    if overall_top_user:
+        users_to_resolve.append(overall_top_user)
+    for n in nodes_data:
+        if n["top_user"]:
+            users_to_resolve.append(n["top_user"])
+
+    if users_to_resolve:
+        resolve_tasks = [
+            _resolve_tg_user_info(u.get("username"), u.get("userId"))
+            for u in users_to_resolve
+        ]
+        resolved_data = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+        for u, res in zip(users_to_resolve, resolved_data):
+            if isinstance(res, tuple):
+                tg_id, tg_username, tg_name = res
+                u["tg_id"] = tg_id
+                u["tg_username"] = tg_username
+                u["tg_name"] = tg_name
+
+    return {
+        "date_str": date_display,
+        "raw_date": raw_date,
+        "total_bytes": total_traffic_bytes,
+        "overall_top_user": overall_top_user,
+        "nodes": nodes_data,
+    }
+
+
+def format_daily_report_text(report_data: dict) -> tuple[str, Optional[str]]:
+    """
+    Форматирует текст ежедневного отчета по трафику.
+    Возвращает (caption, optional_extra_text).
+    Если caption <= 1024 символов, optional_extra_text = None.
+    Если > 1024 символов, caption — краткая сводка для фото, optional_extra_text — полный текст.
+    """
+    date_str = report_data.get("date_str") or "—"
+    total_bytes = report_data.get("total_bytes") or 0
+    overall_top = report_data.get("overall_top_user")
+    nodes = report_data.get("nodes") or []
+
+    lines = [
+        f"📊 <b>Ежедневный отчет по трафику за {date_str}</b>\n",
+        f"🌐 <b>Общий трафик:</b> <b>{html.escape(human_bytes(total_bytes))}</b>\n",
+        "🥇 <b>Топ пользователь дня (все ноды):</b>",
+        f"└ 👤 {_format_user_display(overall_top)}\n",
+        "📡 <b>Потребление по серверам:</b>",
+    ]
+
+    if not nodes:
+        lines.append("<i>Нет данных по нодам.</i>")
+    else:
+        for n in nodes:
+            disp_name = html.escape(n.get("display_name") or n.get("name") or "Unnamed")
+            n_tot = human_bytes(n.get("total_bytes", 0))
+            pct = n.get("percentage", 0.0)
+            u_str = _format_user_display(n.get("top_user"))
+            lines.append(
+                f"• <b>{disp_name}</b>: <b>{html.escape(n_tot)}</b> ({pct:.1f}%)\n"
+                f"  └ 👤 Топ: {u_str}"
+            )
+
+    full_text = "\n".join(lines)
+
+    if len(full_text) <= 1024:
+        return full_text, None
+
+    # Если текст превышает лимит подписи к фото (1024 символа), отправляем краткую выжимку к фото и текст следом
+    short_lines = [
+        f"📊 <b>Ежедневный отчет по трафику за {date_str}</b>\n",
+        f"🌐 <b>Общий трафик:</b> <b>{html.escape(human_bytes(total_bytes))}</b>\n",
+        "🥇 <b>Топ пользователь дня:</b>",
+        f"└ 👤 {_format_user_display(overall_top)}\n",
+        f"<i>Детальная статистика по {len(nodes)} серверам направлена ниже ⬇️</i>"
+    ]
+    short_caption = "\n".join(short_lines)
+    return short_caption, full_text
 
 
 async def _collect_panel_traffic(
@@ -921,7 +1179,7 @@ async def cb_admin_stats_sub(callback: CallbackQuery):
         return
     section = callback.data.split(":", 1)[1]
     
-    if section not in ("nodes_total_chart", "nodes_compare_chart"):
+    if section not in ("nodes_total_chart", "nodes_compare_chart", "daily_report_now"):
         await callback.answer()
         
     if section == "traffic":
@@ -947,6 +1205,15 @@ async def cb_admin_stats_sub(callback: CallbackQuery):
         await cb_nodes_total_chart(callback)
     elif section == "nodes_compare_chart":
         await cb_nodes_compare_chart(callback)
+    elif section == "daily_report_now":
+        from scheduler import send_daily_traffic_report
+        await callback.answer("Формирую отчет за день...")
+        ok = await send_daily_traffic_report(
+            callback.bot,
+            target_chat_id=callback.message.chat.id,
+        )
+        if not ok:
+            await callback.message.answer("❌ Не удалось сгенерировать ежедневный отчет.")
     elif section == "digest_menu":
         await _send_admin_stats_digest(callback, "7d", prefer_edit=True)
     elif section.startswith("digest:"):
@@ -992,3 +1259,47 @@ async def cmd_stats(message: Message):
         "Подробнее — <code>/admin → 📊 Аналитика</code>."
     )
     await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("daily_report"))
+async def cmd_daily_report(message: Message):
+    """
+    Ручной запуск ежедневного отчета по трафику серверов (23:59).
+    Использование:
+      /daily_report — отправить отчет в текущий чат
+      /daily_report send — отправить отчет в канал/чат администраторов
+      /daily_report 2026-09-25 — сформировать отчет за конкретную дату
+    """
+    if not await auth.is_admin(message.from_user.id):
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split()
+    send_to_channel = "send" in parts
+
+    date_arg = None
+    for p in parts[1:]:
+        if p != "send":
+            date_arg = p
+            break
+
+    from scheduler import send_daily_traffic_report
+    target_chat = None if send_to_channel else message.chat.id
+    status_msg = await message.answer("⏳ Формирую ежедневный отчет по трафику...")
+
+    ok = await send_daily_traffic_report(
+        message.bot,
+        target_chat_id=target_chat,
+        report_date=date_arg,
+    )
+
+    if ok:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        if send_to_channel:
+            await message.answer("✅ Ежедневный отчет успешно отправлен в канал администраторов.")
+    else:
+        await status_msg.edit_text("❌ Не удалось сформировать или отправить ежедневный отчет.")

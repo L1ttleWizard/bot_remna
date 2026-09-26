@@ -20,7 +20,9 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 
 ### 3. Bandwidth Statistics
 - `GET /api/bandwidth-stats/users/{userId}`: Returns user traffic history with params `start`, `end`, `topNodesLimit`.
-- `GET /api/bandwidth-stats/nodes`: Returns aggregate traffic series across all nodes.
+- `GET /api/bandwidth-stats/nodes`: Returns aggregate traffic series across all nodes with params `start`, `end` (returns `{categories: [...], series: [{uuid, name, countryCode, color, total, data}], sparklineData: [...]}`).
+- `GET /api/bandwidth-stats/nodes/{nodeUuid}/users`: Returns user traffic ranking for a specific node with params `start`, `end`, `topUsersLimit` (returns `{topUsers: [{color, userId, username, total}]}`).
+- `GET /api/system/stats/bandwidth`: System-wide traffic comparisons across 2d, 7d, 30d, current month, and current year.
 
 ### 4. Nodes & Squads
 - `GET /api/nodes`: Lists all nodes and their status (`isConnected`, `isDisabled`, `address`, `name`).

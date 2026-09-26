@@ -84,6 +84,8 @@ from config import (
     BACKUP_TG_CHAT_ID,
     BACKUP_CRON_HOUR,
     BACKUP_CRON_MINUTE,
+    DAILY_REPORT_CRON_HOUR,
+    DAILY_REPORT_CRON_MINUTE,
 )
 from formatters import (
     DEFAULT_HWID_DEVICE_LIMIT,
@@ -132,6 +134,7 @@ from scheduler import (
     check_nodes_health,
     check_cpu_load,
     run_daily_backup,
+    send_daily_traffic_report,
     ssh_execute_on_node,
 )
 
@@ -3212,6 +3215,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="dm", description="✉️ Написать пользователю"),
     BotCommand(command="broadcast", description="📢 Массовая рассылка сообщений"),
     BotCommand(command="stats", description="📊 Аналитика и сводка"),
+    BotCommand(command="daily_report", description="📅 Ежедневный отчет по трафику (23:59)"),
     BotCommand(command="make_backup", description="📦 Создать резервную копию сейчас"),
     BotCommand(command="redeem", description="Активировать токен доступа"),
 ]
@@ -3263,6 +3267,14 @@ async def main():
         check_cpu_load,
         "interval",
         minutes=1,
+        args=[bot],
+    )
+    # Daily traffic report at 23:59
+    scheduler.add_job(
+        send_daily_traffic_report,
+        "cron",
+        hour=DAILY_REPORT_CRON_HOUR,
+        minute=DAILY_REPORT_CRON_MINUTE,
         args=[bot],
     )
     if BACKUP_TG_CHAT_ID:

@@ -53,6 +53,17 @@ if BACKUP_TG_CHAT_ID:
 BACKUP_CRON_HOUR = int(os.environ.get("BACKUP_CRON_HOUR", "1"))
 BACKUP_CRON_MINUTE = int(os.environ.get("BACKUP_CRON_MINUTE", "0"))
 
+# Настройки ежедневного отчета по трафику (23:59)
+ADMIN_REPORT_CHAT_ID = os.environ.get("ADMIN_REPORT_CHAT_ID", "").strip() or None
+if ADMIN_REPORT_CHAT_ID:
+    try:
+        ADMIN_REPORT_CHAT_ID = int(ADMIN_REPORT_CHAT_ID)
+    except ValueError:
+        pass
+
+DAILY_REPORT_CRON_HOUR = int(os.environ.get("DAILY_REPORT_CRON_HOUR", "23"))
+DAILY_REPORT_CRON_MINUTE = int(os.environ.get("DAILY_REPORT_CRON_MINUTE", "59"))
+
 
 
 def _parse_admin_ids(raw: str) -> set[int]:

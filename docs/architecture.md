@@ -21,13 +21,22 @@ flowchart TD
 - **`remnawave_api.py`**: Async client wrapper for Remnawave API (with connection pooling via `aiohttp.ClientSession`, automatic resolution between UUID/shortUuid/numeric IDs, and retry handling).
 - **`database.py`**: SQLite database models and queries (`aiosqlite`) for users, roles, subscriptions, referral relations, node metrics, notification logs, and audit trails.
 - **`handlers/`**:
-  - `admin_analytics.py`: Real-time analytics, user bandwidth aggregation, node comparison charts, and summary reports.
+  - `admin_analytics.py`: Real-time analytics, user bandwidth aggregation, node comparison charts, daily traffic report aggregation (`collect_daily_traffic_data`, `format_daily_report_text`), `/daily_report` command, and summary reports.
   - `admin_nodes.py`: Node management, online status polling, ping, enable/disable toggle, and SSH remote execution.
   - `admin_dm.py` & `admin_notifications.py`: Direct messaging, broadcast announcements, and notification preferences.
   - `connect.py`: Interactive connection wizard, QR code generators, deep-linking, and client setup instructions.
-- **`scheduler.py`**: Background cron jobs for expiration alerts, node status checks, high CPU alerts, node auto-restart, and metric collection.
+- **`scheduler.py`**: Background cron and interval jobs:
+  - Expiration alerts for clients and admins (`check_expiring_subscriptions`).
+  - Node healthcheck every 2 minutes (`check_nodes_health`).
+  - Node CPU load check every 1 minute (`check_cpu_load`).
+  - Daily traffic report at 23:59 MSK (`send_daily_traffic_report`).
+  - Daily database and configuration backup at 01:00 MSK (`run_daily_backup`).
 - **`services/`**:
-  - `chart_generator.py`: Matplotlib-based chart generation for traffic series and node comparison.
+  - `chart_generator.py`: Matplotlib-based chart generation:
+    - Node load history charts (CPU, RAM, users online).
+    - 30-day cluster total traffic sparkline charts.
+    - Node traffic comparative charts.
+    - Daily 23:59 node traffic distribution donut charts (`generate_daily_nodes_distribution_chart`) with dark cyberpunk styling, KPI callout, and sanitized emoji glyphs.
 
 ## User Onboarding & Trial Flow
 

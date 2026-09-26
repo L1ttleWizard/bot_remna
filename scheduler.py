@@ -2,6 +2,7 @@ import logging
 import time
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Union
 
 from aiogram import Bot
 
@@ -736,4 +737,89 @@ async def run_daily_backup(bot: Bot, target_chat_id: int | str = None) -> bool:
                 logger.info(f"Временный архив {backup_path} удален.")
             except Exception as e:
                 logger.warning(f"Не удалось удалить временный архив {backup_path}: {e}")
+
+
+async def send_daily_traffic_report(
+    bot: Bot,
+    target_chat_id: Optional[Union[int, str]] = None,
+    report_date: Optional[str] = None,
+) -> bool:
+    """Генерирует и отправляет ежедневный отчет по трафику (ноды, график распределения, топ юзеры)."""
+    import config
+    from handlers.admin_analytics import collect_daily_traffic_data, format_daily_report_text
+    from services.chart_generator import generate_daily_nodes_distribution_chart
+    from aiogram.types import BufferedInputFile
+
+    # 1. Определяем дату
+    if report_date:
+        raw_date = report_date.strip()
+    else:
+        now_msk = datetime.now(MSK)
+        raw_date = now_msk.strftime("%Y-%m-%d")
+
+    # 2. Определяем список получателей
+    recipients = []
+    if target_chat_id:
+        recipients.append(target_chat_id)
+    elif config.ADMIN_REPORT_CHAT_ID:
+        recipients.append(config.ADMIN_REPORT_CHAT_ID)
+    elif config.BACKUP_TG_CHAT_ID:
+        recipients.append(config.BACKUP_TG_CHAT_ID)
+    elif config.ADMIN_TG_IDS:
+        recipients.extend(sorted(config.ADMIN_TG_IDS))
+
+    if not recipients:
+        logger.warning(
+            "send_daily_traffic_report: нет адресатов для отправки отчета "
+            "(ADMIN_REPORT_CHAT_ID, BACKUP_TG_CHAT_ID, ADMIN_TG_IDS не заданы)."
+        )
+        return False
+
+    logger.info("Формирование ежедневного отчета за %s для %s...", raw_date, recipients)
+
+    try:
+        report_data = await collect_daily_traffic_data(raw_date)
+
+        # Подготовка данных для графика
+        nodes_traffic = [
+            (n["name"], n["total_bytes"], n["color"])
+            for n in report_data.get("nodes", [])
+        ]
+
+        loop = asyncio.get_running_loop()
+        chart_bytes = await loop.run_in_executor(
+            None,
+            generate_daily_nodes_distribution_chart,
+            nodes_traffic,
+            report_data["total_bytes"],
+            report_data["date_str"],
+        )
+
+        caption, extra_text = format_daily_report_text(report_data)
+
+        sent_any = False
+        for cid in recipients:
+            try:
+                photo_file = BufferedInputFile(chart_bytes, filename=f"daily_report_{raw_date}.png")
+                await bot.send_photo(
+                    chat_id=cid,
+                    photo=photo_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+                if extra_text:
+                    await bot.send_message(
+                        chat_id=cid,
+                        text=extra_text,
+                        parse_mode="HTML",
+                    )
+                sent_any = True
+                logger.info("Ежедневный отчет успешно отправлен в chat_id %s", cid)
+            except Exception as send_err:
+                logger.warning("Не удалось отправить ежедневный отчет в chat_id %s: %s", cid, send_err)
+
+        return sent_any
+    except Exception as e:
+        logger.exception("Ошибка при генерации или отправке ежедневного отчета за %s: %s", raw_date, e)
+        return False
 
