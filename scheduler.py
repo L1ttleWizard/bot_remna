@@ -20,6 +20,9 @@ from app import (
     CPU_NOTIFY_ENABLED_KEY,
     CPU_THRESHOLD_KEY,
     CPU_SUSTAINED_MINUTES_KEY,
+    DAILY_REPORT_ENABLED_KEY,
+    NODE_BILLING_NOTIFY_ENABLED_KEY,
+    NODE_BILLING_NOTIFY_DAYS_KEY,
     api,
 )
 
@@ -291,6 +294,7 @@ async def check_expiring_subscriptions(bot: Bot) -> None:
         thirty_days_ago = now - 30 * day_sec
         seven_days_ago = now - 7 * day_sec
         await db.cleanup_old_notifications(thirty_days_ago)
+        await db.cleanup_old_billing_notifications(thirty_days_ago)
         await db.cleanup_old_node_metrics(seven_days_ago)
     except Exception as e:
         logger.warning("Failed to cleanup old notifications/metrics: %s", e)
@@ -750,6 +754,13 @@ async def send_daily_traffic_report(
     from services.chart_generator import generate_daily_nodes_distribution_chart
     from aiogram.types import BufferedInputFile
 
+    # 0. Проверяем настройку включения дайджеста при автоматическом запуске по расписанию
+    if target_chat_id is None and report_date is None:
+        is_enabled = (await db.get_setting(DAILY_REPORT_ENABLED_KEY)) != "0"
+        if not is_enabled:
+            logger.info("send_daily_traffic_report: ежедневный дайджест отключен в настройках (DAILY_REPORT_ENABLED_KEY=0). Пропуск.")
+            return False
+
     # 1. Определяем дату
     if report_date:
         raw_date = report_date.strip()
@@ -822,4 +833,152 @@ async def send_daily_traffic_report(
     except Exception as e:
         logger.exception("Ошибка при генерации или отправке ежедневного отчета за %s: %s", raw_date, e)
         return False
+
+
+def _days_until_billing(iso: Optional[str], now_date: Optional[datetime.date] = None) -> Optional[int]:
+    """Вычисляет оставшееся количество календарных дней до даты списания nextBillingAt."""
+    if not iso:
+        return None
+    try:
+        s = str(iso).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s).astimezone(MSK)
+        base_date = now_date or datetime.now(MSK).date()
+        return (dt.date() - base_date).days
+    except Exception:
+        return None
+
+
+async def check_billing_nodes_expiration(
+    bot: Bot,
+    target_chat_id: Optional[Union[int, str]] = None,
+    force: bool = False,
+) -> dict:
+    """Проверяет сроки окончания оплаты нод и отправляет уведомления."""
+    import html
+    import config
+    from handlers.admin_analytics import get_country_flag
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    # 1. Проверяем настройку включения уведомлений биллинга
+    is_enabled = (await db.get_setting(NODE_BILLING_NOTIFY_ENABLED_KEY)) != "0"
+    if not is_enabled and not force:
+        logger.info("check_billing_nodes_expiration: уведомления биллинга выключены.")
+        return {"status": "disabled", "sent": 0, "checked": 0}
+
+    # 2. Получаем настроенные дни напоминаний
+    days_str = (await db.get_setting(NODE_BILLING_NOTIFY_DAYS_KEY)) or "7,3,1,0"
+    try:
+        notify_days = [int(x.strip()) for x in days_str.split(",") if x.strip()]
+    except ValueError:
+        notify_days = [7, 3, 1, 0]
+
+    # 3. Определяем адресатов
+    recipients = []
+    if target_chat_id:
+        recipients.append(target_chat_id)
+    elif config.ADMIN_REPORT_CHAT_ID:
+        recipients.append(config.ADMIN_REPORT_CHAT_ID)
+    elif config.BACKUP_TG_CHAT_ID:
+        recipients.append(config.BACKUP_TG_CHAT_ID)
+    elif config.ADMIN_TG_IDS:
+        recipients.extend(sorted(config.ADMIN_TG_IDS))
+
+    if not recipients:
+        logger.warning("check_billing_nodes_expiration: нет адресатов для отправки уведомлений.")
+        return {"status": "no_recipients", "sent": 0, "checked": 0}
+
+    billing_nodes = await api.list_billing_nodes()
+    if billing_nodes is None:
+        logger.warning("check_billing_nodes_expiration: не удалось получить список биллинга нод из API.")
+        return {"status": "api_error", "sent": 0, "checked": 0}
+
+    now_date = datetime.now(MSK).date()
+    sent_count = 0
+    checked_count = len(billing_nodes)
+
+    for item in billing_nodes:
+        billing_uuid = item.get("uuid")
+        if not billing_uuid:
+            continue
+
+        next_billing_iso = item.get("nextBillingAt")
+        days_left = _days_until_billing(next_billing_iso, now_date)
+        if days_left is None:
+            continue
+
+        if not force and days_left not in notify_days:
+            continue
+
+        billing_date_str = str(next_billing_iso)[:10]
+        if not force and await db.was_billing_notification_sent(billing_uuid, days_left, billing_date_str):
+            continue
+
+        node_data = item.get("node") or {}
+        node_name = node_data.get("name") or item.get("nodeName") or "Сервер"
+        country_code = node_data.get("countryCode")
+        flag = get_country_flag(country_code)
+
+        provider_data = item.get("provider") or {}
+        provider_name = provider_data.get("name") or item.get("providerName") or "—"
+        login_url = (
+            provider_data.get("loginUrl")
+            or provider_data.get("billingUrl")
+            or provider_data.get("faviconLink")
+        )
+
+        try:
+            dt = datetime.fromisoformat(str(next_billing_iso).replace("Z", "+00:00")).astimezone(MSK)
+            date_formatted = dt.strftime("%d.%m.%Y")
+        except Exception:
+            date_formatted = billing_date_str
+
+        days_word = get_days_word(days_left)
+
+        if days_left == 0:
+            header = "🚨 <b>Внимание: Сегодня день списания за сервер!</b>"
+            time_desc = "<b>сегодня (0 дн.)</b>"
+        elif days_left == 1:
+            header = "⚠️ <b>Внимание: Завтра списание за сервер!</b>"
+            time_desc = "<b>завтра (1 дн.)</b>"
+        elif days_left < 0:
+            header = "❌ <b>Внимание: Оплата сервера просрочена!</b>"
+            time_desc = f"<b>просрочено ({days_word})</b>"
+        else:
+            header = f"⏳ <b>Напоминание о списании за сервер ({days_left} дн.)</b>"
+            time_desc = f"<b>{days_word}</b>"
+
+        node_display = f"{flag} {node_name}".strip() if flag else node_name
+
+        msg_text = (
+            f"{header}\n\n"
+            f"• Сервер: <b>{html.escape(node_display)}</b>\n"
+            f"• Провайдер: <b>{html.escape(provider_name)}</b>\n"
+            f"• Дата списания: <b>{date_formatted}</b> ({time_desc})\n\n"
+            f"<i>Пожалуйста, проверьте баланс у хостинг-провайдера во избежание блокировки сервера.</i>"
+        )
+
+        kb_rows = []
+        if login_url and (login_url.startswith("http://") or login_url.startswith("https://")):
+            kb_rows.append([InlineKeyboardButton(text="💳 Панель провайдера", url=login_url)])
+        kb_rows.append([InlineKeyboardButton(text="📀 Настройки ноды", callback_data=f"billing:bn:{billing_uuid}")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+        for cid in recipients:
+            try:
+                await bot.send_message(
+                    chat_id=cid,
+                    text=msg_text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+            except Exception as send_err:
+                logger.warning("Не удалось отправить уведомление биллинга в chat_id %s: %s", cid, send_err)
+
+        if not force:
+            await db.mark_billing_notification_sent(billing_uuid, days_left, billing_date_str)
+        sent_count += 1
+        logger.info("Sent billing notification for node %s (%s, days left: %s)", node_name, billing_uuid, days_left)
+
+    return {"status": "ok", "sent": sent_count, "checked": checked_count}
 

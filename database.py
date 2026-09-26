@@ -145,6 +145,21 @@ async def init_db():
 
         await db.execute(
             """
+            CREATE TABLE IF NOT EXISTS billing_notification_log (
+                billing_uuid TEXT NOT NULL,
+                days_left INTEGER NOT NULL,
+                billing_date TEXT NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY (billing_uuid, days_left, billing_date)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_billing_notification_log_sent_at ON billing_notification_log(sent_at)"
+        )
+
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS node_status_log (
                 node_uuid TEXT PRIMARY KEY,
                 node_name TEXT,
@@ -1211,6 +1226,33 @@ async def mark_notification_sent(tg_id: int, sub_id: int, days_left: int) -> Non
 async def cleanup_old_notifications(before_ts: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM notification_log WHERE sent_at < ?", (int(before_ts),))
+        await db.commit()
+
+
+async def was_billing_notification_sent(billing_uuid: str, days_left: int, billing_date: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM billing_notification_log WHERE billing_uuid = ? AND days_left = ? AND billing_date = ?",
+            (str(billing_uuid), int(days_left), str(billing_date)),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def mark_billing_notification_sent(billing_uuid: str, days_left: int, billing_date: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO billing_notification_log (billing_uuid, days_left, billing_date, sent_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(billing_uuid), int(days_left), str(billing_date), int(time.time())),
+        )
+        await db.commit()
+
+
+async def cleanup_old_billing_notifications(before_ts: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM billing_notification_log WHERE sent_at < ?", (int(before_ts),))
         await db.commit()
 
 

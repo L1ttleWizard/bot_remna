@@ -158,6 +158,14 @@ REFERRAL_NOTIFY_ENABLED_KEY = "referral_notify_enabled"
 # Auto-restart settings keys
 NODE_AUTORESTART_ENABLED_KEY = "node_autorestart_enabled"
 
+# Daily traffic digest (23:59) settings keys
+DAILY_REPORT_ENABLED_KEY = "daily_report_enabled"
+
+# Node billing notification settings keys
+NODE_BILLING_NOTIFY_ENABLED_KEY = "node_billing_notify_enabled"
+NODE_BILLING_NOTIFY_DAYS_KEY = "node_billing_notify_days"
+NODE_BILLING_NOTIFY_TEXT_KEY = "node_billing_notify_text"
+
 
 
 # --- Middleware ---

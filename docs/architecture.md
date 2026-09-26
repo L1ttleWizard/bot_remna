@@ -23,13 +23,14 @@ flowchart TD
 - **`handlers/`**:
   - `admin_analytics.py`: Real-time analytics, user bandwidth aggregation, node comparison charts, daily traffic report aggregation (`collect_daily_traffic_data`, `format_daily_report_text`), `/daily_report` command, and summary reports.
   - `admin_nodes.py`: Node management, online status polling, ping, enable/disable toggle, and SSH remote execution.
-  - `admin_dm.py` & `admin_notifications.py`: Direct messaging, broadcast announcements, and notification preferences.
+  - `admin_dm.py` & `admin_notifications.py`: Direct messaging, broadcast announcements, and notification preferences center (client & admin subscriptions digest, server offline & CPU alerts, daily traffic report 23:59 toggle, and node billing expiration notifications & reminder days).
   - `connect.py`: Interactive connection wizard, QR code generators, deep-linking, and client setup instructions.
 - **`scheduler.py`**: Background cron and interval jobs:
   - Expiration alerts for clients and admins (`check_expiring_subscriptions`).
   - Node healthcheck every 2 minutes (`check_nodes_health`).
   - Node CPU load check every 1 minute (`check_cpu_load`).
-  - Daily traffic report at 23:59 MSK (`send_daily_traffic_report`).
+  - Daily traffic report at 23:59 MSK (`send_daily_traffic_report`, honors `DAILY_REPORT_ENABLED_KEY`).
+  - Node billing expiration alerts at 10:00 MSK (`check_billing_nodes_expiration`, honors `NODE_BILLING_NOTIFY_ENABLED_KEY` and `NODE_BILLING_NOTIFY_DAYS_KEY`).
   - Daily bot SQLite database and configuration backup at 01:00 MSK (`run_daily_backup`).
   - Automated Remnawave panel backup (Postgres database dumpall + configs) runs host-level via `rw-backup-restore` cron (`@daily` / midnight) uploading `remnawave_backup_panel_*.tar.gz` to the admin Telegram chat.
 - **`services/`**:

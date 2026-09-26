@@ -86,6 +86,8 @@ from config import (
     BACKUP_CRON_MINUTE,
     DAILY_REPORT_CRON_HOUR,
     DAILY_REPORT_CRON_MINUTE,
+    BILLING_CHECK_CRON_HOUR,
+    BILLING_CHECK_CRON_MINUTE,
 )
 from formatters import (
     DEFAULT_HWID_DEVICE_LIMIT,
@@ -133,6 +135,7 @@ from scheduler import (
     check_expiring_subscriptions,
     check_nodes_health,
     check_cpu_load,
+    check_billing_nodes_expiration,
     run_daily_backup,
     send_daily_traffic_report,
     ssh_execute_on_node,
@@ -3275,6 +3278,14 @@ async def main():
         "cron",
         hour=DAILY_REPORT_CRON_HOUR,
         minute=DAILY_REPORT_CRON_MINUTE,
+        args=[bot],
+    )
+    # Node billing expiration check
+    scheduler.add_job(
+        check_billing_nodes_expiration,
+        "cron",
+        hour=BILLING_CHECK_CRON_HOUR,
+        minute=BILLING_CHECK_CRON_MINUTE,
         args=[bot],
     )
     if BACKUP_TG_CHAT_ID:

@@ -23,7 +23,12 @@ from app import (
     CPU_THRESHOLD_KEY,
     CPU_SUSTAINED_MINUTES_KEY,
     REFERRAL_NOTIFY_ENABLED_KEY,
+    DAILY_REPORT_ENABLED_KEY,
+    NODE_BILLING_NOTIFY_ENABLED_KEY,
+    NODE_BILLING_NOTIFY_DAYS_KEY,
+    NODE_BILLING_NOTIFY_TEXT_KEY,
     AdminNotifyStates,
+    api,
     dp,
     safe_edit,
 )
@@ -66,7 +71,7 @@ async def get_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
         callback_data="admin_notify_toggle:client",
     )
     btn_admin_toggle = InlineKeyboardButton(
-        text="👑 Админы: " + ("Выключить ❌" if admin_enabled else "Включить ✅"),
+        text="👑 Дайджест админам: " + ("Выключить ❌" if admin_enabled else "Включить ✅"),
         callback_data="admin_notify_toggle:admin",
     )
 
@@ -161,21 +166,182 @@ async def get_referral_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
 
 
 
+async def get_digest_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
+    digest_enabled = (await db.get_setting(DAILY_REPORT_ENABLED_KEY)) != "0"
+    digest_status = "✅ Включен" if digest_enabled else "❌ Выключен"
+
+    import config
+    chat_info = (
+        f"Чат ID: <code>{config.ADMIN_REPORT_CHAT_ID or config.BACKUP_TG_CHAT_ID}</code>"
+        if (config.ADMIN_REPORT_CHAT_ID or config.BACKUP_TG_CHAT_ID)
+        else "Администраторы бота"
+    )
+
+    body = (
+        "📊 <b>Настройка ежедневного дайджеста трафика</b>\n\n"
+        "Бот ежедневно формирует отчет по использованию трафика нод:\n"
+        "• Суммарный объем по кластеру за сутки\n"
+        "• Киберпанк Donut-график распределения по нодам\n"
+        "• Абсолютный топ пользователь дня\n"
+        "• Статистика и топ пользователь по каждой ноде\n\n"
+        f"• Статус: <b>{digest_status}</b>\n"
+        f"• Время отправки: <b>23:59 MSK</b>\n"
+        f"• Адресат: {chat_info}"
+    )
+
+    btn_toggle = InlineKeyboardButton(
+        text="📊 Дайджест: " + ("Выключить ❌" if digest_enabled else "Включить ✅"),
+        callback_data="admin_notify_toggle:daily_report",
+    )
+    btn_send_now = InlineKeyboardButton(
+        text="📢 Отправить сейчас",
+        callback_data="admin_stats:daily_report_now",
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn_toggle],
+            [btn_send_now],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_notify_settings")],
+        ]
+    )
+    return body, kb
+
+
+async def get_billing_settings_summary() -> tuple[str, InlineKeyboardMarkup]:
+    from scheduler import _days_until_billing
+    from handlers.admin_analytics import get_country_flag
+    from datetime import datetime, timezone, timedelta
+
+    billing_enabled = (await db.get_setting(NODE_BILLING_NOTIFY_ENABLED_KEY)) != "0"
+    billing_status = "✅ Включены" if billing_enabled else "❌ Выключены"
+    billing_days = (await db.get_setting(NODE_BILLING_NOTIFY_DAYS_KEY)) or "7,3,1,0"
+
+    items = await api.list_billing_nodes() or []
+    
+    nodes_info = []
+    MSK = timezone(timedelta(hours=3))
+    now_date = datetime.now(MSK).date()
+
+    for b in items:
+        next_iso = b.get("nextBillingAt")
+        days = _days_until_billing(next_iso, now_date)
+        node_name = b.get("node", {}).get("name") or b.get("nodeName") or "Сервер"
+        country = b.get("node", {}).get("countryCode")
+        prov = b.get("provider", {}).get("name") or b.get("providerName") or "—"
+        flag = get_country_flag(country)
+        display_name = f"{flag} {node_name}".strip() if flag else node_name
+
+        date_str = "—"
+        if next_iso:
+            try:
+                dt = datetime.fromisoformat(str(next_iso).replace("Z", "+00:00")).astimezone(MSK)
+                date_str = dt.strftime("%d.%m.%Y")
+            except Exception:
+                date_str = str(next_iso)[:10]
+
+        nodes_info.append((days if days is not None else 9999, display_name, prov, date_str, days))
+
+    nodes_info.sort(key=lambda x: x[0])
+
+    lines = []
+    if not nodes_info:
+        lines.append("<i>Нет привязанных к биллингу серверов.</i>")
+    else:
+        for _, name, prov, date_str, d in nodes_info[:6]:
+            if d is None:
+                tail = ""
+            elif d == 0:
+                tail = " · 🚨 <b>сегодня</b>"
+            elif d == 1:
+                tail = " · ⚠️ <b>завтра</b>"
+            elif d < 0:
+                tail = f" · ❌ <b>просрочено ({abs(d)} дн.)</b>"
+            else:
+                tail = f" · через <b>{d} дн.</b>"
+            lines.append(f"• <b>{name}</b> ({prov}) — {date_str}{tail}")
+        if len(nodes_info) > 6:
+            lines.append(f"<i>...и еще {len(nodes_info) - 6} серверов</i>")
+
+    nodes_text = "\n".join(lines)
+
+    body = (
+        "💳 <b>Настройка уведомлений биллинга нод</b>\n\n"
+        "Автоматическое отслеживание окончания оплаченного периода серверов (Remnawave Infra-Billing).\n"
+        "При приближении даты списания бот присылает предупреждение со ссылкой на оплату у хостинг-провайдера.\n\n"
+        f"• Статус: <b>{billing_status}</b>\n"
+        f"• Дни напоминаний: <code>{billing_days}</code> (дней до списания)\n\n"
+        f"📋 <b>Ближайшие списания:</b>\n{nodes_text}"
+    )
+
+    btn_toggle = InlineKeyboardButton(
+        text="💳 Биллинг: " + ("Выключить ❌" if billing_enabled else "Включить ✅"),
+        callback_data="admin_notify_toggle:billing",
+    )
+    btn_edit_days = InlineKeyboardButton(
+        text="📅 Дни напоминаний",
+        callback_data="admin_notify_edit_days:billing",
+    )
+    btn_test = InlineKeyboardButton(
+        text="📢 Проверить сейчас",
+        callback_data="admin_notify_test_billing",
+    )
+    btn_billing_panel = InlineKeyboardButton(
+        text="💳 Раздел биллинга",
+        callback_data="billing:menu",
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn_toggle, btn_edit_days],
+            [btn_test, btn_billing_panel],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_notify_settings")],
+        ]
+    )
+    return body, kb
+
+
 @dp.callback_query(F.data == "admin_notify_settings")
 async def cb_admin_notify_settings(callback: CallbackQuery, state: FSMContext):
     if not await auth.is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     await state.clear()
+
+    client_enabled = (await db.get_setting(CLIENT_NOTIFY_ENABLED_KEY)) != "0"
+    admin_sub_enabled = (await db.get_setting(ADMIN_NOTIFY_ENABLED_KEY)) != "0"
+    node_down_enabled = (await db.get_setting(NODE_DOWN_NOTIFY_ENABLED_KEY)) != "0"
+    cpu_enabled = (await db.get_setting(CPU_NOTIFY_ENABLED_KEY)) != "0"
+    digest_enabled = (await db.get_setting(DAILY_REPORT_ENABLED_KEY)) != "0"
+    billing_enabled = (await db.get_setting(NODE_BILLING_NOTIFY_ENABLED_KEY)) != "0"
+    ref_enabled = (await db.get_setting(REFERRAL_NOTIFY_ENABLED_KEY)) != "0"
+
+    sub_status = "✅" if client_enabled else "❌"
+    sub_digest_status = "✅" if admin_sub_enabled else "❌"
+    servers_status = "✅" if (node_down_enabled or cpu_enabled) else "❌"
+    digest_status = "✅" if digest_enabled else "❌"
+    billing_status = "✅" if billing_enabled else "❌"
+    ref_status = "✅" if ref_enabled else "❌"
+
     body = (
         "🔔 <b>Центр уведомлений</b>\n\n"
-        "Выберите категорию настроек уведомлений:"
+        "Текущий статус уведомлений:\n"
+        f"• 📅 Подписки: {sub_status} (Дайджест: {sub_digest_status})\n"
+        f"• 🖥 Серверы: {servers_status}\n"
+        f"• 📊 Дайджест 23:59: {digest_status}\n"
+        f"• 💳 Биллинг нод: {billing_status}\n"
+        f"• 👥 Рефералы: {ref_status}\n\n"
+        "Выберите категорию настроек:"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="📅 Подписки", callback_data="admin_notify_subs_menu"),
                 InlineKeyboardButton(text="🖥 Серверы", callback_data="admin_notify_servers_menu"),
+            ],
+            [
+                InlineKeyboardButton(text="📊 Дайджест (23:59)", callback_data="admin_notify_digest_menu"),
+                InlineKeyboardButton(text="💳 Биллинг", callback_data="admin_notify_billing_menu"),
             ],
             [
                 InlineKeyboardButton(text="👥 Рефералы", callback_data="admin_notify_referrals_menu"),
@@ -185,6 +351,28 @@ async def cb_admin_notify_settings(callback: CallbackQuery, state: FSMContext):
             ]
         ]
     )
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_notify_digest_menu")
+async def cb_admin_notify_digest_menu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
+    body, kb = await get_digest_settings_summary()
+    await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_notify_billing_menu")
+async def cb_admin_notify_billing_menu(callback: CallbackQuery, state: FSMContext):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
+    body, kb = await get_billing_settings_summary()
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
     await callback.answer()
 
@@ -249,6 +437,14 @@ async def cb_admin_notify_toggle(callback: CallbackQuery):
         cur = (await db.get_setting(REFERRAL_NOTIFY_ENABLED_KEY)) != "0"
         await db.set_setting(REFERRAL_NOTIFY_ENABLED_KEY, "0" if cur else "1")
         body, kb = await get_referral_settings_summary()
+    elif target == "daily_report":
+        cur = (await db.get_setting(DAILY_REPORT_ENABLED_KEY)) != "0"
+        await db.set_setting(DAILY_REPORT_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_digest_settings_summary()
+    elif target == "billing":
+        cur = (await db.get_setting(NODE_BILLING_NOTIFY_ENABLED_KEY)) != "0"
+        await db.set_setting(NODE_BILLING_NOTIFY_ENABLED_KEY, "0" if cur else "1")
+        body, kb = await get_billing_settings_summary()
     else:
         return
 
@@ -265,16 +461,27 @@ async def cb_admin_notify_edit_days(callback: CallbackQuery, state: FSMContext):
     await state.update_data(target=target)
     await state.set_state(AdminNotifyStates.waiting_for_days)
 
-    body = (
-        "📅 <b>Настройка дней напоминаний</b>\n\n"
-        "Введите через запятую дни до окончания подписки, в которые нужно отправлять уведомления.\n"
-        "Например: <code>3, 1, 0</code> (за 3 дня, за 1 день, и в день окончания).\n"
-        "Для администраторов можно использовать отрицательные значения, например <code>-1</code> для вчера истекших подписок.\n\n"
-        "Для отмены отправьте /cancel."
-    )
+    if target == "billing":
+        body = (
+            "📅 <b>Настройка дней напоминаний биллинга</b>\n\n"
+            "Введите через запятую дни до окончания оплаченного периода сервера, в которые нужно отправлять уведомления.\n"
+            "Например: <code>7, 3, 1, 0</code> (за неделю, за 3 дня, за 1 день и в день списания).\n\n"
+            "Для отмены отправьте /cancel."
+        )
+        back_cb = "admin_notify_billing_menu"
+    else:
+        body = (
+            "📅 <b>Настройка дней напоминаний</b>\n\n"
+            "Введите через запятую дни до окончания подписки, в которые нужно отправлять уведомления.\n"
+            "Например: <code>3, 1, 0</code> (за 3 дня, за 1 день, и в день окончания).\n"
+            "Для администраторов можно использовать отрицательные значения, например <code>-1</code> для вчера истекших подписок.\n\n"
+            "Для отмены отправьте /cancel."
+        )
+        back_cb = "admin_notify_subs_menu"
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_notify_subs_menu")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=back_cb)],
         ]
     )
     await safe_edit(callback, body, parse_mode="HTML", reply_markup=kb, prefer_edit=True)
@@ -289,8 +496,13 @@ async def process_notify_days(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.startswith("/"):
         if text == "/cancel":
+            data = await state.get_data()
+            target = data.get("target")
             await state.clear()
-            body, kb = await get_settings_summary()
+            if target == "billing":
+                body, kb = await get_billing_settings_summary()
+            else:
+                body, kb = await get_settings_summary()
             await message.answer(body, parse_mode="HTML", reply_markup=kb)
             return
         await message.answer("Пожалуйста, введите список чисел через запятую или отправьте /cancel.")
@@ -310,13 +522,37 @@ async def process_notify_days(message: Message, state: FSMContext):
 
     if target == "client":
         await db.set_setting(CLIENT_NOTIFY_DAYS_KEY, days_str)
+        await state.clear()
+        body, kb = await get_settings_summary()
+    elif target == "billing":
+        await db.set_setting(NODE_BILLING_NOTIFY_DAYS_KEY, days_str)
+        await state.clear()
+        body, kb = await get_billing_settings_summary()
     else:
         await db.set_setting(ADMIN_NOTIFY_DAYS_KEY, days_str)
+        await state.clear()
+        body, kb = await get_settings_summary()
 
-    await state.clear()
-    body, kb = await get_settings_summary()
     await message.answer(f"✅ Дни для {target} успешно сохранены: <code>{days_str}</code>", parse_mode="HTML")
     await message.answer(body, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "admin_notify_test_billing")
+async def cb_admin_notify_test_billing(callback: CallbackQuery):
+    if not await auth.is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("⏳ Запуск проверки биллинга...")
+    from scheduler import check_billing_nodes_expiration
+    res = await check_billing_nodes_expiration(callback.bot, target_chat_id=callback.message.chat.id, force=True)
+    sent = res.get("sent", 0)
+    checked = res.get("checked", 0)
+    await callback.message.answer(
+        f"✅ <b>Проверка биллинга завершена</b>\n\n"
+        f"• Проверено серверов: <b>{checked}</b>\n"
+        f"• Отправлено оповещений: <b>{sent}</b>",
+        parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data.startswith("admin_notify_edit_text:"))

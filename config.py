@@ -64,6 +64,10 @@ if ADMIN_REPORT_CHAT_ID:
 DAILY_REPORT_CRON_HOUR = int(os.environ.get("DAILY_REPORT_CRON_HOUR", "23"))
 DAILY_REPORT_CRON_MINUTE = int(os.environ.get("DAILY_REPORT_CRON_MINUTE", "59"))
 
+# Настройки проверки биллинга нод (по умолчанию 10:00 MSK)
+BILLING_CHECK_CRON_HOUR = int(os.environ.get("BILLING_CHECK_CRON_HOUR", "10"))
+BILLING_CHECK_CRON_MINUTE = int(os.environ.get("BILLING_CHECK_CRON_MINUTE", "0"))
+
 
 
 def _parse_admin_ids(raw: str) -> set[int]:

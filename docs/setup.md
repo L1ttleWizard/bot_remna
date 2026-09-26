@@ -21,6 +21,10 @@ ADMIN_REPORT_CHAT_ID=-1003983882002  # Target group/channel ID (defaults to BACK
 DAILY_REPORT_CRON_HOUR=23            # Hour in SCHEDULER_TIMEZONE (default: 23)
 DAILY_REPORT_CRON_MINUTE=59          # Minute in SCHEDULER_TIMEZONE (default: 59)
 
+# Node Billing Check (10:00 MSK)
+BILLING_CHECK_CRON_HOUR=10           # Hour in SCHEDULER_TIMEZONE (default: 10)
+BILLING_CHECK_CRON_MINUTE=0          # Minute in SCHEDULER_TIMEZONE (default: 0)
+
 # Automated Backups
 BACKUP_TG_CHAT_ID=-1003983882002
 BACKUP_CRON_HOUR=1

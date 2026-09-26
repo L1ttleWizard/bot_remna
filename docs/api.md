@@ -28,6 +28,13 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 - `GET /api/nodes`: Lists all nodes and their status (`isConnected`, `isDisabled`, `address`, `name`).
 - `GET /api/internal-squads`: Lists internal squads (profiles) available in the panel.
 
+### 5. Infra-Billing
+- `GET /api/infra-billing/providers`: Lists hosting providers (`uuid`, `name`, `loginUrl`, `billingUrl`, `faviconLink`).
+- `GET /api/infra-billing/nodes`: Lists node billing records (`uuid`, `nodeUuid`, `providerUuid`, `nextBillingAt`, nested `node` and `provider`).
+- `POST /api/infra-billing/nodes`: Creates node-to-provider billing association.
+- `PATCH /api/infra-billing/nodes`: Updates billing properties (e.g. `nextBillingAt`).
+- `DELETE /api/infra-billing/nodes/{uuid}`: Unlinks a billing association.
+
 ## Bot Internal Contracts
 
 ### Self-Registration & Trial Flow
@@ -47,6 +54,12 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 - **Supported Formats**: Integer/float seconds, millisecond timestamps (`> 100_000_000_000`), string timestamps, and ISO 8601 strings (`2026-10-01T00:00:00Z`).
 - **Tuple Polymorphism**: Formatters and renderers safely accept 7-tuples (from `list_subscriptions`: `id, uuid, short_uuid, username, expire_date, label, created_at`), 9-tuples (from `get_subscription`), and dicts.
 - **Authorization Decoupling**: User subscription listing (`cb_my_subs`) queries `list_subscriptions(tg_id)` directly. Unregistered users receive the redemption instruction screen with a Back button instead of an alert popup.
+
+### Node Billing Notifications Contract
+- **Trigger**: Automated schedule at 10:00 MSK (`check_billing_nodes_expiration`) or manual check via `admin_notify_test_billing`.
+- **Calculation**: Computes exact calendar day difference between MSK today and `nextBillingAt`.
+- **Deduplication**: Recorded in SQLite `billing_notification_log` by composite key `(billing_uuid, days_left, billing_date)`. Renewals with a new billing date start a fresh notification cycle.
+- **Payload**: Country flag, node name, hosting provider, formatted expiration date, days remaining badge, direct link to provider control panel, and inline shortcut to node settings.
 
 
 
