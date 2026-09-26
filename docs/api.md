@@ -40,4 +40,11 @@ The bot interacts with the Remnawave Panel API using bearer tokens. In Remnawave
 - **Identifier**: Uses `shortUuid` (or numeric `id`) in callback data to avoid Telegram's 64-byte payload constraint and guarantee instant resolution via `GET /api/users/{id}` or `POST /api/users/resolve`.
 - **Persistence**: Upon confirmation (`lnkok:<tg>:<ident>`), inserts into `subscriptions` using `vlessUuid` (as primary UUID), `shortUuid`, `username`, and `expireAt`.
 
+### Subscription Listing & Date Standardization (`my_subs`, `format_sub_caption`)
+- **Universal Date Parsing**: All subscription and expiration fields in SQLite and API envelopes (`expire_date`, `expireAt`) are parsed through `parse_expire_to_ts(val)` and formatted via `safe_format_expire_date(val, fmt)`.
+- **Supported Formats**: Integer/float seconds, millisecond timestamps (`> 100_000_000_000`), string timestamps, and ISO 8601 strings (`2026-10-01T00:00:00Z`).
+- **Tuple Polymorphism**: Formatters and renderers safely accept 7-tuples (from `list_subscriptions`: `id, uuid, short_uuid, username, expire_date, label, created_at`), 9-tuples (from `get_subscription`), and dicts.
+- **Authorization Decoupling**: User subscription listing (`cb_my_subs`) queries `list_subscriptions(tg_id)` directly. Unregistered users receive the redemption instruction screen with a Back button instead of an alert popup.
+
+
 

@@ -6,7 +6,7 @@
 import html
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 
 # --- HWID limits ---
@@ -78,28 +78,62 @@ def traffic_summary_markdown(api_data: dict) -> str:
 
 # --- Dates ---
 
-def format_expire_display(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "—"
-    s = iso_str.replace("Z", "+00:00") if iso_str.endswith("Z") else iso_str
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-
-
-def parse_expire_to_ts(value: Optional[str]) -> int:
-    """ISO-строка expireAt → unix timestamp (UTC). 0 если пусто/некорректно."""
+def parse_expire_to_ts(value: Any) -> int:
+    """Универсальный парсер даты окончания подписки -> unix timestamp (UTC).
+    Поддерживает:
+      - int / float секунды
+      - int / float миллисекунды (> 100_000_000_000)
+      - строковые int/float ("1780000000", "1780000000.0")
+      - ISO-строки ("2026-10-01T00:00:00Z", "2026-10-01 00:00:00")
+    0 если пусто, некорректно или <= 0.
+    """
     if not value:
         return 0
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 100_000_000_000:
+            ts = ts / 1000.0
+        return int(ts) if ts > 0 else 0
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.lower() in ("none", "null", "0", "—", "-"):
+            return 0
+        try:
+            ts = float(s)
+            if ts > 100_000_000_000:
+                ts = ts / 1000.0
+            return int(ts) if ts > 0 else 0
+        except ValueError:
+            pass
+        try:
+            iso_clean = s.replace("Z", "+00:00") if s.endswith("Z") else s
+            dt = datetime.fromisoformat(iso_clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return 0
+    return 0
+
+
+def safe_format_expire_date(val: Any, fmt: str = "%d.%m.%Y") -> Optional[str]:
+    """Безопасное форматирование даты окончания подписки.
+    Возвращает None, если дата отсутствует, невалидна или <= 0.
+    Никогда не выбрасывает исключений.
+    """
+    ts = parse_expire_to_ts(val)
+    if ts <= 0:
+        return None
     try:
-        s = value.replace("Z", "+00:00") if value.endswith("Z") else value
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return 0
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(fmt)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def format_expire_display(iso_str: Any) -> str:
+    """Человекочитаемое отображение даты в формате DD.MM.YYYY HH:MM UTC."""
+    formatted = safe_format_expire_date(iso_str, "%d.%m.%Y %H:%M UTC")
+    return formatted if formatted else "—"
 
 
 # --- Devices ---
@@ -129,18 +163,45 @@ def format_devices_html(devices: list, limit_label: str) -> str:
 
 # --- Subscription captions ---
 
-def format_sub_caption(sub: tuple) -> str:
-    """Читаемое название подписки из (id, uuid, short_uuid, username, expire_date, label, created_at)."""
-    sid, _uuid, _short, username, expire_date, label, _created = sub
-    if label:
-        head = label
-    elif username:
-        head = username
+def format_sub_caption(sub: Any) -> str:
+    """Читаемое название подписки из любого кортежа (7 или 9 полей) или словаря.
+    Гарантированно не падает с исключением.
+    """
+    if not sub:
+        return "#—"
+    sid = "—"
+    head = ""
+    expire_date = None
+    if isinstance(sub, dict):
+        sid = sub.get("id") or "—"
+        head = sub.get("label") or sub.get("username") or f"#{sid}"
+        expire_date = sub.get("expire_date")
+    elif isinstance(sub, (tuple, list)):
+        if len(sub) >= 9:
+            # (id, tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+            sid = sub[0]
+            username = sub[4]
+            expire_date = sub[5]
+            label = sub[6]
+            head = label or username or f"#{sid}"
+        elif len(sub) >= 6:
+            # (id, uuid, short_uuid, username, expire_date, label, ...)
+            sid = sub[0]
+            username = sub[3]
+            expire_date = sub[4]
+            label = sub[5]
+            head = label or username or f"#{sid}"
+        elif len(sub) >= 1:
+            sid = sub[0]
+            head = f"#{sid}"
+            if len(sub) >= 5:
+                expire_date = sub[4]
     else:
-        head = f"#{sid}"
-    if expire_date:
-        ts = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
-        return f"#{sid} · {head} · до {ts}"
+        head = str(sub)
+
+    exp_str = safe_format_expire_date(expire_date, "%d.%m.%Y")
+    if exp_str:
+        return f"#{sid} · {head} · до {exp_str}"
     return f"#{sid} · {head}"
 
 

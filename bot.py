@@ -103,6 +103,7 @@ from formatters import (
     hwid_limit_caption,
     is_hwid_unlimited,
     parse_expire_to_ts as _parse_expire_to_ts,
+    safe_format_expire_date as _safe_format_expire_date,
     sort_hwid_devices,
     traffic_summary_markdown,
 )
@@ -1035,10 +1036,7 @@ async def cmd_whois(message: Message, command: CommandObject):
     ) = full
     role = role or db.ROLE_USER
     tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
-    expire_str = (
-        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
-        if expire_date else "—"
-    )
+    expire_str = _safe_format_expire_date(expire_date, "%d.%m.%Y %H:%M") or "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
     text = (
         "🔍 <b>Найден пользователь</b>\n\n"
@@ -1117,9 +1115,7 @@ async def _send_admin_users_list(
     ) in rows:
         marker = "👑" if role == db.ROLE_ADMIN else "👤"
         tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
-        when = "—"
-        if expire_date:
-            when = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
+        when = _safe_format_expire_date(expire_date, "%d.%m.%Y") or "—"
         lines.append(
             f"{marker} <code>{tg_id}</code> · {html.escape(tg_name)} · до {when}"
         )
@@ -1604,9 +1600,6 @@ _ensure_sub_belongs_to_user = ensure_sub_belongs_to_user
 @dp.callback_query(F.data == "my_subs")
 async def cb_my_subs(callback: CallbackQuery):
     await callback.answer()
-    if not (await auth.is_admin(callback.from_user.id) or await auth.is_authorized(callback.from_user.id)):
-        await callback.answer("Доступ только по приглашению.", show_alert=True)
-        return
     subs = await db.list_subscriptions(callback.from_user.id)
     if not subs:
         await safe_edit(
@@ -1635,11 +1628,15 @@ async def cb_my_subs(callback: CallbackQuery):
 
 
 async def _render_sub_open(callback: CallbackQuery, sub: tuple, *, prefer_edit: bool) -> None:
-    sid, uuid, short_uuid, username, expire_date, label, _created = sub
-    expire_str = (
-        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
-        if expire_date else "—"
-    )
+    if len(sub) >= 9:
+        sid, _tg, uuid, short_uuid, username, expire_date, label = sub[0], sub[1], sub[2], sub[3], sub[4], sub[5], sub[6]
+    elif len(sub) >= 6:
+        sid, uuid, short_uuid, username, expire_date, label = sub[0], sub[1], sub[2], sub[3], sub[4], sub[5]
+    else:
+        sid = sub[0]
+        uuid, short_uuid, username, expire_date, label = None, None, None, None, None
+
+    expire_str = _safe_format_expire_date(expire_date, "%d.%m.%Y %H:%M") or "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
     text = (
         f"📅 <b>Подписка #{sid}</b>"
@@ -1669,9 +1666,7 @@ async def cb_sub_open(callback: CallbackQuery):
     sub = await _ensure_sub_belongs_to_user(callback, sub_id)
     if not sub:
         return
-    # adapt 9-tuple to 7-tuple for _render_sub_open
-    adapted = (sub[0], sub[2], sub[3], sub[4], sub[5], sub[6], sub[8])
-    await _render_sub_open(callback, adapted, prefer_edit=True)
+    await _render_sub_open(callback, sub, prefer_edit=True)
 
 
 @dp.callback_query(F.data.startswith("sub:info:"))
@@ -1686,10 +1681,7 @@ async def cb_sub_info(callback: CallbackQuery):
     username = sub[4]
     user_ident = short_uuid or username or full_uuid
     expire_timestamp = sub[5]
-    expire_date_str = (
-        datetime.fromtimestamp(expire_timestamp).strftime("%d.%m.%Y %H:%M")
-        if expire_timestamp else "—"
-    )
+    expire_date_str = _safe_format_expire_date(expire_timestamp, "%d.%m.%Y %H:%M") or "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
     
     # 7-day range for daily traffic chart
@@ -1871,11 +1863,7 @@ async def cb_my_settings(callback: CallbackQuery):
     full_uuid = user_data[1]
     short_uuid = user_data[2]
     expire_timestamp = user_data[4]
-    expire_date_str = (
-        datetime.fromtimestamp(expire_timestamp).strftime("%d.%m.%Y %H:%M")
-        if expire_timestamp
-        else "—"
-    )
+    expire_date_str = _safe_format_expire_date(expire_timestamp, "%d.%m.%Y %H:%M") or "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
 
     info = await api.get_user_info(full_uuid)
@@ -2102,10 +2090,7 @@ async def _send_admin_user_card(callback: CallbackQuery, target_tg: int, *, pref
         tg_last_name,
     ) = full
     role = role or db.ROLE_USER
-    expire_str = (
-        datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
-        if expire_date else "—"
-    )
+    expire_str = _safe_format_expire_date(expire_date, "%d.%m.%Y %H:%M") or "—"
     sub_url = f"{SUB_DOMAIN}/{short_uuid}" if short_uuid else "—"
     tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
     has_account = bool(full_uuid)
@@ -2412,10 +2397,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
     short_uuid = sub[3]
     username = sub[4]
     user_ident = short_uuid or username or full_uuid
-    expire_str = (
-        datetime.fromtimestamp(int(sub[5])).strftime("%d.%m.%Y %H:%M")
-        if sub[5] else "—"
-    )
+    expire_str = _safe_format_expire_date(sub[5], "%d.%m.%Y %H:%M") or "—"
 
     # 7-day range for daily traffic chart
     from datetime import timedelta, timezone
@@ -2480,7 +2462,7 @@ async def _send_admin_sub_open(callback: CallbackQuery, target_tg: int, sub_id: 
     text = (
         f"📅 <b>Подписка #{sub_id}</b> пользователя <code>{target_tg}</code>\n"
         f"<b>panel username:</b> {html.escape(sub[4] or '—')}\n"
-        f"<b>uuid:</b> <code>{html.escape(sub[2])}</code>\n"
+        f"<b>uuid:</b> <code>{html.escape(sub[2] or '—')}</code>\n"
         f"<b>действует до:</b> {html.escape(expire_str)}\n\n"
     ) + stats_block
     await safe_edit(

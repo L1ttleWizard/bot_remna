@@ -325,8 +325,21 @@ async def ensure_authorized_user(callback: CallbackQuery) -> Optional[tuple]:
     """Проверяет, что вызывающий есть в users и привязан к панели.
 
     Возвращает кортеж юзера или None (с alert «Доступ только по приглашению»)."""
+    import auth
+    if await auth.is_admin(callback.from_user.id):
+        user_data = await db.get_user(callback.from_user.id)
+        return user_data or (callback.from_user.id, "admin", "admin", "admin", 0)
+
     user_data = await db.get_user(callback.from_user.id)
-    if not user_data or not user_data[1]:
+    has_account = bool(user_data and (user_data[1] or user_data[2] or user_data[3]))
+    if not has_account:
+        subs = await db.list_subscriptions(callback.from_user.id)
+        if subs:
+            has_account = True
+            if not user_data:
+                s0 = subs[0]
+                user_data = (callback.from_user.id, s0[1], s0[2], s0[3], s0[4])
+    if not has_account:
         await callback.answer(
             "Доступ только по приглашению. Активируйте токен через /redeem.",
             show_alert=True,
@@ -344,8 +357,10 @@ async def ensure_sub_belongs_to_user(callback: CallbackQuery, sub_id: int) -> Op
     return sub
 
 
-async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
+async def sync_local_expire_from_panel(tg_id: int, full_uuid: Optional[str]) -> None:
     """Синкает expire_date конкретной подписки (по uuid) с тем, что отдаёт панель."""
+    if not full_uuid:
+        return
     info = await api.get_user_info(full_uuid)
     if not info or "response" not in info:
         import database as _db
@@ -357,8 +372,7 @@ async def sync_local_expire_from_panel(tg_id: int, full_uuid: str) -> None:
     iso = info["response"].get("expireAt")
     if not iso:
         return
-    s = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    await db.update_subscription_expire_by_uuid(full_uuid, int(dt.timestamp()))
+    from formatters import parse_expire_to_ts
+    ts = parse_expire_to_ts(iso)
+    if ts > 0:
+        await db.update_subscription_expire_by_uuid(full_uuid, ts)

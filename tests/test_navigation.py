@@ -360,3 +360,163 @@ async def test_connect_platform_and_alt_handlers():
         assert "Другие приложения" in args[1]
 
 
+def test_format_sub_caption_robustness():
+    """Verify format_sub_caption never crashes with various formats, tuple sizes, and date types."""
+    from formatters import format_sub_caption
+
+    # 7-tuple standard
+    sub7 = (1, "uuid1", "short1", "user1", 1759230000, "Label1", 1700000000)
+    cap7 = format_sub_caption(sub7)
+    assert "#1" in cap7 and "Label1" in cap7 and "до" in cap7
+
+    # 7-tuple with ISO date string
+    sub_iso = (2, "uuid2", "short2", "user2", "2026-10-01T00:00:00Z", None, 1700000000)
+    cap_iso = format_sub_caption(sub_iso)
+    assert "#2" in cap_iso and "user2" in cap_iso and "01.10.2026" in cap_iso
+
+    # 7-tuple with float string
+    sub_flt = (3, "uuid3", "short3", "user3", "1759230000.0", None, 1700000000)
+    cap_flt = format_sub_caption(sub_flt)
+    assert "#3" in cap_flt and "user3" in cap_flt and "до" in cap_flt
+
+    # 9-tuple from get_subscription
+    sub9 = (4, 99999, "uuid4", "short4", "user4", "2026-10-01T00:00:00Z", "Sub9", 111, 1700000000)
+    cap9 = format_sub_caption(sub9)
+    assert "#4" in cap9 and "Sub9" in cap9 and "01.10.2026" in cap9
+
+    # Sub with None / 0 expire date
+    sub_no_exp = (5, "uuid5", "short5", "user5", None, None, 1700000000)
+    cap_no_exp = format_sub_caption(sub_no_exp)
+    assert cap_no_exp == "#5 · user5"
+
+    # Dict representation
+    sub_dict = {"id": 6, "username": "user6", "label": "DictLabel", "expire_date": 1759230000}
+    cap_dict = format_sub_caption(sub_dict)
+    assert "#6" in cap_dict and "DictLabel" in cap_dict and "до" in cap_dict
+
+    # Edge cases (empty or None)
+    assert format_sub_caption(None) == "#—"
+    assert format_sub_caption(()) == "#—"
+
+
+def test_safe_format_expire_date_and_parse_expire_to_ts():
+    """Verify safe_format_expire_date and parse_expire_to_ts handles all inputs."""
+    from formatters import safe_format_expire_date, parse_expire_to_ts
+
+    assert parse_expire_to_ts(1759230000) == 1759230000
+    assert parse_expire_to_ts(1759230000.0) == 1759230000
+    assert parse_expire_to_ts("1759230000") == 1759230000
+    assert parse_expire_to_ts("1759230000.0") == 1759230000
+    assert parse_expire_to_ts(1759230000000) == 1759230000  # ms
+    assert parse_expire_to_ts("2026-10-01T00:00:00Z") > 0
+    assert parse_expire_to_ts("2026-10-01 00:00:00") > 0
+    assert parse_expire_to_ts(None) == 0
+    assert parse_expire_to_ts("None") == 0
+    assert parse_expire_to_ts("invalid") == 0
+
+    assert safe_format_expire_date(1759230000, "%d.%m.%Y") is not None
+    assert safe_format_expire_date("2026-10-01T00:00:00Z", "%d.%m.%Y") == "01.10.2026"
+    assert safe_format_expire_date(None) is None
+    assert safe_format_expire_date("0") is None
+
+
+@pytest.mark.asyncio
+async def test_cb_my_subs_zero_and_multiple():
+    """Verify cb_my_subs with 0 subscriptions shows empty screen and with 2 shows list."""
+    import bot
+    from aiogram.types import CallbackQuery
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.from_user = MagicMock()
+    callback.from_user.id = 12345
+    callback.answer = AsyncMock()
+
+    # Case 1: 0 subscriptions -> shows friendly message with Back button
+    with patch("bot.db.list_subscriptions", AsyncMock(return_value=[])), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe_edit:
+
+        await bot.cb_my_subs(callback)
+        mock_safe_edit.assert_called_once()
+        args, kwargs = mock_safe_edit.call_args
+        assert "У вас пока нет активных подписок" in args[1]
+        reply_markup = kwargs.get("reply_markup") or args[2]
+        assert reply_markup.inline_keyboard[0][0].callback_data == "back_main"
+
+    # Case 2: 2 subscriptions -> renders list of subscriptions
+    mock_subs = [
+        (1, "uuid1", "short1", "user1", "2026-10-01T00:00:00Z", "Label1", 1700000000),
+        (2, "uuid2", "short2", "user2", 1759230000, None, 1700000000),
+    ]
+    with patch("bot.db.list_subscriptions", AsyncMock(return_value=mock_subs)), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe_edit:
+
+        await bot.cb_my_subs(callback)
+        mock_safe_edit.assert_called_once()
+        args, kwargs = mock_safe_edit.call_args
+        assert "Ваши подписки</b> (2)" in args[1]
+        reply_markup = kwargs.get("reply_markup") or args[2]
+        btns = [btn for row in reply_markup.inline_keyboard for btn in row]
+        cb_datas = [b.callback_data for b in btns]
+        assert "sub:open:1" in cb_datas
+        assert "sub:open:2" in cb_datas
+        assert "back_main" in cb_datas
+
+
+@pytest.mark.asyncio
+async def test_render_sub_open_with_9_tuple_and_iso_date():
+    """Verify _render_sub_open gracefully accepts 9-tuple and ISO date string."""
+    import bot
+    from aiogram.types import CallbackQuery
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.from_user = MagicMock()
+    callback.from_user.id = 12345
+    callback.answer = AsyncMock()
+
+    sub9 = (10, 12345, "uuid10", "short10", "panel_user", "2026-10-01T00:00:00Z", "Label10", 999, 1700000000)
+
+    with patch("bot.db.list_subscriptions", AsyncMock(return_value=[sub9])), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe_edit:
+
+        await bot._render_sub_open(callback, sub9, prefer_edit=True)
+        mock_safe_edit.assert_called_once()
+        args, _kwargs = mock_safe_edit.call_args
+        text = args[1]
+        assert "Подписка #10" in text
+        assert "Label10" in text
+        assert "01.10.2026" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_sub_open_with_none_uuid():
+    """Verify _send_admin_sub_open does not crash when uuid is None."""
+    import bot
+    from aiogram.types import CallbackQuery
+
+    callback = MagicMock(spec=CallbackQuery)
+    callback.from_user = MagicMock()
+    callback.from_user.id = 999
+    callback.answer = AsyncMock()
+
+    target_tg = 12345
+    sub_id = 42
+    # sub with None uuid
+    mock_sub = (sub_id, target_tg, None, "short42", "panel_usr", "2026-10-01T00:00:00Z", None, 999, 1700000000)
+
+    with patch("bot.db.get_subscription", AsyncMock(return_value=mock_sub)), \
+         patch("bot.api.resolve_user", AsyncMock(return_value={"id": 42})), \
+         patch("bot.api.get_user_info", AsyncMock(return_value=None)), \
+         patch("bot.api.get_user_hwid_devices", AsyncMock(return_value=None)), \
+         patch("bot.api.get_user_sparkline_traffic", AsyncMock(return_value=None)), \
+         patch("bot.safe_edit", AsyncMock()) as mock_safe_edit:
+
+        await bot._send_admin_sub_open(callback, target_tg, sub_id, prefer_edit=True)
+        mock_safe_edit.assert_called_once()
+        args, _kwargs = mock_safe_edit.call_args
+        text = args[1]
+        assert f"Подписка #{sub_id}" in text
+        assert "<b>uuid:</b> <code>\u2014</code>" in text
+        assert "01.10.2026" in text
+
+
+

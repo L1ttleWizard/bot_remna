@@ -16,7 +16,7 @@ from aiogram.types import (
 import auth
 import database as db
 from app import dp
-from formatters import format_tg_name
+from formatters import format_tg_name, safe_format_expire_date
 
 
 @dp.inline_query(StateFilter("*"))
@@ -42,10 +42,7 @@ async def inline_user_search(query: InlineQuery):
     ) in rows:
         marker = "👑" if role == db.ROLE_ADMIN else "👤"
         tg_name = format_tg_name(tg_username, tg_first_name, tg_last_name)
-        when = (
-            datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y")
-            if expire_date else "—"
-        )
+        when = safe_format_expire_date(expire_date, "%d.%m.%Y") or "—"
         title = f"{marker} {tg_id} · {tg_name}"[:64]
         desc_parts = []
         if tg_username:

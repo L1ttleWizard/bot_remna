@@ -5,6 +5,8 @@ from typing import Iterable, Optional
 
 import aiosqlite
 
+from formatters import parse_expire_to_ts
+
 DB_PATH = os.environ.get("DATABASE_PATH", "bot_database.db")
 
 
@@ -220,14 +222,23 @@ async def init_db():
         ) as cursor:
             legacy_rows = await cursor.fetchall()
         for tg_id, uuid, short_uuid, username, expire_date, created_by, created_at in legacy_rows:
+            clean_exp = parse_expire_to_ts(expire_date)
             await db.execute(
                 """
                 INSERT OR IGNORE INTO subscriptions
                   (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
                 VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (tg_id, uuid, short_uuid, username, expire_date, created_by, created_at),
+                (tg_id, uuid, short_uuid, username, clean_exp, created_by, created_at),
             )
+
+        # Sanitize existing non-int or ms expire_dates in subscriptions
+        async with db.execute("SELECT id, expire_date FROM subscriptions WHERE expire_date IS NOT NULL") as cursor:
+            sub_rows = await cursor.fetchall()
+        for s_id, s_exp in sub_rows:
+            if not isinstance(s_exp, int) or s_exp > 100_000_000_000:
+                clean_ts = parse_expire_to_ts(s_exp)
+                await db.execute("UPDATE subscriptions SET expire_date = ? WHERE id = ?", (clean_ts, s_id))
 
         await db.commit()
 
@@ -336,22 +347,51 @@ async def add_subscription(
 ) -> int:
     """Insert a new subscription and return its sub_id."""
     now = int(time.time())
+    expire_ts = parse_expire_to_ts(expire_date)
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO subscriptions
-              (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(uuid) DO UPDATE SET
-              tg_id = excluded.tg_id,
-              short_uuid = excluded.short_uuid,
-              username = excluded.username,
-              expire_date = excluded.expire_date
-            """,
-            (tg_id, uuid, short_uuid, username, expire_date, label, created_by, now),
-        )
+        sub_id = 0
+        try:
+            cursor = await db.execute(
+                """
+                INSERT INTO subscriptions
+                  (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uuid) DO UPDATE SET
+                  tg_id = excluded.tg_id,
+                  short_uuid = excluded.short_uuid,
+                  username = excluded.username,
+                  expire_date = excluded.expire_date
+                RETURNING id
+                """,
+                (tg_id, uuid, short_uuid, username, expire_ts, label, created_by, now),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                sub_id = int(row[0])
+        except Exception:
+            cursor = await db.execute(
+                """
+                INSERT INTO subscriptions
+                  (tg_id, uuid, short_uuid, username, expire_date, label, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uuid) DO UPDATE SET
+                  tg_id = excluded.tg_id,
+                  short_uuid = excluded.short_uuid,
+                  username = excluded.username,
+                  expire_date = excluded.expire_date
+                """,
+                (tg_id, uuid, short_uuid, username, expire_ts, label, created_by, now),
+            )
+            sub_id = int(cursor.lastrowid or 0)
+
+        if not sub_id and uuid:
+            async with db.execute("SELECT id FROM subscriptions WHERE uuid = ?", (uuid,)) as c:
+                r = await c.fetchone()
+                if r and r[0]:
+                    sub_id = int(r[0])
+
         await db.commit()
-        return int(cursor.lastrowid or 0)
+        return sub_id
 
 
 async def list_subscriptions(tg_id: int) -> list:

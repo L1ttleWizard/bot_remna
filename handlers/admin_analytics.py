@@ -21,7 +21,7 @@ import auth
 import database as db
 import keyboards as kb
 from app import api, dp, safe_edit
-from formatters import human_bytes, format_expire_display
+from formatters import human_bytes, format_expire_display, parse_expire_to_ts, safe_format_expire_date
 
 logger = logging.getLogger(__name__)
 
@@ -360,8 +360,9 @@ async def _send_admin_stats_expiring(callback: CallbackQuery, *, prefer_edit: bo
         lines.append("Пусто. Никто не истекает в этом окне.")
     now = int(time.time())
     for tg_id, uuid_v, _short, username_s, expire_date, sub_id, tg_username, tg_first, tg_last in expiring:
-        days_left = max(0, (int(expire_date) - now) // 86400)
-        when = datetime.fromtimestamp(int(expire_date)).strftime("%d.%m.%Y %H:%M")
+        exp_ts = parse_expire_to_ts(expire_date)
+        days_left = max(0, (exp_ts - now) // 86400) if exp_ts > 0 else 0
+        when = safe_format_expire_date(expire_date, "%d.%m.%Y %H:%M") or "—"
         name_bits = []
         if tg_username:
             name_bits.append(f"@{html.escape(tg_username)}")

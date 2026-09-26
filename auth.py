@@ -29,17 +29,17 @@ async def is_admin(tg_id: int) -> bool:
 
 
 async def is_authorized(tg_id: int) -> bool:
-    """Юзер авторизован, если его роль == admin или у него есть запись в users
-    (т.е. кто-то когда-то выдал ему токен и он его погасил)."""
-    full = await db.get_user_full(tg_id)
-    if not full:
-        return False
-    role = full[5]
-    if role == db.ROLE_ADMIN:
+    """Юзер авторизован, если его роль == admin или у него есть активная/привязанная подписка."""
+    if await is_admin(tg_id):
         return True
-    # Обычный пользователь авторизован, только если у него есть привязанный аккаунт
-    # (uuid выставляется при погашении токена).
-    return bool(full[1])
+    full = await db.get_user_full(tg_id)
+    if full:
+        # role == admin or has any identifier (uuid, short_uuid, username)
+        if full[5] == db.ROLE_ADMIN or bool(full[1] or full[2] or full[3]):
+            return True
+    # Check if there are any subscriptions directly in DB
+    subs = await db.list_subscriptions(tg_id)
+    return bool(subs)
 
 
 async def issue_token(*, created_by: int, expire_days: int, hwid_device_limit: int) -> str:
