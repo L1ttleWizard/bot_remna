@@ -48,3 +48,19 @@ python bot.py
 ```bash
 pytest
 ```
+
+## Remnawave Panel Automated Backups
+The Remnawave panel uses `rw-backup-restore` located at `/opt/rw-backup-restore`.
+Configuration file: `/opt/rw-backup-restore/config.env`
+Scheduled via host crontab:
+```cron
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+@daily /opt/rw-backup-restore/backup-restore.sh backup >> /var/log/rw_backup_cron.log 2>&1
+```
+Logs: `/var/log/rw_backup_cron.log`
+Logrotate: `/etc/logrotate.d/rw-backup`
+Manual test run:
+```bash
+/usr/local/bin/rw-backup backup
+```

@@ -30,7 +30,8 @@ flowchart TD
   - Node healthcheck every 2 minutes (`check_nodes_health`).
   - Node CPU load check every 1 minute (`check_cpu_load`).
   - Daily traffic report at 23:59 MSK (`send_daily_traffic_report`).
-  - Daily database and configuration backup at 01:00 MSK (`run_daily_backup`).
+  - Daily bot SQLite database and configuration backup at 01:00 MSK (`run_daily_backup`).
+  - Automated Remnawave panel backup (Postgres database dumpall + configs) runs host-level via `rw-backup-restore` cron (`@daily` / midnight) uploading `remnawave_backup_panel_*.tar.gz` to the admin Telegram chat.
 - **`services/`**:
   - `chart_generator.py`: Matplotlib-based chart generation:
     - Node load history charts (CPU, RAM, users online).
